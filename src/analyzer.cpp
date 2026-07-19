@@ -5,14 +5,49 @@
 #include "db25/ast/node_types.hpp"
 #include "db25/semantic/ast_helpers.hpp"
 
+#include <array>
+#include <cctype>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace db25::semantic {
 
 using ast::NodeType;
 
 namespace {
+
+[[nodiscard]] std::string to_upper(std::string_view s) {
+    std::string r{s};
+    for (char& c : r) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return r;
+}
+
+// The set of function names treated as aggregates. Kept as a single table so it
+// is trivially extensible: add a name here and it is recognized everywhere
+// (grouping legality and result typing).
+constexpr std::array<std::string_view, 5> kAggregateNames = {
+    "COUNT", "SUM", "AVG", "MIN", "MAX",
+};
+
+[[nodiscard]] bool is_aggregate_name(std::string_view upper_name) {
+    for (const std::string_view a : kAggregateNames) {
+        if (a == upper_name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True if `node` is a column-reference-like leaf. The parser emits ColumnRef
+// for a top-level column and Identifier for a bare column that is the direct
+// argument of a function call; both carry the (possibly dotted) name in
+// primary_text and resolve the same way.
+[[nodiscard]] bool is_column_ref_node(NodeType t) {
+    return t == NodeType::ColumnRef || t == NodeType::Identifier;
+}
 
 [[nodiscard]] bool is_numeric(DataType t) {
     switch (t) {
@@ -112,6 +147,67 @@ struct TypeReconcile {
     return {false, DataType::Unknown};
 }
 
+// SUM widens integer inputs to BigInt (avoids overflow of the accumulator);
+// exact/approximate numerics keep their kind. Non-numeric inputs pass through
+// unchanged (degrading conservatively rather than guessing).
+[[nodiscard]] DataType sum_result(DataType arg) {
+    switch (arg) {
+        case DataType::TinyInt:
+        case DataType::SmallInt:
+        case DataType::Integer:
+        case DataType::BigInt:
+            return DataType::BigInt;
+        default:
+            return arg;
+    }
+}
+
+struct FunctionType {
+    DataType type;
+    bool known;  // false => name not in the signature table (soft-diagnose)
+};
+
+// Result type for a function call given its (already inferred) argument types.
+// Aggregates and a small, extensible table of common scalar functions are
+// modeled; anything else degrades to Unknown with known=false.
+[[nodiscard]] FunctionType function_result_type(std::string_view upper_name,
+                                                const std::vector<DataType>& args) {
+    const DataType arg0 = args.empty() ? DataType::Unknown : args.front();
+
+    if (is_aggregate_name(upper_name)) {
+        if (upper_name == "COUNT") {
+            return {DataType::BigInt, true};  // COUNT(*) / COUNT(expr)
+        }
+        if (upper_name == "SUM") {
+            return {sum_result(arg0), true};
+        }
+        if (upper_name == "AVG") {
+            return {DataType::Double, true};
+        }
+        // MIN / MAX preserve the argument type.
+        return {arg0, true};
+    }
+
+    // Scalar function signature table (extend here as needed).
+    if (upper_name == "UPPER" || upper_name == "LOWER") {
+        return {DataType::Text, true};
+    }
+    if (upper_name == "LENGTH") {
+        return {DataType::Integer, true};
+    }
+    if (upper_name == "ABS") {
+        return {is_numeric(arg0) ? arg0 : DataType::Unknown, true};
+    }
+    if (upper_name == "COALESCE") {
+        DataType unified = DataType::Unknown;
+        for (const DataType a : args) {
+            unified = reconcile_types(unified, a).type;
+        }
+        return {unified, true};
+    }
+    return {DataType::Unknown, false};
+}
+
 }  // namespace
 
 void Analyzer::analyze(ASTNode* root) {
@@ -164,9 +260,10 @@ void Analyzer::record_type(ASTNode* node, DataType type) {
     node->data_type = type;  // mirror onto the parser node
 }
 
-void Analyzer::add_diagnostic(DiagnosticCode code, std::string message, const ASTNode* at) {
+void Analyzer::add_diagnostic(DiagnosticCode code, std::string message, const ASTNode* at,
+                              Severity severity) {
     Diagnostic d;
-    d.severity = Severity::Error;
+    d.severity = severity;
     d.code = code;
     d.message = std::move(message);
     if (at != nullptr) {
@@ -234,11 +331,31 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             infer_expr(pred, scope);
         }
     }
+    // 5. GROUP BY: resolve each grouping expression against the FROM scope
+    //    (emitting the usual unresolved diagnostics) before legality checking.
+    ASTNode* group_by = find_child(select_stmt, NodeType::GroupByClause);
+    if (group_by != nullptr) {
+        for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
+            infer_expr(key, scope);
+        }
+    }
+
+    // 6. HAVING: resolve/infer the predicate (column refs resolve here too).
     if (ASTNode* having = find_child(select_stmt, NodeType::HavingClause)) {
         if (ASTNode* pred = first_child(having)) {
             infer_expr(pred, scope);
         }
     }
+
+    // 7. ORDER BY: resolve each sort expression against the FROM scope.
+    if (ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
+        for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
+            infer_expr(item, scope);
+        }
+    }
+
+    // 8. Aggregate / GROUP BY / HAVING legality (validation pass).
+    analyze_grouping(select_stmt, group_by, scope);
 
     projections_[select_stmt] = output;
     return output;
@@ -514,7 +631,33 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             return DataType::Null;
 
         case NodeType::ColumnRef:
+        // A bare column that is the direct argument of a function call is emitted
+        // as an Identifier; resolve it the same way as a ColumnRef.
+        case NodeType::Identifier:
             return resolve_column_ref(expr, scope).type;
+
+        case NodeType::FunctionCall:
+        case NodeType::FunctionExpr: {
+            // Infer argument types (recursion also resolves nested column refs).
+            // A COUNT(*) star argument contributes no type and is skipped.
+            std::vector<DataType> arg_types;
+            for (ASTNode* arg = first_child(expr); arg != nullptr; arg = arg->next_sibling) {
+                const DataType t = infer_expr(arg, scope);
+                if (arg->node_type != NodeType::Star) {
+                    arg_types.push_back(t);
+                }
+            }
+            const std::string upper = to_upper(expr->primary_text);
+            const FunctionType ft = function_result_type(upper, arg_types);
+            if (!ft.known) {
+                add_diagnostic(DiagnosticCode::UnknownFunction,
+                               "unknown function '" + std::string{expr->primary_text} +
+                                   "'; result type is Unknown",
+                               expr, Severity::Warning);
+            }
+            record_type(expr, ft.type);
+            return ft.type;
+        }
 
         case NodeType::BinaryExpr: {
             ASTNode* lhs = first_child(expr);
@@ -551,6 +694,143 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             }
             return DataType::Unknown;
         }
+    }
+}
+
+namespace {
+
+// Does the subtree rooted at `node` contain an aggregate function call?
+[[nodiscard]] bool contains_aggregate(const ASTNode* node) {
+    if (node == nullptr) {
+        return false;
+    }
+    if (node->node_type == NodeType::FunctionCall ||
+        node->node_type == NodeType::FunctionExpr) {
+        if (is_aggregate_name(to_upper(node->primary_text))) {
+            return true;
+        }
+    }
+    for (const ASTNode* c = node->first_child; c != nullptr; c = c->next_sibling) {
+        if (contains_aggregate(c)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Does a column reference `ref` match the grouping key `k`? Prefer resolved
+// (table_id, column_id) identity; fall back to the reference text when either
+// side is unresolved (e.g. derived columns or expression keys).
+[[nodiscard]] bool key_matches(const GroupKey& k, const ASTNode* ref) {
+    const std::uint32_t tid = ref->context.analysis.table_id;
+    const std::uint32_t cid = ref->context.analysis.column_id;
+    if (cid != 0 && k.column_id != 0) {
+        return tid == k.table_id && cid == k.column_id;
+    }
+    return ref->primary_text == k.text;
+}
+
+}  // namespace
+
+void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope) {
+    (void)scope;  // resolution already happened; this pass is structural.
+
+    ASTNode* select_list = find_child(select_stmt, NodeType::SelectList);
+
+    // The query is "grouped" if it has a GROUP BY clause or any aggregate in the
+    // SELECT list. Only grouped queries are subject to the legality rules.
+    bool grouped = group_by != nullptr;
+    if (!grouped && select_list != nullptr) {
+        for (ASTNode* item = first_child(select_list); item != nullptr;
+             item = item->next_sibling) {
+            if (contains_aggregate(item)) {
+                grouped = true;
+                break;
+            }
+        }
+    }
+    if (!grouped) {
+        return;
+    }
+
+    // Collect the grouping keys (their resolved identity + text).
+    std::vector<GroupKey> keys;
+    if (group_by != nullptr) {
+        for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
+            GroupKey k;
+            k.table_id = key->context.analysis.table_id;
+            k.column_id = key->context.analysis.column_id;
+            k.text = key->primary_text;
+            keys.push_back(k);
+        }
+    }
+
+    // SELECT list and ORDER BY: every non-aggregated column must be a group key.
+    if (select_list != nullptr) {
+        for (ASTNode* item = first_child(select_list); item != nullptr;
+             item = item->next_sibling) {
+            check_grouping_expr(item, keys, /*in_aggregate=*/false);
+        }
+    }
+    if (ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
+        for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
+            check_grouping_expr(item, keys, /*in_aggregate=*/false);
+        }
+    }
+    // HAVING may reference grouping keys and aggregates; a bare non-grouped
+    // column outside an aggregate is illegal here too.
+    if (ASTNode* having = find_child(select_stmt, NodeType::HavingClause)) {
+        if (ASTNode* pred = first_child(having)) {
+            check_grouping_expr(pred, keys, /*in_aggregate=*/false);
+        }
+    }
+}
+
+void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& keys,
+                                   bool in_aggregate) {
+    if (expr == nullptr) {
+        return;
+    }
+
+    if (expr->node_type == NodeType::FunctionCall ||
+        expr->node_type == NodeType::FunctionExpr) {
+        const bool is_agg = is_aggregate_name(to_upper(expr->primary_text));
+        if (is_agg && in_aggregate) {
+            add_diagnostic(DiagnosticCode::NestedAggregate,
+                           "aggregate function '" + std::string{expr->primary_text} +
+                               "' nested inside another aggregate",
+                           expr);
+        }
+        // Columns beneath an aggregate are exempt from the grouping rule.
+        const bool inside = in_aggregate || is_agg;
+        for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
+            check_grouping_expr(c, keys, inside);
+        }
+        return;
+    }
+
+    if (is_column_ref_node(expr->node_type)) {
+        if (!in_aggregate) {
+            bool ok = false;
+            for (const GroupKey& k : keys) {
+                if (key_matches(k, expr)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                add_diagnostic(DiagnosticCode::NonGroupedColumn,
+                               "column '" + std::string{expr->primary_text} +
+                                   "' must appear in the GROUP BY clause or be used "
+                                   "in an aggregate function",
+                               expr);
+            }
+        }
+        return;
+    }
+
+    for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
+        check_grouping_expr(c, keys, in_aggregate);
     }
 }
 

@@ -17,6 +17,14 @@ enum class DiagnosticCode : std::uint16_t {
     UnresolvedColumn,
     UnresolvedQualifier,
     AmbiguousColumn,
+    // `SELECT *` used without a FROM clause (nothing to expand).
+    StarWithoutFrom,
+    // A `JOIN ... USING (col)` names a column missing from one/both sides.
+    UsingColumnMissing,
+    // Set-operation branches project a different number of columns.
+    SetOpArityMismatch,
+    // Set-operation branches have incompatible column types pairwise.
+    SetOpTypeMismatch,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

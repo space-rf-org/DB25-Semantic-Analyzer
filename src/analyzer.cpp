@@ -62,16 +62,84 @@ namespace {
     return op == "+" || op == "-" || op == "*" || op == "/" || op == "%";
 }
 
+[[nodiscard]] bool is_setop(NodeType t) {
+    return t == NodeType::UnionStmt || t == NodeType::IntersectStmt ||
+           t == NodeType::ExceptStmt;
+}
+
+// A FROM/JOIN child that contributes relations to the scope (as opposed to a
+// join predicate such as an ON expression or a USING clause).
+[[nodiscard]] bool is_relation_node(NodeType t) {
+    switch (t) {
+        case NodeType::TableRef:
+        case NodeType::Subquery:
+        case NodeType::SubqueryExpr:
+        case NodeType::JoinClause:
+        case NodeType::InnerJoin:
+        case NodeType::LeftJoin:
+        case NodeType::RightJoin:
+        case NodeType::FullJoin:
+        case NodeType::CrossJoin:
+        case NodeType::LateralJoin:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Reconcile two column types for a set operation. `ok` is false only when the
+// types are genuinely incompatible; `type` is the unified result otherwise.
+// Conservative: exact match, NULL/Unknown unify with anything, and any two
+// numeric types unify by numeric promotion. Everything else is incompatible.
+struct TypeReconcile {
+    bool ok;
+    DataType type;
+};
+
+[[nodiscard]] TypeReconcile reconcile_types(DataType a, DataType b) {
+    if (a == b) {
+        return {true, a};
+    }
+    if (a == DataType::Null || a == DataType::Unknown) {
+        return {true, b};
+    }
+    if (b == DataType::Null || b == DataType::Unknown) {
+        return {true, a};
+    }
+    if (is_numeric(a) && is_numeric(b)) {
+        return {true, promote_numeric(a, b)};
+    }
+    return {false, DataType::Unknown};
+}
+
 }  // namespace
 
 void Analyzer::analyze(ASTNode* root) {
     if (root == nullptr) {
         return;
     }
-    if (root->node_type == NodeType::SelectStmt) {
-        analyze_query(root, nullptr);
+    if (root->node_type == NodeType::SelectStmt || is_setop(root->node_type)) {
+        analyze_stmt(root, nullptr);
     }
     // Other statement kinds are not yet analyzed; see docs/DESIGN.md roadmap.
+}
+
+std::vector<ResolvedColumn> Analyzer::analyze_stmt(ASTNode* node, Scope* parent) {
+    if (node == nullptr) {
+        return {};
+    }
+    if (is_setop(node->node_type)) {
+        return analyze_setop(node, parent);
+    }
+    if (node->node_type == NodeType::SelectStmt) {
+        return analyze_query(node, parent);
+    }
+    return {};
+}
+
+const std::vector<ResolvedColumn>* Analyzer::projection_of(const ASTNode* query) const {
+    const auto it = projections_.find(query);
+    return it == projections_.end() ? nullptr : &it->second;
 }
 
 bool Analyzer::has_errors() const {
@@ -140,8 +208,8 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
         for (ASTNode* item = first_child(select_list); item != nullptr;
              item = item->next_sibling) {
             if (item->node_type == NodeType::Star) {
-                // Expand `*` to every visible column (best effort).
-                // Not exercised by the current tests but kept correct.
+                // `*` / `table.*` -> concrete columns in FROM/JOIN order.
+                expand_star(item, scope, output);
                 continue;
             }
             const DataType type = infer_expr(item, scope);
@@ -172,7 +240,97 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
         }
     }
 
+    projections_[select_stmt] = output;
     return output;
+}
+
+void Analyzer::expand_star(ASTNode* star, Scope& scope,
+                           std::vector<ResolvedColumn>& output) {
+    // A qualified star `table.*` carries the qualifier in schema_name; an
+    // unqualified `*` has an empty schema_name.
+    //
+    // NOTE (parser limitation): the consumed parser build does not currently
+    // produce a qualified-star node in this shape - it misparses `table.*` as a
+    // multiplication expression (dropping the FROM clause) or, before a comma,
+    // as a bare column reference. The qualified-star path below is written
+    // against the correct/forward-compatible shape (a Star node whose
+    // schema_name holds the qualifier) so it takes effect unchanged once the
+    // parser emits it. See docs/DESIGN.md.
+    const std::string_view qualifier = alias_of(star);
+
+    if (qualifier.empty()) {
+        if (scope.relations().empty()) {
+            add_diagnostic(DiagnosticCode::StarWithoutFrom,
+                           "'SELECT *' requires a FROM clause", star);
+            return;
+        }
+        for (const auto& rel : scope.relations()) {
+            for (const auto& col : rel.columns) {
+                output.push_back(col);
+            }
+        }
+        return;
+    }
+
+    bool matched = false;
+    for (const auto& rel : scope.relations()) {
+        if (rel.matches_qualifier(qualifier)) {
+            matched = true;
+            for (const auto& col : rel.columns) {
+                output.push_back(col);
+            }
+        }
+    }
+    if (!matched) {
+        add_diagnostic(DiagnosticCode::UnresolvedQualifier,
+                       "unresolved table qualifier '" + std::string{qualifier} +
+                           "' in '" + std::string{qualifier} + ".*'",
+                       star);
+    }
+}
+
+std::vector<ResolvedColumn> Analyzer::analyze_setop(ASTNode* setop, Scope* parent) {
+    // Analyze every branch (each a SELECT block or a nested set operation) and
+    // collect its projected columns.
+    std::vector<std::vector<ResolvedColumn>> branches;
+    for (ASTNode* child = first_child(setop); child != nullptr;
+         child = child->next_sibling) {
+        if (child->node_type == NodeType::SelectStmt || is_setop(child->node_type)) {
+            branches.push_back(analyze_stmt(child, parent));
+        }
+    }
+
+    if (branches.empty()) {
+        return {};
+    }
+
+    // Fold the branches left-to-right, reconciling arity and types pairwise.
+    std::vector<ResolvedColumn> result = branches.front();
+    for (std::size_t i = 1; i < branches.size(); ++i) {
+        const auto& branch = branches[i];
+        if (branch.size() != result.size()) {
+            add_diagnostic(DiagnosticCode::SetOpArityMismatch,
+                           "set operation branches have different column counts (" +
+                               std::to_string(result.size()) + " vs " +
+                               std::to_string(branch.size()) + ")",
+                           setop);
+            continue;  // arity differs: pairwise type check is meaningless
+        }
+        for (std::size_t j = 0; j < result.size(); ++j) {
+            const TypeReconcile r = reconcile_types(result[j].type, branch[j].type);
+            if (!r.ok) {
+                add_diagnostic(DiagnosticCode::SetOpTypeMismatch,
+                               "incompatible types in set operation for output column " +
+                                   std::to_string(j + 1),
+                               setop);
+            }
+            result[j].type = r.type;      // reconciled output type
+            result[j].nullable = result[j].nullable || branch[j].nullable;
+        }
+    }
+
+    projections_[setop] = result;
+    return result;
 }
 
 void Analyzer::resolve_from(ASTNode* from_clause, Scope& scope) {
@@ -225,9 +383,10 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
             scope.add_relation(std::move(binding));
             return;
         }
-        // Joins: descend and add every relation on either side. The ON/USING
-        // condition is resolved by the parser's structure walk in a future
-        // pass; for now we make the joined relations visible.
+        // Joins: bring every relation on the right side into scope, then
+        // resolve the join predicate now that both sides are visible. The left
+        // side is the FROM-clause sibling processed before this join, so it is
+        // already in scope.
         case NodeType::JoinClause:
         case NodeType::InnerJoin:
         case NodeType::LeftJoin:
@@ -235,15 +394,68 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
         case NodeType::FullJoin:
         case NodeType::CrossJoin:
         case NodeType::LateralJoin: {
+            const std::size_t left_end = scope.relations().size();
+            // Pass 1: make the right-hand relation(s) visible.
             for (ASTNode* child = first_child(item); child != nullptr;
                  child = child->next_sibling) {
-                resolve_from_item(child, scope);
+                if (is_relation_node(child->node_type)) {
+                    resolve_from_item(child, scope);
+                }
+            }
+            const std::size_t right_end = scope.relations().size();
+            // Pass 2: resolve the ON expression / USING columns against the now
+            // fully-populated scope.
+            for (ASTNode* child = first_child(item); child != nullptr;
+                 child = child->next_sibling) {
+                if (child->node_type == NodeType::UsingClause) {
+                    resolve_using(child, scope, left_end, right_end);
+                } else if (!is_relation_node(child->node_type)) {
+                    // The ON predicate: a normal expression whose column refs
+                    // resolve (and emit diagnostics) through infer_expr.
+                    infer_expr(child, scope);
+                }
             }
             return;
         }
         default:
             // Not a relation-producing node (e.g. a join predicate); ignore.
             return;
+    }
+}
+
+void Analyzer::resolve_using(ASTNode* using_clause, Scope& scope,
+                             std::size_t left_end, std::size_t right_end) {
+    const auto& relations = scope.relations();
+    for (ASTNode* col = first_child(using_clause); col != nullptr;
+         col = col->next_sibling) {
+        // A USING item names a bare column; primary_text is the column name.
+        const std::string_view name = split_column_ref(col->primary_text).column;
+
+        const ResolvedColumn* left_hit = nullptr;
+        for (std::size_t i = 0; i < left_end && i < relations.size(); ++i) {
+            if (const auto* c = relations[i].find_column(name)) {
+                left_hit = c;
+            }
+        }
+        bool right_found = false;
+        for (std::size_t i = left_end; i < right_end && i < relations.size(); ++i) {
+            if (relations[i].find_column(name) != nullptr) {
+                right_found = true;
+            }
+        }
+
+        if (left_hit == nullptr || !right_found) {
+            add_diagnostic(DiagnosticCode::UsingColumnMissing,
+                           "USING column '" + std::string{name} +
+                               "' is not present in both joined relations",
+                           col);
+            continue;
+        }
+        // A USING column collapses to a single merged output column; record its
+        // resolved type on the node so downstream consumers see it.
+        record_type(col, left_hit->type);
+        col->context.analysis.table_id = left_hit->table_id;
+        col->context.analysis.column_id = left_hit->column_id;
     }
 }
 

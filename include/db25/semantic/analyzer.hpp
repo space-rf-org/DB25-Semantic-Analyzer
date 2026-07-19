@@ -40,14 +40,39 @@ public:
     // Inferred type recorded for a node (Unknown if none / not analyzed).
     [[nodiscard]] DataType type_of(const ASTNode* node) const;
 
+    // The resolved output projection of a query block (a SELECT statement or a
+    // set-operation node), with `SELECT *` / `table.*` expanded to concrete
+    // columns in FROM/JOIN order, and (for set operations) the reconciled
+    // column types. Returns nullptr if the node was not analyzed as a query.
+    [[nodiscard]] const std::vector<ResolvedColumn>* projection_of(
+        const ASTNode* query) const;
+
 private:
+    // Analyze a statement that yields a row set: a SELECT block or a set
+    // operation (UNION/INTERSECT/EXCEPT). Returns the projected columns.
+    std::vector<ResolvedColumn> analyze_stmt(ASTNode* node, Scope* parent);
+
     // Analyze a SELECT query block under `parent` scope and return the list of
     // columns it projects (used when the block is a derived table or CTE body).
     std::vector<ResolvedColumn> analyze_query(ASTNode* select_stmt, Scope* parent);
 
+    // Analyze a set-operation node (UNION/INTERSECT/EXCEPT): analyze both
+    // branches, check arity + pairwise type compatibility, and return the
+    // reconciled output columns.
+    std::vector<ResolvedColumn> analyze_setop(ASTNode* setop, Scope* parent);
+
+    // Expand a `Star` select-list item into concrete columns, appending them to
+    // `output`. Handles unqualified `*` and qualified `table.*`.
+    void expand_star(ASTNode* star, Scope& scope, std::vector<ResolvedColumn>& output);
+
     // Populate `scope` with the relations named in a FROM clause.
     void resolve_from(ASTNode* from_clause, Scope& scope);
     void resolve_from_item(ASTNode* item, Scope& scope);
+
+    // Resolve a JOIN's USING (col, ...) columns against the left relations
+    // (indices [0, left_end)) and right relations ([left_end, right_end)).
+    void resolve_using(ASTNode* using_clause, Scope& scope, std::size_t left_end,
+                       std::size_t right_end);
 
     // Resolve a column reference against `scope`, recording type + context and
     // emitting a diagnostic on failure.
@@ -64,6 +89,9 @@ private:
     const Catalog& catalog_;
     std::vector<Diagnostic> diagnostics_;
     std::unordered_map<const ASTNode*, DataType> inferred_;
+    // Per query-block resolved projection (stars expanded, set-op types
+    // reconciled), keyed by the SELECT / set-operation node.
+    std::unordered_map<const ASTNode*, std::vector<ResolvedColumn>> projections_;
 };
 
 }  // namespace db25::semantic

@@ -88,6 +88,21 @@ Diagnostics are collected in a flat `std::vector<Diagnostic>`; each diagnostic
 carries the offending node's `source_start` / `source_end` byte range so a
 front-end can underline the exact text.
 
+### Resolved projections (`SELECT *` / set operations)
+
+A query block's **output projection** - the ordered list of columns it produces,
+with `SELECT *` / `table.*` already expanded and set-operation column types
+reconciled - is recorded in a side map keyed by the query node
+(`std::unordered_map<const ASTNode*, std::vector<ResolvedColumn>>`), read back
+via `Analyzer::projection_of(node)`. The key is the `SelectStmt` for a plain
+query and the `UnionStmt` / `IntersectStmt` / `ExceptStmt` node for a set
+operation. This is a *side structure*: we deliberately do not synthesize extra
+`ColumnRef` nodes into the parser's arena AST to represent expanded stars, both
+because the arena is parser-owned and because a resolved `(name, type,
+nullable, table_id, column_id)` list is exactly what downstream consumers
+(derived-table column lists, optimizers) need. `analyze_query` / `analyze_setop`
+also *return* this list so it flows into derived-table and CTE column sets.
+
 ## AST conventions relied upon (KNOWN COUPLINGS)
 
 These are conventions of the *current* parser AST that the analyzer depends on.
@@ -170,11 +185,56 @@ scope in which the `WITH` appears and are found by `FROM` items via
 query block whose projected columns become the columns of the enclosing relation
 binding.
 
+## Projection, joins, and set operations
+
+Three capabilities built on the passes above:
+
+### `SELECT *` / `table.*` expansion
+
+A `Star` select-list item is expanded, in FROM/JOIN order, into the concrete
+columns of the relations visible in the *current* query block
+(`Scope::relations()`, not outer scopes). An unqualified `*` expands every
+visible relation; a qualified `table.*` expands only the relation whose alias /
+name matches the qualifier. The expanded columns land in the query's resolved
+projection (above). Diagnostics: `StarWithoutFrom` when `*` appears with no FROM
+relations; `UnresolvedQualifier` when `table.*`'s qualifier names no visible
+relation.
+
+> **Parser limitation (qualified star).** The consumed parser build does not
+> represent `table.*` in a usable way. Immediately before `FROM` it misparses
+> `t.*` as a `*` (multiplication) `BinaryExpr` and *drops the entire FROM
+> clause*; before a comma it collapses `t.*` to a bare `ColumnRef` holding only
+> the qualifier text, discarding the `.*`. Neither yields a qualified-star node.
+> The analyzer's qualified-star path is therefore written against the *correct*
+> forward-compatible shape - a `Star` node whose `schema_name` holds the
+> qualifier - so it works unchanged once the parser emits that shape. Unqualified
+> `SELECT *` parses correctly (a clean `Star` node) and is fully supported.
+
+### JOIN `ON` / `USING` resolution
+
+For a `JoinClause`, the left side is the FROM sibling already in scope; the
+right side's relations are brought into scope first, then the predicate is
+resolved against both. An `ON` expression is resolved with the ordinary
+expression walk (`infer_expr`), so its column references emit the same
+unresolved-column / ambiguous diagnostics. For `USING (col, ...)`, each named
+column must be present in *both* the left relation set and the right relation
+set (tracked by relation index ranges); a `UsingColumnMissing` diagnostic is
+emitted otherwise. A resolved USING column is recorded once (the merged output
+column).
+
+### Set-operation type reconciliation
+
+`UnionStmt` / `IntersectStmt` / `ExceptStmt` analyze each branch (a SELECT block
+or a nested set operation), then fold the branches left-to-right: branches must
+have equal **arity** (`SetOpArityMismatch` otherwise) and pairwise **compatible
+types** (`SetOpTypeMismatch` otherwise). Compatibility is conservative - exact
+match, `NULL`/`Unknown` unify with anything, and any two numeric types unify by
+numeric promotion; everything else is incompatible. The reconciled types become
+the set operation's output projection.
+
 ## Roadmap / not yet implemented
 
-* `SELECT *` expansion across visible relations (stubbed; skipped today).
-* `JOIN` ON/USING predicate resolution (join relations are made visible, but the
-  predicate is not yet resolved as its own pass).
-* Set operations (UNION/INTERSECT/EXCEPT) column-arity/type reconciliation.
 * Aggregate / GROUP BY / HAVING legality checking (validation pass).
 * Implicit type coercion rules and function-signature typing.
+* Set operations or qualified stars nested inside a FROM subquery / CTE body
+  (the current derived-table path analyzes a `SelectStmt` body only).

@@ -77,6 +77,13 @@ public:
         relations_.push_back(std::move(binding));
     }
 
+    // The relations made visible directly by this scope's own FROM clause, in
+    // FROM/JOIN order. Used to expand `SELECT *` / `table.*` (which expand over
+    // the current query block only, not outer scopes).
+    [[nodiscard]] const std::vector<RelationBinding>& relations() const {
+        return relations_;
+    }
+
     void add_cte(NamedRelation cte) {
         ctes_.push_back(std::move(cte));
     }

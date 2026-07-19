@@ -1,0 +1,117 @@
+name: CI
+
+# Build and test the semantic analyzer on every push and pull request.
+# The analyzer consumes the DB25 SQL parser via `find_package(DB25Parser)`,
+# so each job must build + install the parser dependency first, then point
+# the analyzer at that install prefix with -DCMAKE_PREFIX_PATH.
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the parser dependency, then build + test the analyzer.
+  # Runs once per compiler (g++-13 and g++-14 both build the parser).
+  # ---------------------------------------------------------------------------
+  build-and-test:
+    name: build-and-test (${{ matrix.cxx }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cxx: g++-14
+          - cxx: g++-13
+    steps:
+      # 1. Check out the analyzer.
+      - name: Checkout analyzer
+        uses: actions/checkout@v4
+
+      # 2. Install the compiler.
+      - name: Install ${{ matrix.cxx }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cxx }}
+
+      # 3. Build + install the parser dependency (portable / non-native build:
+      #    ENABLE_NATIVE is intentionally NOT passed so the binaries run on any
+      #    runner). Pinned to the parser's default branch (main). The tokenizer
+      #    is a git submodule and must be pulled recursively.
+      - name: Build and install DB25 SQL parser
+        run: |
+          git clone --branch main https://github.com/space-rf-org/db25-sql-parser
+          cd db25-sql-parser
+          git submodule update --init --recursive
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_TOOLS=OFF \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_INSTALL_PREFIX=$HOME/parser-install
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      # 4. Configure the analyzer against the parser install, build, and test.
+      - name: Configure analyzer
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_PREFIX_PATH=$HOME/parser-install
+
+      - name: Build analyzer
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test analyzer
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------------
+  # Same recipe, but build the analyzer with AddressSanitizer +
+  # UndefinedBehaviorSanitizer and run the tests under them. Only the analyzer
+  # is sanitized; the parser dependency stays a normal Release install.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: sanitizers (asan+ubsan)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout analyzer
+        uses: actions/checkout@v4
+
+      - name: Install g++-14
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14
+
+      # Parser install stays a plain Release build (no sanitizers needed).
+      - name: Build and install DB25 SQL parser
+        run: |
+          git clone --branch main https://github.com/space-rf-org/db25-sql-parser
+          cd db25-sql-parser
+          git submodule update --init --recursive
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_TOOLS=OFF \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_INSTALL_PREFIX=$HOME/parser-install
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      # Sanitizer flags apply to the analyzer's own translation units.
+      - name: Configure analyzer (asan+ubsan)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_PREFIX_PATH=$HOME/parser-install \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build analyzer (asan+ubsan)
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test analyzer (asan+ubsan)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure

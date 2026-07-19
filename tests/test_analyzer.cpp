@@ -62,6 +62,22 @@ InMemoryCatalog make_catalog_joins() {
     return cat;
 }
 
+// A catalog for grouping / aggregate tests:
+//   emp(id INTEGER NOT NULL, name TEXT, dept TEXT, region TEXT,
+//       salary DOUBLE, age INTEGER)
+InMemoryCatalog make_catalog_emp() {
+    InMemoryCatalog cat;
+    cat.add_table("emp", {
+        ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+        ColumnInfo{"name", DataType::Text, /*nullable=*/true},
+        ColumnInfo{"dept", DataType::Text, /*nullable=*/true},
+        ColumnInfo{"region", DataType::Text, /*nullable=*/true},
+        ColumnInfo{"salary", DataType::Double, /*nullable=*/true},
+        ColumnInfo{"age", DataType::Integer, /*nullable=*/true},
+    });
+    return cat;
+}
+
 // Find the first descendant of a given type (depth-first), or nullptr.
 ASTNode* find_descendant(ASTNode* n, NodeType type) {
     if (n == nullptr) return nullptr;
@@ -457,6 +473,181 @@ void test_setop_numeric_compatible() {
     }
 }
 
+// Find the first FunctionCall descendant with the given name (or nullptr).
+ASTNode* find_function(ASTNode* n, std::string_view name) {
+    if (n == nullptr) return nullptr;
+    if ((n->node_type == NodeType::FunctionCall ||
+         n->node_type == NodeType::FunctionExpr) &&
+        n->primary_text == name) {
+        return n;
+    }
+    for (ASTNode* c = first_child(n); c != nullptr; c = c->next_sibling) {
+        if (ASTNode* hit = find_function(c, name)) return hit;
+    }
+    return nullptr;
+}
+
+// --- GROUP BY / HAVING legality & function typing ----------------------
+
+void test_groupby_clean_count_star() {
+    std::printf("test_groupby_clean_count_star\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT dept, COUNT(*) FROM emp GROUP BY dept");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // Clean: dept is a grouping key, COUNT(*) is an aggregate.
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
+
+    // COUNT(*) is typed as an integer type (BigInt).
+    ASTNode* cnt = find_function(res.value(), "COUNT");
+    CHECK(cnt != nullptr && a.type_of(cnt) == DataType::BigInt);
+}
+
+void test_groupby_non_grouped_column() {
+    std::printf("test_groupby_non_grouped_column\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT dept, name FROM emp GROUP BY dept");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // name is neither grouped nor aggregated.
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
+void test_groupby_having_aggregate_clean() {
+    std::printf("test_groupby_having_aggregate_clean\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse(
+        "SELECT dept, SUM(salary) FROM emp GROUP BY dept HAVING SUM(salary) > 1000");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // HAVING references only an aggregate and dept is grouped: clean.
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
+
+    // SUM(salary) over a DOUBLE stays numeric (Double).
+    ASTNode* sum = find_function(res.value(), "SUM");
+    CHECK(sum != nullptr && a.type_of(sum) == DataType::Double);
+}
+
+void test_having_non_grouped_column() {
+    std::printf("test_having_non_grouped_column\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // name is not a grouping key and is not under an aggregate in HAVING.
+    auto res = p.parse(
+        "SELECT dept, SUM(salary) FROM emp GROUP BY dept HAVING name = 'x'");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
+void test_nested_aggregate() {
+    std::printf("test_nested_aggregate\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT SUM(COUNT(*)) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NestedAggregate) == 1);
+}
+
+void test_order_by_non_grouped() {
+    std::printf("test_order_by_non_grouped\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // name in ORDER BY is not a grouping key.
+    auto res = p.parse("SELECT dept, COUNT(*) FROM emp GROUP BY dept ORDER BY name");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
+void test_avg_result_type() {
+    std::printf("test_avg_result_type\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT AVG(salary) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    ASTNode* avg = find_function(res.value(), "AVG");
+    // AVG result is Double.
+    CHECK(avg != nullptr && a.type_of(avg) == DataType::Double);
+}
+
+void test_scalar_function_type() {
+    std::printf("test_scalar_function_type\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT UPPER(name) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // UPPER(...) -> Text; not a grouped query, so no grouping diagnostics.
+    CHECK(!a.has_errors());
+    ASTNode* up = find_function(res.value(), "UPPER");
+    CHECK(up != nullptr && a.type_of(up) == DataType::Text);
+}
+
+void test_unknown_function_degrades() {
+    std::printf("test_unknown_function_degrades\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT WIDGETIZE(name) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // Unknown function: type is Unknown, and it is only a soft (warning)
+    // diagnostic, so it is not an error.
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::UnknownFunction) == 1);
+    ASTNode* fn = find_function(res.value(), "WIDGETIZE");
+    CHECK(fn != nullptr && a.type_of(fn) == DataType::Unknown);
+}
+
+void test_aggregate_makes_query_grouped() {
+    std::printf("test_aggregate_makes_query_grouped\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // No GROUP BY, but the aggregate makes the query grouped, so the bare
+    // non-aggregated `name` is illegal.
+    auto res = p.parse("SELECT name, COUNT(*) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -485,6 +676,18 @@ int main() {
     test_setop_arity_mismatch();
     test_setop_type_mismatch();
     test_setop_numeric_compatible();
+
+    // GROUP BY / HAVING legality & function typing
+    test_groupby_clean_count_star();
+    test_groupby_non_grouped_column();
+    test_groupby_having_aggregate_clean();
+    test_having_non_grouped_column();
+    test_nested_aggregate();
+    test_order_by_non_grouped();
+    test_avg_result_type();
+    test_scalar_function_type();
+    test_unknown_function_degrades();
+    test_aggregate_makes_query_grouped();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

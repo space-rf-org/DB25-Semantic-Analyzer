@@ -25,6 +25,14 @@ enum class DiagnosticCode : std::uint16_t {
     SetOpArityMismatch,
     // Set-operation branches have incompatible column types pairwise.
     SetOpTypeMismatch,
+    // In a grouped query, a column referenced outside any aggregate that is not
+    // one of the GROUP BY keys (SELECT list, ORDER BY, or HAVING).
+    NonGroupedColumn,
+    // An aggregate function call nested directly inside another aggregate.
+    NestedAggregate,
+    // A function call whose name is not in the signature table; result type
+    // degrades to Unknown. Emitted as a Warning (not an error).
+    UnknownFunction,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

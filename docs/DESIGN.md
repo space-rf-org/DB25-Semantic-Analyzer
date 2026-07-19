@@ -45,9 +45,11 @@ the nodes and/or produces diagnostics.
                        |
                        v
    +-------------------------------------------------------------+
-   | Pass 3: Validation (FUTURE)                                  |
-   |   aggregate/group-by consistency, set-op arity, coercion     |
-   |   legality, subquery cardinality, etc. Not yet implemented.  |
+   | Pass 3: Validation                                          |
+   |   * set-op arity / type reconciliation                       |
+   |   * aggregate / GROUP BY / HAVING legality                   |
+   |   * function-signature typing + implicit numeric coercion    |
+   |   (subquery cardinality etc. still future)                   |
    +-------------------------------------------------------------+
 ```
 
@@ -232,9 +234,50 @@ match, `NULL`/`Unknown` unify with anything, and any two numeric types unify by
 numeric promotion; everything else is incompatible. The reconciled types become
 the set operation's output projection.
 
+## Aggregates, GROUP BY / HAVING legality, and function typing
+
+Built on the passes above and driven from `analyze_query` after FROM / SELECT /
+WHERE have been resolved.
+
+### Function & coercion typing
+
+A `FunctionCall` (the parser also has `FunctionExpr`) carries its name in
+`primary_text` and its arguments as children; `COUNT(*)` has a single `Star`
+child and `DISTINCT` sets `NodeFlags::Distinct`. A bare column that is the direct
+argument of a function is emitted as an `Identifier` (not a `ColumnRef`), so
+`infer_expr` resolves both node kinds the same way. `infer_expr` types a call
+from a small, extensible signature table (`function_result_type`):
+
+* **Aggregates** (`kAggregateNames` = COUNT, SUM, AVG, MIN, MAX — add a name
+  there to extend recognition everywhere): `COUNT → BigInt`; `SUM →` input type,
+  integer inputs widened to `BigInt`; `AVG → Double`; `MIN`/`MAX →` argument
+  type.
+* **Scalars**: `UPPER`/`LOWER → Text`, `LENGTH → Integer`, `ABS →` numeric arg
+  type, `COALESCE →` its arguments unified via `reconcile_types` (the same
+  conservative numeric-promotion / NULL-unification rule used for set
+  operations).
+* **Unknown** names degrade to `Unknown` and raise a soft `UnknownFunction`
+  **Warning** (never an error, so `has_errors()` is unaffected).
+
+### GROUP BY / HAVING legality
+
+A query is *grouped* if it has a `GroupByClause` or any aggregate in the SELECT
+list. `analyze_grouping` collects the grouping keys (as resolved
+`(table_id, column_id)` identity, with the reference text as a fallback for
+unresolved / derived keys) and walks the SELECT list, ORDER BY, and HAVING:
+
+* a column reference **outside** any aggregate that is not a grouping key →
+  `NonGroupedColumn`;
+* an aggregate nested directly inside another aggregate → `NestedAggregate`.
+
+Columns beneath an aggregate are exempt from the grouping rule. GROUP BY and
+ORDER BY expressions are resolved against the FROM scope through the ordinary
+`infer_expr` path, so they emit the usual unresolved-column diagnostics.
+
 ## Roadmap / not yet implemented
 
-* Aggregate / GROUP BY / HAVING legality checking (validation pass).
-* Implicit type coercion rules and function-signature typing.
+* Subquery cardinality checks and correlated-aggregate scoping.
+* Expression-valued GROUP BY keys matched to SELECT expressions (currently
+  keyed by resolved column identity, or reference text as a fallback).
 * Set operations or qualified stars nested inside a FROM subquery / CTE body
   (the current derived-table path analyzes a `SelectStmt` body only).

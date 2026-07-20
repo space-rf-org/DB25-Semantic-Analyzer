@@ -96,6 +96,11 @@ private:
     // warning); anything else is a TypeMismatch error. `at` locates the value.
     void check_assignment(DataType target, DataType value, const ASTNode* at);
 
+    // Validate a LIMIT / OFFSET clause: any operand that is a literal must be a
+    // non-negative integer (negative or non-integer literal -> InvalidLimit).
+    // Non-literal operands are skipped.
+    void check_limit(ASTNode* limit_clause);
+
     // Analyze a SELECT query block under `parent` scope and return the list of
     // columns it projects (used when the block is a derived table or CTE body).
     std::vector<ResolvedColumn> analyze_query(ASTNode* select_stmt, Scope* parent);

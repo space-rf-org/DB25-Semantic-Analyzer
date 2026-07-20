@@ -1265,6 +1265,168 @@ void test_delete_where_synth() {
     CHECK(a.diagnostics().empty());
 }
 
+// --- CASE expression typing --------------------------------------------
+
+void test_case_searched_text() {
+    std::printf("test_case_searched_text\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("SELECT CASE WHEN id > 0 THEN 'a' ELSE 'b' END FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* ce = find_descendant(res.value(), NodeType::CaseExpr);
+    CHECK(ce != nullptr && a.type_of(ce) == DataType::Text);
+    // Both branches are not-null and there is an ELSE, so the CASE is not-null.
+    CHECK(ce != nullptr && a.nullability_of(ce) == 1);
+}
+
+void test_case_type_mismatch() {
+    std::printf("test_case_type_mismatch\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // 'a' (Text) vs 1 (Integer) across CASE branches: incompatible.
+    auto res = p.parse("SELECT CASE WHEN id > 0 THEN 'a' ELSE 1 END FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 1);
+}
+
+void test_case_no_else_nullable() {
+    std::printf("test_case_no_else_nullable\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // No ELSE: an unmatched CASE yields NULL, so the result is nullable.
+    auto res = p.parse("SELECT CASE WHEN id > 0 THEN 'a' END FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    ASTNode* ce = find_descendant(res.value(), NodeType::CaseExpr);
+    CHECK(ce != nullptr && a.type_of(ce) == DataType::Text);
+    CHECK(ce != nullptr && a.nullability_of(ce) == 2);
+}
+
+void test_case_simple_clean() {
+    std::printf("test_case_simple_clean\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // Simple CASE: the WHEN operands are compared to `id`, not booleans, so no
+    // non-boolean-condition warning is emitted.
+    auto res = p.parse("SELECT CASE id WHEN 1 THEN 'a' ELSE 'b' END FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    ASTNode* ce = find_descendant(res.value(), NodeType::CaseExpr);
+    CHECK(ce != nullptr && a.type_of(ce) == DataType::Text);
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 0);
+    CHECK(!a.has_errors());
+}
+
+void test_case_nonboolean_when_warns() {
+    std::printf("test_case_nonboolean_when_warns\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // Searched CASE whose WHEN operand is `id` (Integer, not boolean): a soft
+    // warning, not an error.
+    auto res = p.parse("SELECT CASE WHEN id THEN 'a' ELSE 'b' END FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
+    CHECK(!a.has_errors());
+}
+
+// --- ORDER BY / LIMIT --------------------------------------------------
+
+void test_order_by_alias_resolves() {
+    std::printf("test_order_by_alias_resolves\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // ORDER BY references the SELECT-list alias `x`.
+    auto res = p.parse("SELECT id AS x FROM users ORDER BY x");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+}
+
+void test_order_by_unknown_column() {
+    std::printf("test_order_by_unknown_column\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // `bogus` is neither an output name nor a column of users.
+    auto res = p.parse("SELECT id FROM users ORDER BY bogus");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
+}
+
+void test_limit_valid() {
+    std::printf("test_limit_valid\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("SELECT id FROM users LIMIT 10");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::InvalidLimit) == 0);
+    CHECK(!a.has_errors());
+}
+
+void test_limit_float_invalid() {
+    std::printf("test_limit_float_invalid\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // A fractional LIMIT literal is not a valid (integer) row count.
+    auto res = p.parse("SELECT id FROM users LIMIT 1.5");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::InvalidLimit) == 1);
+}
+
+void test_limit_negative_synth() {
+    std::printf("test_limit_negative_synth\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // The parser build drops a negative LIMIT literal, so attach a synthesized
+    // LimitClause with a negative integer operand to a real SELECT.
+    auto res = p.parse("SELECT id FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    SynthTree t;
+    ASTNode* limit = t.make(NodeType::LimitClause);
+    t.adopt(limit, t.make(NodeType::IntegerLiteral, "-1"));
+    SynthTree::adopt(res.value(), limit);
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::InvalidLimit) == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -1349,6 +1511,20 @@ int main() {
     test_delete_clean();
     test_delete_unknown_table();
     test_delete_where_synth();
+
+    // CASE expression typing
+    test_case_searched_text();
+    test_case_type_mismatch();
+    test_case_no_else_nullable();
+    test_case_simple_clean();
+    test_case_nonboolean_when_warns();
+
+    // ORDER BY / LIMIT
+    test_order_by_alias_resolves();
+    test_order_by_unknown_column();
+    test_limit_valid();
+    test_limit_float_invalid();
+    test_limit_negative_synth();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

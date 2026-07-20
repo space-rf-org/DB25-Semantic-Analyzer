@@ -617,6 +617,37 @@ void Analyzer::analyze_delete(ASTNode* delete_stmt) {
     }
 }
 
+void Analyzer::check_limit(ASTNode* limit_clause) {
+    for (ASTNode* op = first_child(limit_clause); op != nullptr; op = op->next_sibling) {
+        // Only literal operands are constrained: a LIMIT / OFFSET value must be a
+        // non-negative integer. A FloatLiteral is fractional by construction; an
+        // IntegerLiteral is validated by text because the parser build tags a
+        // fractional token (e.g. "1.5") as an IntegerLiteral whose text is not a
+        // plain integer. Non-literal operands (parameters, expressions) are not
+        // constrained.
+        const bool is_int = op->node_type == NodeType::IntegerLiteral;
+        const bool is_float = op->node_type == NodeType::FloatLiteral;
+        if (!is_int && !is_float) {
+            continue;
+        }
+        const std::string_view t = op->primary_text;
+        bool valid = is_int && !t.empty();
+        if (valid) {
+            for (const char ch : t) {
+                if (ch < '0' || ch > '9') {  // rejects '-', '.', etc.
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if (!valid) {
+            add_diagnostic(DiagnosticCode::InvalidLimit,
+                           "LIMIT/OFFSET operand must be a non-negative integer",
+                           op);
+        }
+    }
+}
+
 const std::vector<ResolvedColumn>* Analyzer::projection_of(const ASTNode* query) const {
     const auto it = projections_.find(query);
     return it == projections_.end() ? nullptr : &it->second;
@@ -757,14 +788,38 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
         }
     }
 
-    // 7. ORDER BY: resolve each sort expression against the FROM scope.
+    // 7. ORDER BY: resolve each sort expression first against the SELECT-list
+    //    output names/aliases (SQL lets ORDER BY reference an output column by
+    //    its alias), then, failing that, against the FROM scope.
     if (ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
         for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
-            infer_expr(item, scope);
+            const ResolvedColumn* out_match = nullptr;
+            if (is_column_ref_node(item->node_type)) {
+                const std::string_view name = split_column_ref(item->primary_text).column;
+                for (const auto& col : output) {
+                    if (col.name == name) {
+                        out_match = &col;
+                        break;
+                    }
+                }
+            }
+            if (out_match != nullptr) {
+                // Resolved against the projection; type flows from the output
+                // column and no FROM-scope lookup (or diagnostic) is needed.
+                record_type(item, out_match->type);
+                record_nullability(item, out_match->nullable ? 2 : 1);
+            } else {
+                infer_expr(item, scope);
+            }
         }
     }
 
-    // 8. Aggregate / GROUP BY / HAVING legality (validation pass).
+    // 8. LIMIT / OFFSET: literal operands must be non-negative integers.
+    if (ASTNode* limit = find_child(select_stmt, NodeType::LimitClause)) {
+        check_limit(limit);
+    }
+
+    // 9. Aggregate / GROUP BY / HAVING legality (validation pass).
     analyze_grouping(select_stmt, group_by, scope);
 
     projections_[select_stmt] = output;
@@ -1191,6 +1246,90 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             record_type(expr, result);
             // A scalar subquery may return no rows, so its value is nullable.
             record_nullability(expr, 2);
+            return result;
+        }
+
+        case NodeType::CaseExpr: {
+            // Parser layout (confirmed by probing real trees):
+            //   * searched CASE: children are WHEN branches, each a BinaryExpr
+            //     whose primary_text is "WHEN" with two children [condition,
+            //     THEN-result], optionally followed by a bare ELSE expression.
+            //   * simple CASE `CASE op WHEN v THEN r ...`: an extra leading
+            //     operand child precedes the WHEN branches; each WHEN branch's
+            //     first child is the compare value (not a boolean condition).
+            // We unify the THEN results and the ELSE (UnionReconcile) for the
+            // result type; a searched-CASE WHEN condition that is clearly not
+            // boolean gets a soft warning.
+            std::vector<ASTNode*> children;
+            for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
+                children.push_back(c);
+            }
+            auto is_when = [](const ASTNode* n) {
+                return n->node_type == NodeType::BinaryExpr &&
+                       to_upper(n->primary_text) == "WHEN";
+            };
+            // A leading non-WHEN child is the simple-CASE operand; a trailing
+            // non-WHEN child (after the WHEN branches) is the ELSE result.
+            const bool simple =
+                !children.empty() && !is_when(children.front());
+            if (simple) {
+                infer_expr(children.front(), scope);  // resolve the operand
+            }
+            std::vector<DataType> branch_types;
+            std::vector<int> branch_nulls;
+            bool has_else = false;
+            for (std::size_t i = 0; i < children.size(); ++i) {
+                ASTNode* c = children[i];
+                if (simple && i == 0) {
+                    continue;  // operand, already handled
+                }
+                if (is_when(c)) {
+                    ASTNode* cond = first_child(c);
+                    ASTNode* then_res = cond != nullptr ? cond->next_sibling : nullptr;
+                    const DataType ct = infer_expr(cond, scope);
+                    // In a searched CASE the WHEN operand is a predicate; warn if
+                    // it is clearly a non-boolean, non-wildcard type.
+                    if (!simple && cond != nullptr) {
+                        const TypeCategory cc = category_of(ct);
+                        if (cc != TypeCategory::Boolean && cc != TypeCategory::Wildcard) {
+                            add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                                           "CASE WHEN condition is not a boolean expression",
+                                           c, Severity::Warning);
+                        }
+                    }
+                    const DataType tt = infer_expr(then_res, scope);
+                    branch_types.push_back(tt);
+                    branch_nulls.push_back(null_of(then_res));
+                } else {
+                    // Trailing bare expression: the ELSE result.
+                    has_else = true;
+                    const DataType et = infer_expr(c, scope);
+                    branch_types.push_back(et);
+                    branch_nulls.push_back(null_of(c));
+                }
+            }
+            // Unify the branch result types (THEN + ELSE).
+            DataType result = DataType::Unknown;
+            bool mismatch = false;
+            for (const DataType bt : branch_types) {
+                const Coercion r = coerce(result, bt, CoercionKind::UnionReconcile);
+                if (r.status == CoercionStatus::Incompatible) {
+                    mismatch = true;
+                }
+                result = r.type;
+            }
+            if (mismatch) {
+                add_diagnostic(DiagnosticCode::TypeMismatch,
+                               "incompatible result types among CASE branches", expr);
+            }
+            record_type(expr, result);
+            // Nullable if any branch can be NULL, or if there is no ELSE (an
+            // unmatched CASE yields NULL).
+            int null_state = combine_nullable_any(branch_nulls);
+            if (!has_else) {
+                null_state = 2;
+            }
+            record_nullability(expr, null_state);
             return result;
         }
 

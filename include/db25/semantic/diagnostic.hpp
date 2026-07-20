@@ -51,6 +51,9 @@ enum class DiagnosticCode : std::uint16_t {
     // An INSERT omits a NOT NULL target column that has no default value, so the
     // row would violate the NOT NULL constraint.
     NotNullViolation,
+    // A LIMIT / OFFSET operand that is a literal but is negative or not an
+    // integer (e.g. `LIMIT -1`, `LIMIT 1.5`).
+    InvalidLimit,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

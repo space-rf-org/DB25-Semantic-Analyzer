@@ -321,7 +321,6 @@ The *kind* only changes what a non-unifiable pairing means:
   integer column); any other cross-category pairing is a `TypeMismatch` **error**
   (e.g. a boolean into an integer column).
 
-
 `BinaryExpr` comparison/arithmetic, set-operation column reconciliation, `IN`
 type-compatibility, and `COALESCE` unification are all routed through it.
 
@@ -391,7 +390,31 @@ star tests already do):
   INSERT tests;
 * a **DML `WHERE` predicate** is mis-parsed (the predicate collapses to a single
   `ColumnRef` whose text is the keyword `WHERE`), so WHERE-resolution tests
-  synthesize the predicate.
+  synthesize the predicate;
+* a **negative `LIMIT`** literal (`LIMIT -1`) drops the whole `LimitClause`, and a
+  fractional `LIMIT` (`LIMIT 1.5`) is tagged as an `IntegerLiteral` with text
+  `"1.5"` — hence `check_limit` validates an integer operand by its **text**.
+
+## CASE expression typing
+
+`infer_expr` types a `CaseExpr`. Parser layout: a searched CASE is a sequence of
+`BinaryExpr` WHEN branches (`primary_text == "WHEN"`, children `[condition,
+then-result]`) optionally followed by a bare ELSE expression; a simple CASE
+(`CASE op WHEN v THEN r …`) has an extra leading operand child, and each WHEN
+branch's first child is a compare value rather than a boolean. The result type is
+the `UnionReconcile` unification of the THEN results and the ELSE (incompatible
+branches → `TypeMismatch`). Nullability: nullable if any branch is nullable **or**
+there is no ELSE. For a searched CASE, a WHEN condition whose type is clearly not
+boolean raises a soft `ImplicitCoercion` warning.
+
+## ORDER BY / LIMIT semantics
+
+In `analyze_query`, each `OrderByClause` item is resolved first against the
+SELECT-list output names/aliases (an ORDER BY may reference an output column by
+alias) and, failing that, against the FROM scope via `infer_expr` (unresolvable →
+`UnresolvedColumn`). `LimitClause` operands that are literals must be
+non-negative integers; a negative or non-integer literal → `InvalidLimit`
+(`check_limit`), while non-literal operands are not constrained.
 
 ## Roadmap / not yet implemented
 

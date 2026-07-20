@@ -39,6 +39,12 @@ enum class DiagnosticCode : std::uint16_t {
     // Operands of an arithmetic operator whose types cannot be coerced to a
     // common numeric type (e.g. text + integer). An error.
     TypeMismatch,
+    // A subquery used in a scalar position (SELECT-list item, comparison operand)
+    // projects more than one column.
+    ScalarSubqueryColumns,
+    // The subquery on the right of `expr IN (subquery)` does not project exactly
+    // one column.
+    InSubqueryColumns,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

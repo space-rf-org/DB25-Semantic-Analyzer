@@ -71,6 +71,10 @@ struct ColumnResolution {
     bool found = false;
     bool ambiguous = false;      // matched more than one relation (bare ref)
     bool bad_qualifier = false;  // qualifier named no visible relation
+    // True when the reference resolved in an *enclosing* scope rather than the
+    // scope it was looked up from: a correlated reference. Used to mark a
+    // subquery correlated (no diagnostic; correlation is legal).
+    bool from_outer = false;
     ResolvedColumn column;
 };
 
@@ -130,6 +134,7 @@ public:
                 if (const auto* col = rel.find_column(column)) {
                     ColumnResolution res;
                     res.found = true;
+                    res.from_outer = (s != this);
                     res.column = *col;
                     // A relation on the null-supplying side of an outer join
                     // makes every column nullable, base constraint notwithstanding.
@@ -161,6 +166,7 @@ public:
             if (matches == 1) {
                 ColumnResolution res;
                 res.found = true;
+                res.from_outer = (s != this);
                 res.column = *hit;
                 res.column.nullable = res.column.nullable || hit_rel->nullable_from_join;
                 return res;

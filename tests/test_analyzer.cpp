@@ -782,6 +782,129 @@ void test_coercion_arithmetic_text_int_error() {
     CHECK(a.has_errors());
 }
 
+// --- Subquery correlation ----------------------------------------------
+
+void test_exists_correlated_clean() {
+    std::printf("test_exists_correlated_clean\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // u.id inside the subquery resolves against the enclosing query: correlated,
+    // no diagnostic; EXISTS(...) types Boolean.
+    auto res = p.parse(
+        "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.uid = u.id)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+
+    ASTNode* where = find_child(res.value(), NodeType::WhereClause);
+    ASTNode* exists = where ? first_child(where) : nullptr;
+    CHECK(exists != nullptr && a.type_of(exists) == DataType::Boolean);
+    ASTNode* subq = find_descendant(res.value(), NodeType::Subquery);
+    CHECK(subq != nullptr && a.is_correlated(subq));
+}
+
+void test_subquery_unresolved_in_neither_scope() {
+    std::printf("test_subquery_unresolved_in_neither_scope\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // `zzz` is a column of neither the subquery's orders nor the outer users.
+    auto res = p.parse(
+        "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.uid = zzz)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
+}
+
+void test_scalar_subquery_single_column() {
+    std::printf("test_scalar_subquery_single_column\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // Scalar subquery projects one column (COUNT(*) -> BigInt); clean.
+    auto res = p.parse("SELECT (SELECT COUNT(*) FROM orders) FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::ScalarSubqueryColumns) == 0);
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* subq = first_child(list);
+    CHECK(subq != nullptr && subq->node_type == NodeType::Subquery);
+    CHECK(subq != nullptr && a.type_of(subq) == DataType::BigInt);  // integer-typed
+    // Uncorrelated.
+    CHECK(subq != nullptr && !a.is_correlated(subq));
+}
+
+void test_scalar_subquery_too_many_columns() {
+    std::printf("test_scalar_subquery_too_many_columns\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // Scalar subquery projects two columns: ScalarSubqueryColumns diagnostic.
+    auto res = p.parse("SELECT (SELECT id, uid FROM orders) FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::ScalarSubqueryColumns) == 1);
+}
+
+void test_in_subquery_single_compatible() {
+    std::printf("test_in_subquery_single_compatible\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // id (INTEGER) IN (SELECT uid ...) where uid is INTEGER: one column,
+    // type-compatible, clean.
+    auto res = p.parse("SELECT id FROM users WHERE id IN (SELECT uid FROM orders)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::InSubqueryColumns) == 0);
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 0);
+}
+
+void test_in_subquery_multi_column() {
+    std::printf("test_in_subquery_multi_column\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // Subquery on the right of IN projects two columns: diagnostic.
+    auto res = p.parse("SELECT id FROM users WHERE id IN (SELECT uid, id FROM orders)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::InSubqueryColumns) == 1);
+}
+
+void test_in_subquery_incompatible_type() {
+    std::printf("test_in_subquery_incompatible_type\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // id (INTEGER) IN (SELECT note ...) where note is TEXT: single column but a
+    // cross-category comparison -> implicit-coercion diagnostic.
+    auto res = p.parse("SELECT id FROM users WHERE id IN (SELECT note FROM users)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::InSubqueryColumns) == 0);
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -832,6 +955,15 @@ int main() {
     test_coercion_numeric_comparison_clean();
     test_coercion_text_int_comparison_warns();
     test_coercion_arithmetic_text_int_error();
+
+    // Subquery correlation & scalar / IN subqueries
+    test_exists_correlated_clean();
+    test_subquery_unresolved_in_neither_scope();
+    test_scalar_subquery_single_column();
+    test_scalar_subquery_too_many_columns();
+    test_in_subquery_single_compatible();
+    test_in_subquery_multi_column();
+    test_in_subquery_incompatible_type();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

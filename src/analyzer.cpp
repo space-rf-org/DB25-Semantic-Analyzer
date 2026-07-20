@@ -417,6 +417,11 @@ int Analyzer::null_of(const ASTNode* node) const {
     return nullability_of(node);
 }
 
+bool Analyzer::is_correlated(const ASTNode* subquery) const {
+    const auto it = correlated_.find(subquery);
+    return it != correlated_.end() && it->second;
+}
+
 void Analyzer::record_type(ASTNode* node, DataType type) {
     if (node == nullptr) {
         return;
@@ -794,6 +799,11 @@ ResolvedColumn Analyzer::resolve_column_ref(ASTNode* col_ref, Scope& scope) {
         // Nullability comes from the catalog column, already adjusted for the
         // null-supplying side of an outer join by the scope resolver.
         record_nullability(col_ref, res.column.nullable ? 2 : 1);
+        // A reference that resolved in an enclosing scope makes the subquery we
+        // are currently analyzing correlated (no diagnostic: this is legal).
+        if (res.from_outer && corr_sink_ != nullptr) {
+            *corr_sink_ = true;
+        }
         return res.column;
     }
 
@@ -913,14 +923,83 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
         }
 
         case NodeType::UnaryExpr: {
+            const std::string_view op = expr->primary_text;
+            const std::string upper = to_upper(op);
+            // EXISTS (subquery) / NOT EXISTS (subquery): always Boolean and never
+            // NULL; arity of the subquery is irrelevant, correlation is allowed.
+            if (upper == "EXISTS" || upper == "NOT EXISTS") {
+                for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
+                    if (c->node_type == NodeType::Subquery ||
+                        c->node_type == NodeType::SubqueryExpr) {
+                        analyze_subquery(c, scope);
+                    }
+                }
+                record_type(expr, DataType::Boolean);
+                record_nullability(expr, 1);
+                return DataType::Boolean;
+            }
             ASTNode* operand = first_child(expr);
             const DataType ot = infer_expr(operand, scope);
-            const std::string_view op = expr->primary_text;
             const DataType result =
-                (op == "NOT" || op == "not") ? DataType::Boolean : ot;
+                (upper == "NOT") ? DataType::Boolean : ot;
             record_type(expr, result);
             record_nullability(expr, null_of(operand));
             return result;
+        }
+
+        // A subquery used in a scalar position (a SELECT-list item or one side of
+        // a comparison) takes the type of its single projected column; projecting
+        // more than one column is a ScalarSubqueryColumns diagnostic.
+        case NodeType::Subquery:
+        case NodeType::SubqueryExpr: {
+            const std::vector<ResolvedColumn> proj = analyze_subquery(expr, scope);
+            if (proj.size() > 1) {
+                add_diagnostic(DiagnosticCode::ScalarSubqueryColumns,
+                               "scalar subquery projects " + std::to_string(proj.size()) +
+                                   " columns; exactly one is required",
+                               expr);
+            }
+            const DataType result = proj.empty() ? DataType::Unknown : proj.front().type;
+            record_type(expr, result);
+            // A scalar subquery may return no rows, so its value is nullable.
+            record_nullability(expr, 2);
+            return result;
+        }
+
+        case NodeType::InExpr: {
+            ASTNode* left = first_child(expr);
+            const DataType lt = infer_expr(left, scope);
+            ASTNode* right = left != nullptr ? left->next_sibling : nullptr;
+            if (right != nullptr && (right->node_type == NodeType::Subquery ||
+                                     right->node_type == NodeType::SubqueryExpr)) {
+                // `expr IN (subquery)`: the subquery must project exactly one
+                // column, type-compatible with the left operand.
+                const std::vector<ResolvedColumn> proj = analyze_subquery(right, scope);
+                if (proj.size() != 1) {
+                    add_diagnostic(DiagnosticCode::InSubqueryColumns,
+                                   "subquery on the right of IN projects " +
+                                       std::to_string(proj.size()) +
+                                       " columns; exactly one is required",
+                                   expr);
+                } else {
+                    const Coercion c = coerce(lt, proj.front().type,
+                                              CoercionKind::Comparison);
+                    if (c.status != CoercionStatus::Ok) {
+                        add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                                       "implicit coercion between IN operand and "
+                                       "subquery column of a different type category",
+                                       expr, Severity::Warning);
+                    }
+                }
+            } else {
+                // `expr IN (list)`: infer each list element (resolves columns).
+                for (ASTNode* c = right; c != nullptr; c = c->next_sibling) {
+                    infer_expr(c, scope);
+                }
+            }
+            record_type(expr, DataType::Boolean);
+            record_nullability(expr, null_of(left));
+            return DataType::Boolean;
         }
 
         default: {
@@ -932,6 +1011,41 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             return DataType::Unknown;
         }
     }
+}
+
+std::vector<ResolvedColumn> Analyzer::analyze_subquery(ASTNode* subquery, Scope& enclosing) {
+    if (subquery == nullptr) {
+        return {};
+    }
+    // The subquery's inner query block. A plain subquery wraps a SelectStmt; a
+    // set operation (UNION/…) is handled through analyze_stmt.
+    ASTNode* inner = find_child(subquery, NodeType::SelectStmt);
+    if (inner == nullptr) {
+        for (ASTNode* c = first_child(subquery); c != nullptr; c = c->next_sibling) {
+            if (is_setop(c->node_type)) {
+                inner = c;
+                break;
+            }
+        }
+    }
+
+    // Track correlation for this subquery: while analyzing its body, point the
+    // correlation sink at a local flag so a column that resolves in an enclosing
+    // scope sets it. Saved/restored so nested subqueries mark their own flag.
+    bool correlated = false;
+    bool* saved = corr_sink_;
+    corr_sink_ = &correlated;
+    std::vector<ResolvedColumn> proj;
+    if (inner != nullptr) {
+        proj = analyze_stmt(inner, &enclosing);
+    }
+    corr_sink_ = saved;
+
+    correlated_[subquery] = correlated;
+    if (correlated) {
+        subquery->set_flag(ast::NodeFlags::IsCorrelated);
+    }
+    return proj;
 }
 
 namespace {

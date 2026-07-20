@@ -320,10 +320,32 @@ The *kind* only changes what a non-unifiable pairing means:
 `BinaryExpr` comparison/arithmetic, set-operation column reconciliation, `IN`
 type-compatibility, and `COALESCE` unification are all routed through it.
 
+## Subquery correlation, scalar & IN subqueries
+
+Subqueries appearing in **expression** position (a `Subquery`/`SubqueryExpr` used
+as a scalar, on the right of `IN`, or under `EXISTS`) are analyzed by
+`analyze_subquery`, which runs the inner query block under a **child scope** of
+the enclosing query so unresolved-in-self references resolve outward (the scope
+stack already walks parents). A column that resolves in an enclosing scope
+(`ColumnResolution::from_outer`) marks the subquery **correlated** — recorded in a
+side map (`Analyzer::is_correlated`) and mirrored as `NodeFlags::IsCorrelated`,
+with **no** diagnostic; a reference that resolves in neither scope is the usual
+`UnresolvedColumn`.
+
+* **Scalar subquery** (SELECT-list item / comparison operand): takes the type of
+  its single projected column; projecting more than one column →
+  `ScalarSubqueryColumns`.
+* **`EXISTS (subquery)`** (parsed as a `UnaryExpr` with `primary_text` `EXISTS`):
+  always `Boolean`, not-null, arity irrelevant, correlation allowed.
+* **`expr IN (subquery)`** (an `InExpr` with a `Subquery` right child): the
+  subquery must project exactly one column (`InSubqueryColumns` otherwise),
+  type-compatible with the left operand via the coercion model (a cross-category
+  pairing raises the `ImplicitCoercion` warning).
+
 ## Roadmap / not yet implemented
 
-* Subquery cardinality checks and correlated-aggregate scoping.
+* Subquery cardinality checks beyond the scalar/IN arity rules above, and
+  correlated-aggregate scoping.
 * Expression-valued GROUP BY keys matched to SELECT expressions (currently
   keyed by resolved column identity, or reference text as a fallback).
-* Set operations or qualified stars nested inside a FROM subquery / CTE body
-  (the current derived-table path analyzes a `SelectStmt` body only).
+* Qualified stars nested inside a FROM subquery / CTE body.

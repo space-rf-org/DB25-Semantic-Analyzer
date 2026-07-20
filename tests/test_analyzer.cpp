@@ -648,6 +648,101 @@ void test_aggregate_makes_query_grouped() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
+// --- Extended built-in function catalog --------------------------------
+
+// A representative subset of the scalar catalog: string, numeric and
+// date/time functions resolve to their proper types and, being recognized,
+// raise no UnknownFunction warning.
+void test_scalar_catalog_string_numeric_types() {
+    std::printf("test_scalar_catalog_string_numeric_types\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse(
+        "SELECT SUBSTR(name, 1, 3), CHAR_LENGTH(name), ROUND(salary), "
+        "POWER(age, 2), SIGN(age) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    // Every function above is in the catalog, so no spurious warnings.
+    CHECK(count_code(a, DiagnosticCode::UnknownFunction) == 0);
+
+    ASTNode* sub = find_function(res.value(), "SUBSTR");
+    CHECK(sub != nullptr && a.type_of(sub) == DataType::Text);
+    ASTNode* clen = find_function(res.value(), "CHAR_LENGTH");
+    CHECK(clen != nullptr && a.type_of(clen) == DataType::Integer);
+    // ROUND preserves the (numeric) argument type: salary is DOUBLE.
+    ASTNode* rnd = find_function(res.value(), "ROUND");
+    CHECK(rnd != nullptr && a.type_of(rnd) == DataType::Double);
+    // POWER widens to an approximate DOUBLE result.
+    ASTNode* pw = find_function(res.value(), "POWER");
+    CHECK(pw != nullptr && a.type_of(pw) == DataType::Double);
+    ASTNode* sg = find_function(res.value(), "SIGN");
+    CHECK(sg != nullptr && a.type_of(sg) == DataType::Integer);
+}
+
+// NOW() is niladic and never returns NULL; it is a recognized function.
+void test_scalar_catalog_now_not_null() {
+    std::printf("test_scalar_catalog_now_not_null\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT NOW() FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::UnknownFunction) == 0);
+    ASTNode* now = find_function(res.value(), "NOW");
+    CHECK(now != nullptr && a.type_of(now) == DataType::Timestamp);
+    CHECK(now != nullptr && now->context.analysis.nullability == 1);  // NOT NULL
+}
+
+// The newly registered statistical / collection / boolean aggregates carry
+// their proper result types and produce no UnknownFunction warning.
+void test_aggregate_catalog_types() {
+    std::printf("test_aggregate_catalog_types\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse(
+        "SELECT STDDEV(salary), VAR_POP(salary), STRING_AGG(name, ','), "
+        "BOOL_OR(age > 30) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::UnknownFunction) == 0);
+
+    ASTNode* sd = find_function(res.value(), "STDDEV");
+    CHECK(sd != nullptr && a.type_of(sd) == DataType::Double);
+    ASTNode* vp = find_function(res.value(), "VAR_POP");
+    CHECK(vp != nullptr && a.type_of(vp) == DataType::Double);
+    ASTNode* sa = find_function(res.value(), "STRING_AGG");
+    CHECK(sa != nullptr && a.type_of(sa) == DataType::Text);
+    ASTNode* bo = find_function(res.value(), "BOOL_OR");
+    CHECK(bo != nullptr && a.type_of(bo) == DataType::Boolean);
+    // An aggregate over a possibly-empty group is nullable.
+    CHECK(sd != nullptr && sd->context.analysis.nullability == 2);
+}
+
+// A new aggregate must be treated as an aggregate by the grouping logic:
+// a bare non-grouped column alongside STDDEV(...) is illegal.
+void test_new_aggregate_forces_grouping() {
+    std::printf("test_new_aggregate_forces_grouping\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT name, STDDEV(salary) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
 // A catalog for nullability / correlation / subquery tests:
 //   users(id INTEGER NOT NULL, note TEXT)
 //   orders(id INTEGER NOT NULL, uid INTEGER NOT NULL, amount DOUBLE)
@@ -1829,6 +1924,12 @@ int main() {
     test_scalar_function_type();
     test_unknown_function_degrades();
     test_aggregate_makes_query_grouped();
+
+    // Extended built-in function catalog
+    test_scalar_catalog_string_numeric_types();
+    test_scalar_catalog_now_not_null();
+    test_aggregate_catalog_types();
+    test_new_aggregate_forces_grouping();
 
     // Nullability propagation
     test_nullability_columns_and_functions();

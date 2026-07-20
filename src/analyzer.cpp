@@ -28,9 +28,16 @@ namespace {
 
 // The set of function names treated as aggregates. Kept as a single table so it
 // is trivially extensible: add a name here and it is recognized everywhere
-// (grouping legality and result typing).
-constexpr std::array<std::string_view, 5> kAggregateNames = {
+// (grouping legality and result typing). Registering a name here is what makes
+// the grouping logic treat a call as an aggregate (so a bare non-grouped column
+// alongside it is flagged) and lets an empty-group result be typed as nullable.
+constexpr std::array<std::string_view, 15> kAggregateNames = {
+    // Core SQL aggregates.
     "COUNT", "SUM", "AVG", "MIN", "MAX",
+    // Statistical aggregates (all yield an approximate DOUBLE result).
+    "STDDEV", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "VAR_POP", "VAR_SAMP",
+    // Collection / boolean aggregates.
+    "STRING_AGG", "ARRAY_AGG", "BOOL_AND", "BOOL_OR",
 };
 
 [[nodiscard]] bool is_aggregate_name(std::string_view upper_name) {
@@ -317,24 +324,113 @@ struct FunctionType {
         if (upper_name == "SUM") {
             return {sum_result(arg0), true};
         }
-        if (upper_name == "AVG") {
+        // AVG and the statistical aggregates produce an approximate (DOUBLE)
+        // result regardless of the (numeric) input kind.
+        if (upper_name == "AVG" || upper_name == "STDDEV" ||
+            upper_name == "STDDEV_POP" || upper_name == "STDDEV_SAMP" ||
+            upper_name == "VARIANCE" || upper_name == "VAR_POP" ||
+            upper_name == "VAR_SAMP") {
             return {DataType::Double, true};
+        }
+        // STRING_AGG concatenates the group's values into one string.
+        if (upper_name == "STRING_AGG") {
+            return {DataType::Text, true};
+        }
+        // ARRAY_AGG collects the group's values into an array.
+        if (upper_name == "ARRAY_AGG") {
+            return {DataType::Array, true};
+        }
+        // BOOL_AND / BOOL_OR reduce a group of booleans to one boolean.
+        if (upper_name == "BOOL_AND" || upper_name == "BOOL_OR") {
+            return {DataType::Boolean, true};
         }
         // MIN / MAX preserve the argument type.
         return {arg0, true};
     }
 
-    // Scalar function signature table (extend here as needed).
-    if (upper_name == "UPPER" || upper_name == "LOWER") {
+    // -----------------------------------------------------------------------
+    // Scalar function signature table (grouped by category; extend here).
+    // -----------------------------------------------------------------------
+    // We only classify the *result type* here and mark the name as recognized
+    // (known=true); argument nullability is combined separately in
+    // function_nullability. A recognized name never raises a spurious
+    // UnknownFunction warning even when its result type has to degrade to
+    // Unknown (e.g. a numeric function applied to a non-numeric argument).
+
+    // --- String functions -> Text ------------------------------------------
+    // Case conversion, substring extraction, trimming, concatenation,
+    // padding, and replacement all yield character data.
+    if (upper_name == "UPPER" || upper_name == "LOWER" ||
+        upper_name == "INITCAP" || upper_name == "SUBSTRING" ||
+        upper_name == "SUBSTR" || upper_name == "TRIM" ||
+        upper_name == "LTRIM" || upper_name == "RTRIM" ||
+        upper_name == "CONCAT" || upper_name == "REPLACE" ||
+        upper_name == "LEFT" || upper_name == "RIGHT" ||
+        upper_name == "LPAD" || upper_name == "RPAD") {
         return {DataType::Text, true};
     }
-    if (upper_name == "LENGTH") {
+    // --- String functions -> Integer (length / position) -------------------
+    if (upper_name == "LENGTH" || upper_name == "CHAR_LENGTH" ||
+        upper_name == "CHARACTER_LENGTH" || upper_name == "POSITION" ||
+        upper_name == "STRPOS") {
         return {DataType::Integer, true};
     }
-    if (upper_name == "ABS") {
+
+    // --- Numeric functions: preserve the (numeric) argument type -----------
+    // ABS/CEIL/FLOOR/ROUND/TRUNC/MOD keep the numeric kind of their first
+    // argument (e.g. ROUND(DECIMAL) -> DECIMAL); a non-numeric argument
+    // degrades to Unknown while the name stays recognized.
+    if (upper_name == "ABS" || upper_name == "CEIL" ||
+        upper_name == "CEILING" || upper_name == "FLOOR" ||
+        upper_name == "ROUND" || upper_name == "TRUNC" ||
+        upper_name == "MOD") {
         return {is_numeric(arg0) ? arg0 : DataType::Unknown, true};
     }
-    if (upper_name == "COALESCE") {
+    // SIGN returns -1 / 0 / 1.
+    if (upper_name == "SIGN") {
+        return {DataType::Integer, true};
+    }
+    // --- Numeric functions: approximate (DOUBLE) result --------------------
+    if (upper_name == "POWER" || upper_name == "POW" ||
+        upper_name == "SQRT" || upper_name == "EXP" ||
+        upper_name == "LN" || upper_name == "LOG") {
+        return {DataType::Double, true};
+    }
+
+    // --- Date/time functions -----------------------------------------------
+    // The niladic current-value functions have fixed result types.
+    if (upper_name == "NOW" || upper_name == "CURRENT_TIMESTAMP") {
+        return {DataType::Timestamp, true};
+    }
+    if (upper_name == "CURRENT_DATE") {
+        return {DataType::Date, true};
+    }
+    if (upper_name == "CURRENT_TIME") {
+        return {DataType::Time, true};
+    }
+    // DATE_TRUNC rounds a timestamp down to a field boundary.
+    if (upper_name == "DATE_TRUNC") {
+        return {DataType::Timestamp, true};
+    }
+    // EXTRACT / DATE_PART return the requested field as a numeric value.
+    if (upper_name == "EXTRACT" || upper_name == "DATE_PART") {
+        return {DataType::Double, true};
+    }
+    // AGE returns the difference between two timestamps as an interval.
+    if (upper_name == "AGE") {
+        return {DataType::Interval, true};
+    }
+
+    // --- Conditional functions ---------------------------------------------
+    // NULLIF(a, b) is `a` when a<>b else NULL: it takes the first argument's
+    // type (and is always nullable, handled in function_nullability).
+    if (upper_name == "NULLIF") {
+        return {arg0, true};
+    }
+    // GREATEST / LEAST and COALESCE reconcile all argument types to a common
+    // type (Unknown when the arguments are incompatible).
+    if (upper_name == "GREATEST" || upper_name == "LEAST" ||
+        upper_name == "COALESCE") {
         DataType unified = DataType::Unknown;
         for (const DataType a : args) {
             unified = unify_type(unified, a);
@@ -373,9 +469,18 @@ struct FunctionType {
     if (upper_name == "COUNT") {
         return 1;  // COUNT never returns NULL
     }
-    if (upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" ||
-        upper_name == "MAX") {
-        return 2;  // aggregates over an empty group yield NULL
+    if (is_aggregate_name(upper_name)) {
+        return 2;  // any other aggregate over an empty group yields NULL
+    }
+    // The niladic current-value date/time functions always return a value.
+    if (upper_name == "NOW" || upper_name == "CURRENT_TIMESTAMP" ||
+        upper_name == "CURRENT_DATE" || upper_name == "CURRENT_TIME") {
+        return 1;
+    }
+    // NULLIF can always return NULL (when its two arguments are equal),
+    // independent of its arguments' own nullability.
+    if (upper_name == "NULLIF") {
+        return 2;
     }
     if (upper_name == "COALESCE") {
         // NOT NULL iff any argument is known not-null (in particular a not-null

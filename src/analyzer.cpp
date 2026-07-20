@@ -620,11 +620,10 @@ void Analyzer::analyze_delete(ASTNode* delete_stmt) {
 void Analyzer::check_limit(ASTNode* limit_clause) {
     for (ASTNode* op = first_child(limit_clause); op != nullptr; op = op->next_sibling) {
         // Only literal operands are constrained: a LIMIT / OFFSET value must be a
-        // non-negative integer. A FloatLiteral is fractional by construction; an
-        // IntegerLiteral is validated by text because the parser build tags a
-        // fractional token (e.g. "1.5") as an IntegerLiteral whose text is not a
-        // plain integer. Non-literal operands (parameters, expressions) are not
-        // constrained.
+        // non-negative integer. A FloatLiteral is fractional by construction and
+        // always rejected; an IntegerLiteral is validated by text so a negative
+        // literal (e.g. "-1") is rejected. Non-literal operands (parameters,
+        // expressions) are not constrained.
         const bool is_int = op->node_type == NodeType::IntegerLiteral;
         const bool is_float = op->node_type == NodeType::FloatLiteral;
         if (!is_int && !is_float) {

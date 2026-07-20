@@ -9,10 +9,8 @@
 #include "db25/semantic/catalog.hpp"
 
 #include <cstdio>
-#include <memory>
 #include <string>
 #include <string_view>
-#include <vector>
 
 using namespace db25;
 using namespace db25::semantic;
@@ -100,40 +98,6 @@ int count_code(const Analyzer& a, DiagnosticCode code) {
     }
     return n;
 }
-
-// Minimal AST synthesis, used only to exercise analyzer paths the consumed
-// parser build cannot yet represent: an explicit INSERT column list, a DML WHERE
-// predicate, and a negative LIMIT literal (see the parser-limitation notes in
-// docs/DESIGN.md). Nodes are heap-allocated so their addresses are stable, and
-// primary_text points at string literals with static storage. This mirrors the
-// approach already used by the qualified-star tests above, which synthesize a
-// node shape the parser does not emit.
-struct SynthTree {
-    std::vector<std::unique_ptr<ASTNode>> nodes;
-
-    ASTNode* make(NodeType t, std::string_view text = {}) {
-        auto n = std::make_unique<ASTNode>(t);
-        n->primary_text = text;
-        ASTNode* p = n.get();
-        nodes.push_back(std::move(n));
-        return p;
-    }
-
-    // Append `child` as the last child of `parent`, maintaining the sibling chain
-    // and child_count the analyzer relies on.
-    static ASTNode* adopt(ASTNode* parent, ASTNode* child) {
-        child->parent = parent;
-        if (parent->first_child == nullptr) {
-            parent->first_child = child;
-        } else {
-            ASTNode* c = parent->first_child;
-            while (c->next_sibling != nullptr) c = c->next_sibling;
-            c->next_sibling = child;
-        }
-        ++parent->child_count;
-        return child;
-    }
-};
 
 // --- Tests --------------------------------------------------------------
 
@@ -1049,24 +1013,21 @@ void test_insert_unknown_table() {
     CHECK(count_code(a, DiagnosticCode::UnresolvedTable) == 1);
 }
 
-// Explicit-column-list INSERT: the parser build drops the column list, so the
-// InsertStmt shape (TableRef, ColumnList, ValuesClause[row]) is synthesized.
+// Explicit-column-list INSERT, parsed end-to-end: the parser emits the
+// InsertStmt shape (TableRef, ColumnList[Identifier...], ValuesClause[row]).
 void test_insert_explicit_columns_clean() {
     std::printf("test_insert_explicit_columns_clean\n");
     auto cat = make_catalog();
-    SynthTree t;
-    ASTNode* ins = t.make(NodeType::InsertStmt);
-    t.adopt(ins, t.make(NodeType::TableRef, "users"));
-    ASTNode* cols = t.adopt(ins, t.make(NodeType::ColumnList));
-    t.adopt(cols, t.make(NodeType::ColumnRef, "id"));
-    t.adopt(cols, t.make(NodeType::ColumnRef, "name"));
-    ASTNode* values = t.adopt(ins, t.make(NodeType::ValuesClause));
-    ASTNode* row = t.adopt(values, t.make(NodeType::Subquery));
-    t.adopt(row, t.make(NodeType::IntegerLiteral, "1"));
-    t.adopt(row, t.make(NodeType::StringLiteral, "'a'"));
+    parser::Parser p;
+    auto res = p.parse("INSERT INTO users (id, name) VALUES (1, 'a')");
+    CHECK(res.has_value());
+    if (!res) return;
+    // The parser really produced an explicit column list.
+    CHECK(res.value()->node_type == NodeType::InsertStmt);
+    CHECK(find_child(res.value(), NodeType::ColumnList) != nullptr);
 
     Analyzer a(cat);
-    a.analyze(ins);
+    a.analyze(res.value());
     CHECK(!a.has_errors());
     CHECK(a.diagnostics().empty());
 }
@@ -1074,36 +1035,28 @@ void test_insert_explicit_columns_clean() {
 void test_insert_explicit_unknown_column() {
     std::printf("test_insert_explicit_unknown_column\n");
     auto cat = make_catalog();
-    SynthTree t;
-    ASTNode* ins = t.make(NodeType::InsertStmt);
-    t.adopt(ins, t.make(NodeType::TableRef, "users"));
-    ASTNode* cols = t.adopt(ins, t.make(NodeType::ColumnList));
-    t.adopt(cols, t.make(NodeType::ColumnRef, "id"));
-    t.adopt(cols, t.make(NodeType::ColumnRef, "bogus"));  // not a column of users
-    ASTNode* values = t.adopt(ins, t.make(NodeType::ValuesClause));
-    ASTNode* row = t.adopt(values, t.make(NodeType::Subquery));
-    t.adopt(row, t.make(NodeType::IntegerLiteral, "1"));
-    t.adopt(row, t.make(NodeType::IntegerLiteral, "2"));
+    parser::Parser p;
+    // bogus is not a column of users.
+    auto res = p.parse("INSERT INTO users (id, bogus) VALUES (1, 2)");
+    CHECK(res.has_value());
+    if (!res) return;
 
     Analyzer a(cat);
-    a.analyze(ins);
+    a.analyze(res.value());
     CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
 }
 
 void test_insert_not_null_violation() {
     std::printf("test_insert_not_null_violation\n");
     auto cat = make_catalog();  // id is NOT NULL with no default
-    SynthTree t;
-    ASTNode* ins = t.make(NodeType::InsertStmt);
-    t.adopt(ins, t.make(NodeType::TableRef, "users"));
-    ASTNode* cols = t.adopt(ins, t.make(NodeType::ColumnList));
-    t.adopt(cols, t.make(NodeType::ColumnRef, "name"));  // id omitted
-    ASTNode* values = t.adopt(ins, t.make(NodeType::ValuesClause));
-    ASTNode* row = t.adopt(values, t.make(NodeType::Subquery));
-    t.adopt(row, t.make(NodeType::StringLiteral, "'a'"));
+    parser::Parser p;
+    // id is omitted from the explicit column list.
+    auto res = p.parse("INSERT INTO users (name) VALUES ('a')");
+    CHECK(res.has_value());
+    if (!res) return;
 
     Analyzer a(cat);
-    a.analyze(ins);
+    a.analyze(res.value());
     // id is NOT NULL, receives no value, and has no default.
     CHECK(count_code(a, DiagnosticCode::NotNullViolation) == 1);
     CHECK(count_code(a, DiagnosticCode::InsertArityMismatch) == 0);
@@ -1117,17 +1070,13 @@ void test_insert_not_null_with_default_ok() {
         ColumnInfo{"id", DataType::Integer, /*nullable=*/false, /*has_default=*/true},
         ColumnInfo{"name", DataType::Text, /*nullable=*/true},
     });
-    SynthTree t;
-    ASTNode* ins = t.make(NodeType::InsertStmt);
-    t.adopt(ins, t.make(NodeType::TableRef, "users"));
-    ASTNode* cols = t.adopt(ins, t.make(NodeType::ColumnList));
-    t.adopt(cols, t.make(NodeType::ColumnRef, "name"));  // id omitted, but has default
-    ASTNode* values = t.adopt(ins, t.make(NodeType::ValuesClause));
-    ASTNode* row = t.adopt(values, t.make(NodeType::Subquery));
-    t.adopt(row, t.make(NodeType::StringLiteral, "'a'"));
+    parser::Parser p;
+    auto res = p.parse("INSERT INTO users (name) VALUES ('a')");  // id omitted, but has default
+    CHECK(res.has_value());
+    if (!res) return;
 
     Analyzer a(cat);
-    a.analyze(ins);
+    a.analyze(res.value());
     CHECK(count_code(a, DiagnosticCode::NotNullViolation) == 0);
     CHECK(!a.has_errors());
 }
@@ -1176,45 +1125,35 @@ void test_update_type_diagnostic() {
     CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
 }
 
-void test_update_where_synth() {
-    std::printf("test_update_where_synth\n");
+void test_update_where() {
+    std::printf("test_update_where\n");
     auto cat = make_catalog();
-    // Synthesize `UPDATE users SET name = 'b' WHERE id = 1`; the parser build
-    // mis-parses a DML WHERE predicate, so we build the WHERE subtree.
-    SynthTree t;
-    ASTNode* upd = t.make(NodeType::UpdateStmt);
-    t.adopt(upd, t.make(NodeType::TableRef, "users"));
-    ASTNode* set = t.adopt(upd, t.make(NodeType::SetClause));
-    ASTNode* asgn = t.adopt(set, t.make(NodeType::BinaryExpr, "name"));
-    t.adopt(asgn, t.make(NodeType::StringLiteral, "'b'"));
-    ASTNode* where = t.adopt(upd, t.make(NodeType::WhereClause));
-    ASTNode* eq = t.adopt(where, t.make(NodeType::BinaryExpr, "="));
-    t.adopt(eq, t.make(NodeType::ColumnRef, "id"));
-    t.adopt(eq, t.make(NodeType::IntegerLiteral, "1"));
+    parser::Parser p;
+    auto res = p.parse("UPDATE users SET name = 'b' WHERE id = 1");
+    CHECK(res.has_value());
+    if (!res) return;
+    // The parser really produced a DML WHERE clause.
+    CHECK(res.value()->node_type == NodeType::UpdateStmt);
+    CHECK(find_child(res.value(), NodeType::WhereClause) != nullptr);
 
     Analyzer a(cat);
-    a.analyze(upd);
+    a.analyze(res.value());
     // id resolves against the target table; the assignment is clean.
     CHECK(!a.has_errors());
     CHECK(a.diagnostics().empty());
 }
 
-void test_update_where_unresolved_synth() {
-    std::printf("test_update_where_unresolved_synth\n");
+void test_update_where_unresolved() {
+    std::printf("test_update_where_unresolved\n");
     auto cat = make_catalog();
-    SynthTree t;
-    ASTNode* upd = t.make(NodeType::UpdateStmt);
-    t.adopt(upd, t.make(NodeType::TableRef, "users"));
-    ASTNode* set = t.adopt(upd, t.make(NodeType::SetClause));
-    ASTNode* asgn = t.adopt(set, t.make(NodeType::BinaryExpr, "name"));
-    t.adopt(asgn, t.make(NodeType::StringLiteral, "'b'"));
-    ASTNode* where = t.adopt(upd, t.make(NodeType::WhereClause));
-    ASTNode* eq = t.adopt(where, t.make(NodeType::BinaryExpr, "="));
-    t.adopt(eq, t.make(NodeType::ColumnRef, "bogus"));  // not a column of users
-    t.adopt(eq, t.make(NodeType::IntegerLiteral, "1"));
+    parser::Parser p;
+    // bogus in the WHERE predicate is not a column of users.
+    auto res = p.parse("UPDATE users SET name = 'b' WHERE bogus = 1");
+    CHECK(res.has_value());
+    if (!res) return;
 
     Analyzer a(cat);
-    a.analyze(upd);
+    a.analyze(res.value());
     CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
 }
 
@@ -1247,20 +1186,18 @@ void test_delete_unknown_table() {
     CHECK(count_code(a, DiagnosticCode::UnresolvedTable) == 1);
 }
 
-void test_delete_where_synth() {
-    std::printf("test_delete_where_synth\n");
+void test_delete_where() {
+    std::printf("test_delete_where\n");
     auto cat = make_catalog();
-    // Synthesize `DELETE FROM users WHERE id = 1`.
-    SynthTree t;
-    ASTNode* del = t.make(NodeType::DeleteStmt);
-    t.adopt(del, t.make(NodeType::TableRef, "users"));
-    ASTNode* where = t.adopt(del, t.make(NodeType::WhereClause));
-    ASTNode* eq = t.adopt(where, t.make(NodeType::BinaryExpr, "="));
-    t.adopt(eq, t.make(NodeType::ColumnRef, "id"));
-    t.adopt(eq, t.make(NodeType::IntegerLiteral, "1"));
+    parser::Parser p;
+    auto res = p.parse("DELETE FROM users WHERE id = 1");
+    CHECK(res.has_value());
+    if (!res) return;
+    CHECK(res.value()->node_type == NodeType::DeleteStmt);
+    CHECK(find_child(res.value(), NodeType::WhereClause) != nullptr);
 
     Analyzer a(cat);
-    a.analyze(del);
+    a.analyze(res.value());
     CHECK(!a.has_errors());
     CHECK(a.diagnostics().empty());
 }
@@ -1407,24 +1344,42 @@ void test_limit_float_invalid() {
     CHECK(count_code(a, DiagnosticCode::InvalidLimit) == 1);
 }
 
-void test_limit_negative_synth() {
-    std::printf("test_limit_negative_synth\n");
+void test_limit_negative() {
+    std::printf("test_limit_negative\n");
     auto cat = make_catalog();
     parser::Parser p;
-    // The parser build drops a negative LIMIT literal, so attach a synthesized
-    // LimitClause with a negative integer operand to a real SELECT.
-    auto res = p.parse("SELECT id FROM users");
+    // A negative LIMIT literal parses as LimitClause -> IntegerLiteral "-1".
+    auto res = p.parse("SELECT id FROM users LIMIT -1");
     CHECK(res.has_value());
     if (!res) return;
-
-    SynthTree t;
-    ASTNode* limit = t.make(NodeType::LimitClause);
-    t.adopt(limit, t.make(NodeType::IntegerLiteral, "-1"));
-    SynthTree::adopt(res.value(), limit);
+    ASTNode* limit = find_child(res.value(), NodeType::LimitClause);
+    CHECK(limit != nullptr);
 
     Analyzer a(cat);
     a.analyze(res.value());
     CHECK(count_code(a, DiagnosticCode::InvalidLimit) == 1);
+}
+
+void test_float_literal_type() {
+    std::printf("test_float_literal_type\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // A fractional / scientific literal parses as a FloatLiteral and types Double.
+    auto res = p.parse("SELECT 1.5, 1e3 FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* f1 = list ? first_child(list) : nullptr;
+    ASTNode* f2 = f1 ? f1->next_sibling : nullptr;
+    CHECK(f1 != nullptr && f1->node_type == NodeType::FloatLiteral);
+    CHECK(f2 != nullptr && f2->node_type == NodeType::FloatLiteral);
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(f1 != nullptr && a.type_of(f1) == DataType::Double);
+    CHECK(f2 != nullptr && a.type_of(f2) == DataType::Double);
 }
 
 }  // namespace
@@ -1504,13 +1459,13 @@ int main() {
     test_update_clean();
     test_update_unknown_column();
     test_update_type_diagnostic();
-    test_update_where_synth();
-    test_update_where_unresolved_synth();
+    test_update_where();
+    test_update_where_unresolved();
 
     // DML: DELETE
     test_delete_clean();
     test_delete_unknown_table();
-    test_delete_where_synth();
+    test_delete_where();
 
     // CASE expression typing
     test_case_searched_text();
@@ -1524,7 +1479,8 @@ int main() {
     test_order_by_unknown_column();
     test_limit_valid();
     test_limit_float_invalid();
-    test_limit_negative_synth();
+    test_limit_negative();
+    test_float_literal_type();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

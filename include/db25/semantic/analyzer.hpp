@@ -42,8 +42,9 @@ class Analyzer {
 public:
     explicit Analyzer(const Catalog& catalog) : catalog_(catalog) {}
 
-    // Analyze a statement (root node). Currently handles SELECT statements,
-    // including their CTEs and subqueries; other statement kinds are ignored
+    // Analyze a statement (root node). Handles SELECT statements (including their
+    // CTEs and subqueries), set operations (UNION/INTERSECT/EXCEPT), and the DML
+    // statements INSERT / UPDATE / DELETE; other statement kinds are ignored
     // gracefully (no diagnostics, no crash).
     void analyze(ASTNode* root);
 
@@ -75,6 +76,25 @@ private:
     // Analyze a statement that yields a row set: a SELECT block or a set
     // operation (UNION/INTERSECT/EXCEPT). Returns the projected columns.
     std::vector<ResolvedColumn> analyze_stmt(ASTNode* node, Scope* parent);
+
+    // DML entry points. Each resolves the target table in the catalog and, for
+    // UPDATE/DELETE, brings it into a fresh scope so SET values and the WHERE
+    // predicate resolve against it. All conservative: unmodeled shapes degrade
+    // rather than crash. See docs/DESIGN.md.
+    void analyze_insert(ASTNode* insert_stmt);
+    void analyze_update(ASTNode* update_stmt);
+    void analyze_delete(ASTNode* delete_stmt);
+
+    // Resolve a base-table reference by name and, when found, add it to `scope`
+    // as a relation (columns from the catalog). Emits UnresolvedTable and returns
+    // nullptr when the name is not a known table. Used by UPDATE / DELETE.
+    const TableInfo* bind_base_table(ASTNode* table_ref, Scope& scope);
+
+    // Type-check assigning a value of type `value` into a target column of type
+    // `target` using the coercion model's assignment rules: a clean or numeric/
+    // string implicit conversion is accepted (the latter as an ImplicitCoercion
+    // warning); anything else is a TypeMismatch error. `at` locates the value.
+    void check_assignment(DataType target, DataType value, const ASTNode* at);
 
     // Analyze a SELECT query block under `parent` scope and return the list of
     // columns it projects (used when the block is a derived table or CTE body).

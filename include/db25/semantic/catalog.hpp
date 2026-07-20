@@ -24,6 +24,13 @@ struct ColumnInfo {
     std::string name;
     DataType type = DataType::Unknown;
     bool nullable = true;
+    // True when the column has a DEFAULT (or is otherwise auto-populated, e.g. a
+    // serial/identity column). An INSERT that omits a NOT NULL column only
+    // violates the constraint when the column also has no default. Optional and
+    // defaults to false so existing catalog builders keep compiling; positioned
+    // before column_id so brace-init call sites that pass {name, type, nullable}
+    // are unaffected.
+    bool has_default = false;
     std::uint32_t column_id = 0;  // stable id within the owning table
 };
 

@@ -45,6 +45,12 @@ enum class DiagnosticCode : std::uint16_t {
     // The subquery on the right of `expr IN (subquery)` does not project exactly
     // one column.
     InSubqueryColumns,
+    // An INSERT row (VALUES row or the projection of INSERT ... SELECT) has a
+    // different number of values than the target column list.
+    InsertArityMismatch,
+    // An INSERT omits a NOT NULL target column that has no default value, so the
+    // row would violate the NOT NULL constraint.
+    NotNullViolation,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

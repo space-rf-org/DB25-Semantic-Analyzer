@@ -305,7 +305,7 @@ while the preserved side (`u.id`) stays not-null.
 
 The previous conservative set-op reconcile helper is generalized into a single
 `coerce(a, b, kind)` model (`CoercionKind` = `Comparison` / `Arithmetic` /
-`UnionReconcile`) returning `{status, type}` where status is `Ok`,
+`UnionReconcile` / `Assignment`) returning `{status, type}` where status is `Ok`,
 `ImplicitCoercion`, or `Incompatible`. Rules: identical types and
 `NULL`/`Unknown`/`ANY` wildcards unify cleanly; numeric types unify by promotion
 (`Integer < BigInt < Decimal < Double`); `char`/`varchar`/`text` unify to `text`;
@@ -315,7 +315,12 @@ The *kind* only changes what a non-unifiable pairing means:
 * **comparison** → allowed as a soft `ImplicitCoercion` **warning** (never trips
   `has_errors()`); numeric-vs-numeric and string-vs-string stay clean;
 * **arithmetic** → a hard `TypeMismatch` **error** (e.g. `text + integer`);
-* **union-reconcile** → `SetOpTypeMismatch` (unchanged behavior).
+* **union-reconcile** → `SetOpTypeMismatch` (unchanged behavior);
+* **assignment** (INSERT value → column, UPDATE `SET` value) → a numeric↔string
+  pairing is a soft `ImplicitCoercion` **warning** (e.g. a text literal into an
+  integer column); any other cross-category pairing is a `TypeMismatch` **error**
+  (e.g. a boolean into an integer column).
+
 
 `BinaryExpr` comparison/arithmetic, set-operation column reconciliation, `IN`
 type-compatibility, and `COALESCE` unification are all routed through it.
@@ -341,6 +346,52 @@ with **no** diagnostic; a reference that resolves in neither scope is the usual
   subquery must project exactly one column (`InSubqueryColumns` otherwise),
   type-compatible with the left operand via the coercion model (a cross-category
   pairing raises the `ImplicitCoercion` warning).
+
+## DML statements (INSERT / UPDATE / DELETE)
+
+`analyze()` dispatches `InsertStmt` / `UpdateStmt` / `DeleteStmt` alongside
+`SelectStmt` and the set-operation nodes. All checks are additive and degrade to
+"skip" on shapes not modeled.
+
+* **INSERT** (`analyze_insert`): the target `TableRef` is resolved in the catalog
+  (unknown → `UnresolvedTable`, and analysis stops — nothing to check against).
+  The target column list is an explicit `ColumnList` child when present (each
+  entry must be a column of the table, else `UnresolvedColumn`) or, implicitly,
+  the table's columns in declaration order. Values come from either a
+  `ValuesClause` (each row is a `Subquery`/`RowExpr` whose direct children are the
+  value expressions) or a source query for `INSERT … SELECT`. Per row / per
+  projection: the value count must equal the target column count
+  (`InsertArityMismatch`), and each value's type is checked against its target
+  column via the assignment coercion model. Finally, a NOT NULL target column
+  that receives no value and has no default (`ColumnInfo::has_default`) →
+  `NotNullViolation`.
+* **UPDATE** (`analyze_update`): the target table is bound into a fresh scope
+  (`bind_base_table`). Each `SetClause` assignment is a `BinaryExpr` whose
+  `primary_text` is the target column (unknown → `UnresolvedColumn`) and whose
+  first child is the value expression (type-checked against the column via the
+  assignment model). The `WhereClause` predicate is resolved against the table
+  scope.
+* **DELETE** (`analyze_delete`): the target table is bound into scope and the
+  `WhereClause` predicate is resolved against it.
+
+`ColumnInfo` gained an optional `has_default` flag (defaults to `false`, placed
+before `column_id` so `{name, type, nullable}` brace-init call sites are
+unaffected).
+
+### Parser-shape limitations (this consumed build)
+
+The analyzer is written against the correct/forward-compatible shapes, but the
+consumed parser build mis-parses three DML/clause constructs; the tests
+synthesize the intended node shape to exercise the analyzer (as the qualified-
+star tests already do):
+
+* an **explicit INSERT column list** `INSERT INTO t (a, b) …` drops both the
+  column list and the VALUES/SELECT source (leaving only the `TableRef`); the
+  implicit-column-list forms parse correctly and are used for the parse-driven
+  INSERT tests;
+* a **DML `WHERE` predicate** is mis-parsed (the predicate collapses to a single
+  `ColumnRef` whose text is the keyword `WHERE`), so WHERE-resolution tests
+  synthesize the predicate.
 
 ## Roadmap / not yet implemented
 

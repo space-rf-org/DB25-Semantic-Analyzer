@@ -9,8 +9,10 @@
 #include "db25/semantic/catalog.hpp"
 
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace db25;
 using namespace db25::semantic;
@@ -98,6 +100,40 @@ int count_code(const Analyzer& a, DiagnosticCode code) {
     }
     return n;
 }
+
+// Minimal AST synthesis, used only to exercise analyzer paths the consumed
+// parser build cannot yet represent: an explicit INSERT column list, a DML WHERE
+// predicate, and a negative LIMIT literal (see the parser-limitation notes in
+// docs/DESIGN.md). Nodes are heap-allocated so their addresses are stable, and
+// primary_text points at string literals with static storage. This mirrors the
+// approach already used by the qualified-star tests above, which synthesize a
+// node shape the parser does not emit.
+struct SynthTree {
+    std::vector<std::unique_ptr<ASTNode>> nodes;
+
+    ASTNode* make(NodeType t, std::string_view text = {}) {
+        auto n = std::make_unique<ASTNode>(t);
+        n->primary_text = text;
+        ASTNode* p = n.get();
+        nodes.push_back(std::move(n));
+        return p;
+    }
+
+    // Append `child` as the last child of `parent`, maintaining the sibling chain
+    // and child_count the analyzer relies on.
+    static ASTNode* adopt(ASTNode* parent, ASTNode* child) {
+        child->parent = parent;
+        if (parent->first_child == nullptr) {
+            parent->first_child = child;
+        } else {
+            ASTNode* c = parent->first_child;
+            while (c->next_sibling != nullptr) c = c->next_sibling;
+            c->next_sibling = child;
+        }
+        ++parent->child_count;
+        return child;
+    }
+};
 
 // --- Tests --------------------------------------------------------------
 
@@ -905,6 +941,330 @@ void test_in_subquery_incompatible_type() {
     CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
 }
 
+// --- DML: INSERT -------------------------------------------------------
+
+void test_insert_clean() {
+    std::printf("test_insert_clean\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT)
+    parser::Parser p;
+    // Implicit column list = (id, name); the consumed parser drops an explicit
+    // column list, so we use the implicit form here (see docs/DESIGN.md).
+    auto res = p.parse("INSERT INTO users VALUES (1, 'a')");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(res.value()->node_type == NodeType::InsertStmt);
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+}
+
+void test_insert_arity_mismatch() {
+    std::printf("test_insert_arity_mismatch\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // One value but the (implicit) target column list has two columns.
+    auto res = p.parse("INSERT INTO users VALUES (1)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::InsertArityMismatch) == 1);
+}
+
+void test_insert_type_implicit_coercion() {
+    std::printf("test_insert_type_implicit_coercion\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // 'x' (Text) into id (Integer): numeric<->string is a soft implicit
+    // conversion under the assignment coercion model (a warning, not an error).
+    auto res = p.parse("INSERT INTO users VALUES ('x', 'a')");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
+    CHECK(!a.has_errors());
+}
+
+void test_insert_type_mismatch() {
+    std::printf("test_insert_type_mismatch\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // TRUE (Boolean) into id (Integer): boolean vs numeric is not an implicit
+    // conversion -> a hard TypeMismatch error.
+    auto res = p.parse("INSERT INTO users VALUES (TRUE, 'a')");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 1);
+    CHECK(a.has_errors());
+}
+
+void test_insert_select_clean() {
+    std::printf("test_insert_select_clean\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // Projection (id, name) matches the target's implicit column list.
+    auto res = p.parse("INSERT INTO users SELECT id, name FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+}
+
+void test_insert_select_arity_mismatch() {
+    std::printf("test_insert_select_arity_mismatch\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // Projection has one column; the target has two.
+    auto res = p.parse("INSERT INTO users SELECT id FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::InsertArityMismatch) == 1);
+}
+
+void test_insert_unknown_table() {
+    std::printf("test_insert_unknown_table\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("INSERT INTO nonexistent VALUES (1)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedTable) == 1);
+}
+
+// Explicit-column-list INSERT: the parser build drops the column list, so the
+// InsertStmt shape (TableRef, ColumnList, ValuesClause[row]) is synthesized.
+void test_insert_explicit_columns_clean() {
+    std::printf("test_insert_explicit_columns_clean\n");
+    auto cat = make_catalog();
+    SynthTree t;
+    ASTNode* ins = t.make(NodeType::InsertStmt);
+    t.adopt(ins, t.make(NodeType::TableRef, "users"));
+    ASTNode* cols = t.adopt(ins, t.make(NodeType::ColumnList));
+    t.adopt(cols, t.make(NodeType::ColumnRef, "id"));
+    t.adopt(cols, t.make(NodeType::ColumnRef, "name"));
+    ASTNode* values = t.adopt(ins, t.make(NodeType::ValuesClause));
+    ASTNode* row = t.adopt(values, t.make(NodeType::Subquery));
+    t.adopt(row, t.make(NodeType::IntegerLiteral, "1"));
+    t.adopt(row, t.make(NodeType::StringLiteral, "'a'"));
+
+    Analyzer a(cat);
+    a.analyze(ins);
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+}
+
+void test_insert_explicit_unknown_column() {
+    std::printf("test_insert_explicit_unknown_column\n");
+    auto cat = make_catalog();
+    SynthTree t;
+    ASTNode* ins = t.make(NodeType::InsertStmt);
+    t.adopt(ins, t.make(NodeType::TableRef, "users"));
+    ASTNode* cols = t.adopt(ins, t.make(NodeType::ColumnList));
+    t.adopt(cols, t.make(NodeType::ColumnRef, "id"));
+    t.adopt(cols, t.make(NodeType::ColumnRef, "bogus"));  // not a column of users
+    ASTNode* values = t.adopt(ins, t.make(NodeType::ValuesClause));
+    ASTNode* row = t.adopt(values, t.make(NodeType::Subquery));
+    t.adopt(row, t.make(NodeType::IntegerLiteral, "1"));
+    t.adopt(row, t.make(NodeType::IntegerLiteral, "2"));
+
+    Analyzer a(cat);
+    a.analyze(ins);
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
+}
+
+void test_insert_not_null_violation() {
+    std::printf("test_insert_not_null_violation\n");
+    auto cat = make_catalog();  // id is NOT NULL with no default
+    SynthTree t;
+    ASTNode* ins = t.make(NodeType::InsertStmt);
+    t.adopt(ins, t.make(NodeType::TableRef, "users"));
+    ASTNode* cols = t.adopt(ins, t.make(NodeType::ColumnList));
+    t.adopt(cols, t.make(NodeType::ColumnRef, "name"));  // id omitted
+    ASTNode* values = t.adopt(ins, t.make(NodeType::ValuesClause));
+    ASTNode* row = t.adopt(values, t.make(NodeType::Subquery));
+    t.adopt(row, t.make(NodeType::StringLiteral, "'a'"));
+
+    Analyzer a(cat);
+    a.analyze(ins);
+    // id is NOT NULL, receives no value, and has no default.
+    CHECK(count_code(a, DiagnosticCode::NotNullViolation) == 1);
+    CHECK(count_code(a, DiagnosticCode::InsertArityMismatch) == 0);
+}
+
+void test_insert_not_null_with_default_ok() {
+    std::printf("test_insert_not_null_with_default_ok\n");
+    // id is NOT NULL but has a default, so omitting it is fine.
+    InMemoryCatalog cat;
+    cat.add_table("users", {
+        ColumnInfo{"id", DataType::Integer, /*nullable=*/false, /*has_default=*/true},
+        ColumnInfo{"name", DataType::Text, /*nullable=*/true},
+    });
+    SynthTree t;
+    ASTNode* ins = t.make(NodeType::InsertStmt);
+    t.adopt(ins, t.make(NodeType::TableRef, "users"));
+    ASTNode* cols = t.adopt(ins, t.make(NodeType::ColumnList));
+    t.adopt(cols, t.make(NodeType::ColumnRef, "name"));  // id omitted, but has default
+    ASTNode* values = t.adopt(ins, t.make(NodeType::ValuesClause));
+    ASTNode* row = t.adopt(values, t.make(NodeType::Subquery));
+    t.adopt(row, t.make(NodeType::StringLiteral, "'a'"));
+
+    Analyzer a(cat);
+    a.analyze(ins);
+    CHECK(count_code(a, DiagnosticCode::NotNullViolation) == 0);
+    CHECK(!a.has_errors());
+}
+
+// --- DML: UPDATE -------------------------------------------------------
+
+void test_update_clean() {
+    std::printf("test_update_clean\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("UPDATE users SET name = 'b'");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(res.value()->node_type == NodeType::UpdateStmt);
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+}
+
+void test_update_unknown_column() {
+    std::printf("test_update_unknown_column\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("UPDATE users SET missing = 1");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
+}
+
+void test_update_type_diagnostic() {
+    std::printf("test_update_type_diagnostic\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // 'x' (Text) into id (Integer): a soft implicit conversion (type diagnostic).
+    auto res = p.parse("UPDATE users SET id = 'x'");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
+}
+
+void test_update_where_synth() {
+    std::printf("test_update_where_synth\n");
+    auto cat = make_catalog();
+    // Synthesize `UPDATE users SET name = 'b' WHERE id = 1`; the parser build
+    // mis-parses a DML WHERE predicate, so we build the WHERE subtree.
+    SynthTree t;
+    ASTNode* upd = t.make(NodeType::UpdateStmt);
+    t.adopt(upd, t.make(NodeType::TableRef, "users"));
+    ASTNode* set = t.adopt(upd, t.make(NodeType::SetClause));
+    ASTNode* asgn = t.adopt(set, t.make(NodeType::BinaryExpr, "name"));
+    t.adopt(asgn, t.make(NodeType::StringLiteral, "'b'"));
+    ASTNode* where = t.adopt(upd, t.make(NodeType::WhereClause));
+    ASTNode* eq = t.adopt(where, t.make(NodeType::BinaryExpr, "="));
+    t.adopt(eq, t.make(NodeType::ColumnRef, "id"));
+    t.adopt(eq, t.make(NodeType::IntegerLiteral, "1"));
+
+    Analyzer a(cat);
+    a.analyze(upd);
+    // id resolves against the target table; the assignment is clean.
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+}
+
+void test_update_where_unresolved_synth() {
+    std::printf("test_update_where_unresolved_synth\n");
+    auto cat = make_catalog();
+    SynthTree t;
+    ASTNode* upd = t.make(NodeType::UpdateStmt);
+    t.adopt(upd, t.make(NodeType::TableRef, "users"));
+    ASTNode* set = t.adopt(upd, t.make(NodeType::SetClause));
+    ASTNode* asgn = t.adopt(set, t.make(NodeType::BinaryExpr, "name"));
+    t.adopt(asgn, t.make(NodeType::StringLiteral, "'b'"));
+    ASTNode* where = t.adopt(upd, t.make(NodeType::WhereClause));
+    ASTNode* eq = t.adopt(where, t.make(NodeType::BinaryExpr, "="));
+    t.adopt(eq, t.make(NodeType::ColumnRef, "bogus"));  // not a column of users
+    t.adopt(eq, t.make(NodeType::IntegerLiteral, "1"));
+
+    Analyzer a(cat);
+    a.analyze(upd);
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
+}
+
+// --- DML: DELETE -------------------------------------------------------
+
+void test_delete_clean() {
+    std::printf("test_delete_clean\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("DELETE FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(res.value()->node_type == NodeType::DeleteStmt);
+    CHECK(!a.has_errors());
+}
+
+void test_delete_unknown_table() {
+    std::printf("test_delete_unknown_table\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("DELETE FROM nonexistent");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedTable) == 1);
+}
+
+void test_delete_where_synth() {
+    std::printf("test_delete_where_synth\n");
+    auto cat = make_catalog();
+    // Synthesize `DELETE FROM users WHERE id = 1`.
+    SynthTree t;
+    ASTNode* del = t.make(NodeType::DeleteStmt);
+    t.adopt(del, t.make(NodeType::TableRef, "users"));
+    ASTNode* where = t.adopt(del, t.make(NodeType::WhereClause));
+    ASTNode* eq = t.adopt(where, t.make(NodeType::BinaryExpr, "="));
+    t.adopt(eq, t.make(NodeType::ColumnRef, "id"));
+    t.adopt(eq, t.make(NodeType::IntegerLiteral, "1"));
+
+    Analyzer a(cat);
+    a.analyze(del);
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+}
+
 }  // namespace
 
 int main() {
@@ -964,6 +1324,31 @@ int main() {
     test_in_subquery_single_compatible();
     test_in_subquery_multi_column();
     test_in_subquery_incompatible_type();
+
+    // DML: INSERT
+    test_insert_clean();
+    test_insert_arity_mismatch();
+    test_insert_type_implicit_coercion();
+    test_insert_type_mismatch();
+    test_insert_select_clean();
+    test_insert_select_arity_mismatch();
+    test_insert_unknown_table();
+    test_insert_explicit_columns_clean();
+    test_insert_explicit_unknown_column();
+    test_insert_not_null_violation();
+    test_insert_not_null_with_default_ok();
+
+    // DML: UPDATE
+    test_update_clean();
+    test_update_unknown_column();
+    test_update_type_diagnostic();
+    test_update_where_synth();
+    test_update_where_unresolved_synth();
+
+    // DML: DELETE
+    test_delete_clean();
+    test_delete_unknown_table();
+    test_delete_where_synth();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

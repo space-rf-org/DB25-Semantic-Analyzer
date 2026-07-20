@@ -5,6 +5,7 @@
 #include "db25/ast/node_types.hpp"
 #include "db25/semantic/ast_helpers.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <string>
@@ -203,7 +204,11 @@ enum class TypeCategory { Numeric, String, Temporal, Boolean, Wildcard, Other };
 // The syntactic context two types meet in. It only changes what a *non-unifiable*
 // pairing means: a soft implicit coercion in a comparison, but an error in
 // arithmetic or set-operation reconciliation.
-enum class CoercionKind { Comparison, Arithmetic, UnionReconcile };
+//   * Assignment: storing a value into a target column (INSERT value -> column,
+//     UPDATE SET column = value). A numeric<->string pairing is accepted as a
+//     soft implicit conversion (ImplicitCoercion); any other cross-category
+//     pairing is an error (Incompatible).
+enum class CoercionKind { Comparison, Arithmetic, UnionReconcile, Assignment };
 
 enum class CoercionStatus {
     Ok,                // unify cleanly (identical, wildcard, promotion, char/varchar/text)
@@ -244,6 +249,18 @@ struct Coercion {
     // an error.
     if (kind == CoercionKind::Comparison) {
         return {CoercionStatus::ImplicitCoercion, DataType::Boolean};
+    }
+    if (kind == CoercionKind::Assignment) {
+        // Assigning across the numeric/string boundary (e.g. a text literal into
+        // an integer column) is a permitted implicit conversion, flagged softly;
+        // the stored value takes the target column's type `a`.
+        if ((ca == TypeCategory::Numeric && cb == TypeCategory::String) ||
+            (ca == TypeCategory::String && cb == TypeCategory::Numeric)) {
+            return {CoercionStatus::ImplicitCoercion, a};
+        }
+        // Any other cross-category assignment (boolean/temporal vs numeric, …) is
+        // a hard type mismatch.
+        return {CoercionStatus::Incompatible, DataType::Unknown};
     }
     return {CoercionStatus::Incompatible, DataType::Unknown};
 }
@@ -372,8 +389,22 @@ void Analyzer::analyze(ASTNode* root) {
     }
     if (root->node_type == NodeType::SelectStmt || is_setop(root->node_type)) {
         analyze_stmt(root, nullptr);
+        return;
     }
-    // Other statement kinds are not yet analyzed; see docs/DESIGN.md roadmap.
+    switch (root->node_type) {
+        case NodeType::InsertStmt:
+            analyze_insert(root);
+            return;
+        case NodeType::UpdateStmt:
+            analyze_update(root);
+            return;
+        case NodeType::DeleteStmt:
+            analyze_delete(root);
+            return;
+        default:
+            // Other statement kinds are not yet analyzed; see docs/DESIGN.md.
+            return;
+    }
 }
 
 std::vector<ResolvedColumn> Analyzer::analyze_stmt(ASTNode* node, Scope* parent) {
@@ -387,6 +418,203 @@ std::vector<ResolvedColumn> Analyzer::analyze_stmt(ASTNode* node, Scope* parent)
         return analyze_query(node, parent);
     }
     return {};
+}
+
+const TableInfo* Analyzer::bind_base_table(ASTNode* table_ref, Scope& scope) {
+    if (table_ref == nullptr) {
+        return nullptr;
+    }
+    const std::string_view name = table_ref->primary_text;
+    const std::string_view alias = alias_of(table_ref);
+    const TableInfo* table = catalog_.find_table(name);
+    if (table == nullptr) {
+        add_diagnostic(DiagnosticCode::UnresolvedTable,
+                       "unresolved table '" + std::string{name} + "'", table_ref);
+        return nullptr;
+    }
+    RelationBinding binding;
+    binding.name = std::string{name};
+    binding.alias = std::string{alias};
+    binding.table_id = table->table_id;
+    for (const auto& c : table->columns) {
+        binding.columns.push_back(
+            ResolvedColumn{c.name, c.type, c.nullable, table->table_id, c.column_id});
+    }
+    scope.add_relation(std::move(binding));
+    return table;
+}
+
+void Analyzer::check_assignment(DataType target, DataType value, const ASTNode* at) {
+    const Coercion c = coerce(target, value, CoercionKind::Assignment);
+    if (c.status == CoercionStatus::Incompatible) {
+        add_diagnostic(DiagnosticCode::TypeMismatch,
+                       "value type is not compatible with the target column type", at);
+    } else if (c.status == CoercionStatus::ImplicitCoercion) {
+        add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                       "implicit conversion assigning a value to a column of a "
+                       "different type category",
+                       at, Severity::Warning);
+    }
+}
+
+void Analyzer::analyze_insert(ASTNode* insert_stmt) {
+    // Target table (always the first TableRef child).
+    ASTNode* table_ref = find_child(insert_stmt, NodeType::TableRef);
+    const std::string_view table_name =
+        table_ref != nullptr ? table_ref->primary_text : std::string_view{};
+    const TableInfo* table = table_name.empty() ? nullptr : catalog_.find_table(table_name);
+    if (table == nullptr) {
+        add_diagnostic(DiagnosticCode::UnresolvedTable,
+                       "unresolved table '" + std::string{table_name} + "'",
+                       table_ref != nullptr ? table_ref : insert_stmt);
+        return;  // without a resolved table there is nothing to check against
+    }
+
+    // Target column list: an explicit ColumnList child, else the table's columns
+    // in declaration order. `covered` tracks which table columns receive a value
+    // (for the NOT NULL check).
+    std::vector<const ColumnInfo*> target_cols;
+    std::vector<bool> covered(table->columns.size(), false);
+    if (ASTNode* col_list = find_child(insert_stmt, NodeType::ColumnList)) {
+        for (ASTNode* c = first_child(col_list); c != nullptr; c = c->next_sibling) {
+            const std::string_view col_name = split_column_ref(c->primary_text).column;
+            const ColumnInfo* info = table->find_column(col_name);
+            if (info == nullptr) {
+                add_diagnostic(DiagnosticCode::UnresolvedColumn,
+                               "unresolved column '" + std::string{col_name} +
+                                   "' in target of INSERT into '" +
+                                   std::string{table_name} + "'",
+                               c);
+                target_cols.push_back(nullptr);  // keep positional alignment
+                continue;
+            }
+            target_cols.push_back(info);
+            for (std::size_t i = 0; i < table->columns.size(); ++i) {
+                if (&table->columns[i] == info) {
+                    covered[i] = true;
+                }
+            }
+        }
+    } else {
+        for (std::size_t i = 0; i < table->columns.size(); ++i) {
+            target_cols.push_back(&table->columns[i]);
+            covered[i] = true;
+        }
+    }
+
+    // Source of values: a VALUES clause (one or more rows) or a subquery
+    // (INSERT ... SELECT). Values are literals/expressions with no table scope.
+    Scope scope(nullptr);
+    if (ASTNode* values = find_child(insert_stmt, NodeType::ValuesClause)) {
+        for (ASTNode* row = first_child(values); row != nullptr; row = row->next_sibling) {
+            std::vector<ASTNode*> vals;
+            for (ASTNode* v = first_child(row); v != nullptr; v = v->next_sibling) {
+                vals.push_back(v);
+            }
+            if (vals.size() != target_cols.size()) {
+                add_diagnostic(DiagnosticCode::InsertArityMismatch,
+                               "INSERT row has " + std::to_string(vals.size()) +
+                                   " values but the target has " +
+                                   std::to_string(target_cols.size()) + " columns",
+                               row);
+            }
+            const std::size_t n = std::min(vals.size(), target_cols.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                const DataType vt = infer_expr(vals[i], scope);
+                if (target_cols[i] != nullptr) {
+                    check_assignment(target_cols[i]->type, vt, vals[i]);
+                }
+            }
+        }
+    } else {
+        // INSERT ... SELECT: analyze the source query and check its projection.
+        ASTNode* source = find_child(insert_stmt, NodeType::SelectStmt);
+        if (source == nullptr) {
+            for (ASTNode* c = first_child(insert_stmt); c != nullptr; c = c->next_sibling) {
+                if (is_setop(c->node_type)) {
+                    source = c;
+                    break;
+                }
+            }
+        }
+        if (source != nullptr) {
+            const std::vector<ResolvedColumn> proj = analyze_stmt(source, nullptr);
+            if (proj.size() != target_cols.size()) {
+                add_diagnostic(DiagnosticCode::InsertArityMismatch,
+                               "INSERT ... SELECT projects " +
+                                   std::to_string(proj.size()) +
+                                   " columns but the target has " +
+                                   std::to_string(target_cols.size()) + " columns",
+                               source);
+            }
+            const std::size_t n = std::min(proj.size(), target_cols.size());
+            for (std::size_t i = 0; i < n; ++i) {
+                if (target_cols[i] != nullptr) {
+                    check_assignment(target_cols[i]->type, proj[i].type, source);
+                }
+            }
+        }
+    }
+
+    // NOT NULL check: a NOT NULL column that receives no value and has no default
+    // would be inserted as NULL.
+    for (std::size_t i = 0; i < table->columns.size(); ++i) {
+        const ColumnInfo& col = table->columns[i];
+        if (!covered[i] && !col.nullable && !col.has_default) {
+            add_diagnostic(DiagnosticCode::NotNullViolation,
+                           "NOT NULL column '" + col.name +
+                               "' has no value and no default in INSERT into '" +
+                               std::string{table_name} + "'",
+                           table_ref != nullptr ? table_ref : insert_stmt);
+        }
+    }
+}
+
+void Analyzer::analyze_update(ASTNode* update_stmt) {
+    Scope scope(nullptr);
+    ASTNode* table_ref = find_child(update_stmt, NodeType::TableRef);
+    const TableInfo* table = bind_base_table(table_ref, scope);
+
+    // SET assignments: each is a BinaryExpr whose primary_text is the target
+    // column name and whose (first) child is the value expression.
+    if (ASTNode* set_clause = find_child(update_stmt, NodeType::SetClause)) {
+        for (ASTNode* asgn = first_child(set_clause); asgn != nullptr;
+             asgn = asgn->next_sibling) {
+            const std::string_view col_name = split_column_ref(asgn->primary_text).column;
+            const ColumnInfo* info =
+                table != nullptr ? table->find_column(col_name) : nullptr;
+            if (table != nullptr && info == nullptr) {
+                add_diagnostic(DiagnosticCode::UnresolvedColumn,
+                               "unresolved column '" + std::string{col_name} +
+                                   "' in SET clause",
+                               asgn);
+            }
+            ASTNode* value = first_child(asgn);
+            const DataType vt = infer_expr(value, scope);
+            if (info != nullptr && value != nullptr) {
+                check_assignment(info->type, vt, value);
+            }
+        }
+    }
+
+    // WHERE predicate: resolve against the target-table scope.
+    if (ASTNode* where = find_child(update_stmt, NodeType::WhereClause)) {
+        if (ASTNode* pred = first_child(where)) {
+            infer_expr(pred, scope);
+        }
+    }
+}
+
+void Analyzer::analyze_delete(ASTNode* delete_stmt) {
+    Scope scope(nullptr);
+    ASTNode* table_ref = find_child(delete_stmt, NodeType::TableRef);
+    bind_base_table(table_ref, scope);
+
+    if (ASTNode* where = find_child(delete_stmt, NodeType::WhereClause)) {
+        if (ASTNode* pred = first_child(where)) {
+            infer_expr(pred, scope);
+        }
+    }
 }
 
 const std::vector<ResolvedColumn>* Analyzer::projection_of(const ASTNode* query) const {

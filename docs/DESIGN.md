@@ -248,14 +248,36 @@ argument of a function is emitted as an `Identifier` (not a `ColumnRef`), so
 `infer_expr` resolves both node kinds the same way. `infer_expr` types a call
 from a small, extensible signature table (`function_result_type`):
 
-* **Aggregates** (`kAggregateNames` = COUNT, SUM, AVG, MIN, MAX — add a name
-  there to extend recognition everywhere): `COUNT → BigInt`; `SUM →` input type,
-  integer inputs widened to `BigInt`; `AVG → Double`; `MIN`/`MAX →` argument
-  type.
-* **Scalars**: `UPPER`/`LOWER → Text`, `LENGTH → Integer`, `ABS →` numeric arg
-  type, `COALESCE →` its arguments unified via `reconcile_types` (the same
-  conservative numeric-promotion / NULL-unification rule used for set
-  operations).
+* **Aggregates** (`kAggregateNames` — add a name there to extend recognition
+  everywhere: it is what makes the grouping logic treat a call as an aggregate
+  and lets an empty-group result be typed nullable):
+  * `COUNT → BigInt` (never NULL); `SUM →` input type, integer inputs widened to
+    `BigInt`; `MIN`/`MAX →` argument type;
+  * `AVG` and the statistical aggregates `STDDEV`/`STDDEV_POP`/`STDDEV_SAMP`/
+    `VARIANCE`/`VAR_POP`/`VAR_SAMP` → `Double`;
+  * `STRING_AGG → Text`, `ARRAY_AGG → Array`, `BOOL_AND`/`BOOL_OR → Boolean`.
+  * Every aggregate except `COUNT` is **nullable** (an empty group yields NULL).
+* **Scalars** — a table grouped by category (`function_result_type`); each name
+  is marked recognized so no spurious `UnknownFunction` is raised even when the
+  result type has to degrade to `Unknown` (e.g. a numeric function on a
+  non-numeric argument). Nullability is combined separately in
+  `function_nullability` (arguments propagate under the "nullable if any operand
+  is nullable" rule unless noted):
+  * **String → Text**: `UPPER`/`LOWER`/`INITCAP`, `SUBSTRING`/`SUBSTR`,
+    `TRIM`/`LTRIM`/`RTRIM`, `CONCAT`, `REPLACE`, `LEFT`/`RIGHT`, `LPAD`/`RPAD`.
+  * **String → Integer**: `LENGTH`/`CHAR_LENGTH`/`CHARACTER_LENGTH` (length),
+    `POSITION`/`STRPOS` (offset).
+  * **Numeric, argument-preserving**: `ABS`, `CEIL`/`CEILING`, `FLOOR`, `ROUND`,
+    `TRUNC`, `MOD` keep the numeric kind of their first argument (non-numeric
+    argument → `Unknown`); `SIGN → Integer`.
+  * **Numeric → Double**: `POWER`/`POW`, `SQRT`, `EXP`, `LN`, `LOG`.
+  * **Date/time**: the niladic `NOW`/`CURRENT_TIMESTAMP → Timestamp`,
+    `CURRENT_DATE → Date`, `CURRENT_TIME → Time` (all **never NULL**);
+    `DATE_TRUNC → Timestamp`; `EXTRACT`/`DATE_PART → Double`; `AGE → Interval`.
+  * **Conditional**: `NULLIF →` first-argument type, **always nullable** (the
+    two arguments being equal yields NULL); `GREATEST`/`LEAST` and `COALESCE →`
+    their arguments unified via `unify_type` (the same conservative
+    numeric-promotion / NULL-unification rule used for set operations).
 * **Unknown** names degrade to `Unknown` and raise a soft `UnknownFunction`
   **Warning** (never an error, so `has_errors()` is unaffected).
 

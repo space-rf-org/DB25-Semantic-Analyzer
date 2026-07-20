@@ -1028,16 +1028,11 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
 
 void Analyzer::expand_star(ASTNode* star, Scope& scope,
                            std::vector<ResolvedColumn>& output) {
-    // A qualified star `table.*` carries the qualifier in schema_name; an
-    // unqualified `*` has an empty schema_name.
-    //
-    // NOTE (parser limitation): the consumed parser build does not currently
-    // produce a qualified-star node in this shape - it misparses `table.*` as a
-    // multiplication expression (dropping the FROM clause) or, before a comma,
-    // as a bare column reference. The qualified-star path below is written
-    // against the correct/forward-compatible shape (a Star node whose
-    // schema_name holds the qualifier) so it takes effect unchanged once the
-    // parser emits it. See docs/DESIGN.md.
+    // The parser emits a qualified star `table.*` as a Star node whose
+    // schema_name holds the qualifier; an unqualified `*` has an empty
+    // schema_name. The qualified branch below expands to exactly that relation's
+    // columns, and reports UnresolvedQualifier when the qualifier names no
+    // visible relation. See docs/DESIGN.md.
     const std::string_view qualifier = alias_of(star);
 
     if (qualifier.empty()) {

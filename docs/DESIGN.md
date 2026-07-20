@@ -202,15 +202,12 @@ projection (above). Diagnostics: `StarWithoutFrom` when `*` appears with no FROM
 relations; `UnresolvedQualifier` when `table.*`'s qualifier names no visible
 relation.
 
-> **Parser limitation (qualified star).** The consumed parser build does not
-> represent `table.*` in a usable way. Immediately before `FROM` it misparses
-> `t.*` as a `*` (multiplication) `BinaryExpr` and *drops the entire FROM
-> clause*; before a comma it collapses `t.*` to a bare `ColumnRef` holding only
-> the qualifier text, discarding the `.*`. Neither yields a qualified-star node.
-> The analyzer's qualified-star path is therefore written against the *correct*
-> forward-compatible shape - a `Star` node whose `schema_name` holds the
-> qualifier - so it works unchanged once the parser emits that shape. Unqualified
-> `SELECT *` parses correctly (a clean `Star` node) and is fully supported.
+> **Qualified-star AST shape.** The parser emits a qualified star `table.*` as a
+> `Star` node whose `schema_name` holds the qualifier (`o` for `o.*`); an
+> unqualified `*` is a `Star` with an empty `schema_name`. The analyzer's
+> qualified-star path reads that qualifier via `alias_of` and expands it to
+> exactly the matching relation's columns, so both `SELECT *` and `alias.*` are
+> supported end-to-end (see the `test_qualified_star_e2e_*` tests).
 
 ### JOIN `ON` / `USING` resolution
 
@@ -445,8 +442,8 @@ unaffected).
 
 The analyzer is written against the correct/forward-compatible shapes, but the
 consumed parser build mis-parses three DML/clause constructs; the tests
-synthesize the intended node shape to exercise the analyzer (as the qualified-
-star tests already do):
+synthesize the intended node shape to exercise the analyzer (qualified `table.*`
+used to be in this list but now parses correctly and is tested end-to-end):
 
 * an **explicit INSERT column list** `INSERT INTO t (a, b) …` drops both the
   column list and the VALUES/SELECT source (leaving only the `TableRef`); the

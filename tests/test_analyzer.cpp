@@ -1382,6 +1382,179 @@ void test_float_literal_type() {
     CHECK(f2 != nullptr && a.type_of(f2) == DataType::Double);
 }
 
+// --- Expression typing: CAST / BETWEEN / LIKE / IS NULL / window --------
+
+void test_cast_expr_type() {
+    std::printf("test_cast_expr_type\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // CAST takes the named target type; nullability flows from the operand.
+    auto res = p.parse("SELECT CAST(name AS INTEGER) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* cast = find_descendant(res.value(), NodeType::CastExpr);
+    CHECK(cast != nullptr && a.type_of(cast) == DataType::Integer);
+    CHECK(cast != nullptr && a.nullability_of(cast) == 2);  // name is nullable
+}
+
+void test_cast_varchar_type() {
+    std::printf("test_cast_varchar_type\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // A length (VARCHAR(10)) does not change the type category; a NOT NULL
+    // operand keeps the cast not-null.
+    auto res = p.parse("SELECT CAST(id AS VARCHAR(10)) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* cast = find_descendant(res.value(), NodeType::CastExpr);
+    CHECK(cast != nullptr && a.type_of(cast) == DataType::VarChar);
+    CHECK(cast != nullptr && a.nullability_of(cast) == 1);  // id is NOT NULL
+}
+
+void test_between_boolean() {
+    std::printf("test_between_boolean\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT id FROM emp WHERE salary BETWEEN 100 AND 500");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());  // numeric vs numeric: clean
+    ASTNode* bt = find_descendant(res.value(), NodeType::BetweenExpr);
+    CHECK(bt != nullptr && a.type_of(bt) == DataType::Boolean);
+    CHECK(bt != nullptr && a.nullability_of(bt) == 2);  // salary is nullable
+}
+
+void test_between_coercion_warns() {
+    std::printf("test_between_coercion_warns\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // Text value against integer bounds: a soft cross-category coercion.
+    auto res = p.parse("SELECT id FROM emp WHERE name BETWEEN 1 AND 9");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());  // a warning, not an error
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
+}
+
+void test_like_boolean() {
+    std::printf("test_like_boolean\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT id FROM emp WHERE name LIKE 'a%'");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());  // text LIKE text-pattern: clean
+    ASTNode* lk = find_descendant(res.value(), NodeType::LikeExpr);
+    CHECK(lk != nullptr && a.type_of(lk) == DataType::Boolean);
+    CHECK(lk != nullptr && a.nullability_of(lk) == 2);  // name is nullable
+}
+
+void test_like_nonstring_warns() {
+    std::printf("test_like_nonstring_warns\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // LIKE on an integer column: a soft non-string coercion warning.
+    auto res = p.parse("SELECT id FROM emp WHERE id LIKE 'a%'");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
+}
+
+void test_is_null_boolean_notnull() {
+    std::printf("test_is_null_boolean_notnull\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // IS [NOT] NULL always yields a defined boolean, even on a nullable operand.
+    auto res = p.parse("SELECT id FROM emp WHERE name IS NULL");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* isn = find_descendant(res.value(), NodeType::IsNullExpr);
+    CHECK(isn != nullptr && a.type_of(isn) == DataType::Boolean);
+    CHECK(isn != nullptr && a.nullability_of(isn) == 1);  // never NULL
+}
+
+void test_window_rank_type() {
+    std::printf("test_window_rank_type\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // A ranking window function is BIGINT and never NULL; the OVER clause's
+    // partition/order columns resolve, and RANK is not an unknown function.
+    auto res = p.parse(
+        "SELECT RANK() OVER (PARTITION BY dept ORDER BY salary) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::UnknownFunction) == 0);
+    ASTNode* fn = find_descendant(res.value(), NodeType::FunctionCall);
+    CHECK(fn != nullptr && a.type_of(fn) == DataType::BigInt);
+    CHECK(fn != nullptr && a.nullability_of(fn) == 1);
+}
+
+void test_window_sum_over_type() {
+    std::printf("test_window_sum_over_type\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // An aggregate used as a window function keeps its aggregate result type
+    // (SUM over a DOUBLE stays DOUBLE) and is nullable.
+    auto res = p.parse("SELECT SUM(salary) OVER (PARTITION BY dept) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* fn = find_descendant(res.value(), NodeType::FunctionCall);
+    CHECK(fn != nullptr && a.type_of(fn) == DataType::Double);
+    CHECK(fn != nullptr && a.nullability_of(fn) == 2);
+}
+
+void test_window_aggregate_does_not_force_grouping() {
+    std::printf("test_window_aggregate_does_not_force_grouping\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // A windowed aggregate does not collapse rows, so a bare column alongside it
+    // must NOT be reported as a non-grouped column.
+    auto res = p.parse(
+        "SELECT id, SUM(salary) OVER (PARTITION BY dept) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1481,6 +1654,18 @@ int main() {
     test_limit_float_invalid();
     test_limit_negative();
     test_float_literal_type();
+
+    // Expression typing: CAST / BETWEEN / LIKE / IS NULL / window functions.
+    test_cast_expr_type();
+    test_cast_varchar_type();
+    test_between_boolean();
+    test_between_coercion_warns();
+    test_like_boolean();
+    test_like_nonstring_warns();
+    test_is_null_boolean_notnull();
+    test_window_rank_type();
+    test_window_sum_over_type();
+    test_window_aggregate_does_not_force_grouping();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

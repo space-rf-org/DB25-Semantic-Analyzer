@@ -103,6 +103,18 @@ constexpr std::array<std::string_view, 5> kAggregateNames = {
            t == NodeType::ExceptStmt;
 }
 
+// True if a function call carries an OVER clause (a WindowSpec child), i.e. it
+// is a window function. A windowed call — even an aggregate name like SUM — is
+// evaluated after grouping and so is NOT a grouping aggregate.
+[[nodiscard]] bool has_window_spec(const ASTNode* call) {
+    for (const ASTNode* c = call->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type == NodeType::WindowSpec) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // A FROM/JOIN child that contributes relations to the scope (as opposed to a
 // join predicate such as an ON expression or a USING clause).
 [[nodiscard]] bool is_relation_node(NodeType t) {
@@ -379,6 +391,90 @@ struct FunctionType {
     }
     // Ordinary scalar functions propagate nullability from their arguments.
     return combine_nullable_any(arg_nulls);
+}
+
+// ---------------------------------------------------------------------------
+// CAST target types
+// ---------------------------------------------------------------------------
+// Map a SQL type name (as written after AS in a CAST, carried in the type
+// node's primary_text) to a DataType. Length/precision (e.g. the 10 in
+// VARCHAR(10)) is irrelevant to the category and ignored. Unrecognized names
+// degrade to Unknown rather than guessing.
+[[nodiscard]] DataType data_type_from_name(std::string_view name) {
+    const std::string u = to_upper(name);
+    // Strip a trailing "(...)" if the length rode along in the name itself.
+    std::string_view base = u;
+    if (const auto p = base.find('('); p != std::string_view::npos) {
+        base = base.substr(0, p);
+    }
+    while (!base.empty() && base.back() == ' ') base.remove_suffix(1);
+
+    if (base == "INT" || base == "INTEGER" || base == "INT4") return DataType::Integer;
+    if (base == "BIGINT" || base == "INT8") return DataType::BigInt;
+    if (base == "SMALLINT" || base == "INT2") return DataType::SmallInt;
+    if (base == "TINYINT") return DataType::TinyInt;
+    if (base == "DECIMAL" || base == "NUMERIC" || base == "NUMBER") return DataType::Decimal;
+    if (base == "REAL" || base == "FLOAT4") return DataType::Real;
+    if (base == "DOUBLE" || base == "DOUBLE PRECISION" || base == "FLOAT" ||
+        base == "FLOAT8")
+        return DataType::Double;
+    if (base == "BOOLEAN" || base == "BOOL") return DataType::Boolean;
+    if (base == "CHAR" || base == "CHARACTER" || base == "BPCHAR") return DataType::Char;
+    if (base == "VARCHAR" || base == "CHARACTER VARYING") return DataType::VarChar;
+    if (base == "TEXT" || base == "STRING" || base == "CLOB") return DataType::Text;
+    if (base == "DATE") return DataType::Date;
+    if (base == "TIME") return DataType::Time;
+    if (base == "TIMESTAMP" || base == "DATETIME") return DataType::Timestamp;
+    if (base == "INTERVAL") return DataType::Interval;
+    if (base == "BLOB" || base == "BYTEA" || base == "BINARY") return DataType::Blob;
+    return DataType::Unknown;
+}
+
+// ---------------------------------------------------------------------------
+// Window (OVER) functions
+// ---------------------------------------------------------------------------
+// A window function is emitted as a FunctionCall carrying a WindowSpec child
+// (the OVER clause). Pure ranking/analytic functions have fixed result types;
+// an ordinary aggregate used with OVER keeps its aggregate result type.
+
+// The rank-style window functions whose result is a row-number/rank integer.
+[[nodiscard]] bool is_rank_window_fn(std::string_view upper) {
+    return upper == "ROW_NUMBER" || upper == "RANK" || upper == "DENSE_RANK" ||
+           upper == "NTILE";
+}
+// The distribution window functions whose result is a fraction in [0,1].
+[[nodiscard]] bool is_ratio_window_fn(std::string_view upper) {
+    return upper == "PERCENT_RANK" || upper == "CUME_DIST";
+}
+// The value-navigation window functions whose result takes the first argument's
+// type (LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE).
+[[nodiscard]] bool is_value_window_fn(std::string_view upper) {
+    return upper == "LAG" || upper == "LEAD" || upper == "FIRST_VALUE" ||
+           upper == "LAST_VALUE" || upper == "NTH_VALUE";
+}
+
+// Result type of a call that carries an OVER clause. Ranking functions are
+// integer (BIGINT), distribution functions are DOUBLE, value functions take
+// the first argument's type; anything else (an aggregate used as a window
+// function, e.g. SUM(x) OVER (...)) is typed by the ordinary function table.
+[[nodiscard]] FunctionType window_function_result_type(std::string_view upper,
+                                                       const std::vector<DataType>& args) {
+    if (is_rank_window_fn(upper)) return {DataType::BigInt, true};
+    if (is_ratio_window_fn(upper)) return {DataType::Double, true};
+    if (is_value_window_fn(upper)) {
+        return {args.empty() ? DataType::Unknown : args.front(), true};
+    }
+    return function_result_type(upper, args);
+}
+
+// Nullability of a windowed call. Ranking and distribution functions never
+// return NULL; value-navigation functions can (a frame boundary yields no row);
+// an aggregate-over-window follows the aggregate's nullability.
+[[nodiscard]] int window_function_nullability(std::string_view upper,
+                                              const std::vector<int>& arg_nulls) {
+    if (is_rank_window_fn(upper) || is_ratio_window_fn(upper)) return 1;
+    if (is_value_window_fn(upper)) return 2;
+    return function_nullability(upper, arg_nulls);
 }
 
 }  // namespace
@@ -1141,10 +1237,18 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
         case NodeType::FunctionCall:
         case NodeType::FunctionExpr: {
             // Infer argument types (recursion also resolves nested column refs).
-            // A COUNT(*) star argument contributes no type and is skipped.
+            // A COUNT(*) star argument contributes no type and is skipped. A
+            // WindowSpec child is the OVER clause, not an argument: it is set
+            // aside and resolved separately so its PARTITION BY / ORDER BY
+            // columns bind, without being counted as a function argument.
             std::vector<DataType> arg_types;
             std::vector<int> arg_nulls;
+            ASTNode* window_spec = nullptr;
             for (ASTNode* arg = first_child(expr); arg != nullptr; arg = arg->next_sibling) {
+                if (arg->node_type == NodeType::WindowSpec) {
+                    window_spec = arg;
+                    continue;
+                }
                 const DataType t = infer_expr(arg, scope);
                 if (arg->node_type != NodeType::Star) {
                     arg_types.push_back(t);
@@ -1152,6 +1256,23 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                 }
             }
             const std::string upper = to_upper(expr->primary_text);
+            if (window_spec != nullptr) {
+                // Resolve the OVER clause's partition/order expressions (the
+                // default recursion binds their column references) and type the
+                // call with window-aware rules.
+                infer_expr(window_spec, scope);
+                const FunctionType wf = window_function_result_type(upper, arg_types);
+                if (!wf.known) {
+                    add_diagnostic(DiagnosticCode::UnknownFunction,
+                                   "unknown window function '" +
+                                       std::string{expr->primary_text} +
+                                       "'; result type is Unknown",
+                                   expr, Severity::Warning);
+                }
+                record_type(expr, wf.type);
+                record_nullability(expr, window_function_nullability(upper, arg_nulls));
+                return wf.type;
+            }
             const FunctionType ft = function_result_type(upper, arg_types);
             if (!ft.known) {
                 add_diagnostic(DiagnosticCode::UnknownFunction,
@@ -1368,6 +1489,90 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             return DataType::Boolean;
         }
 
+        // CAST(operand AS type): the operand is the first child, the target type
+        // name is carried in the second child's primary_text. The result takes
+        // the named type (Unknown if unrecognized); a cast preserves the
+        // operand's nullability (CAST(NULL) is NULL, CAST(not-null) is not-null).
+        case NodeType::CastExpr: {
+            ASTNode* operand = first_child(expr);
+            ASTNode* type_node = operand != nullptr ? operand->next_sibling : nullptr;
+            infer_expr(operand, scope);  // resolve nested columns
+            DataType result = DataType::Unknown;
+            if (type_node != nullptr) {
+                result = data_type_from_name(type_node->primary_text);
+                record_type(type_node, result);
+            }
+            record_type(expr, result);
+            record_nullability(expr, null_of(operand));
+            return result;
+        }
+
+        // x BETWEEN low AND high: children [value, low, high]. Boolean result,
+        // nullable if any operand is nullable. The value is compared against each
+        // bound, so a cross-category pairing is flagged as a soft coercion.
+        case NodeType::BetweenExpr: {
+            ASTNode* value = first_child(expr);
+            ASTNode* low = value != nullptr ? value->next_sibling : nullptr;
+            ASTNode* high = low != nullptr ? low->next_sibling : nullptr;
+            const DataType vt = infer_expr(value, scope);
+            const DataType lt = infer_expr(low, scope);
+            const DataType ht = infer_expr(high, scope);
+            if (coerce(vt, lt, CoercionKind::Comparison).status != CoercionStatus::Ok ||
+                coerce(vt, ht, CoercionKind::Comparison).status != CoercionStatus::Ok) {
+                add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                               "implicit coercion in BETWEEN between operands of "
+                               "different type categories",
+                               expr, Severity::Warning);
+            }
+            record_type(expr, DataType::Boolean);
+            record_nullability(expr,
+                               combine_nullable_any({null_of(value), null_of(low),
+                                                     null_of(high)}));
+            return DataType::Boolean;
+        }
+
+        // x LIKE pattern: children [value, pattern]. Boolean result, nullable if
+        // either operand is nullable. LIKE is a string operation; a clearly
+        // non-string, non-wildcard operand is flagged as a soft coercion.
+        case NodeType::LikeExpr: {
+            ASTNode* value = first_child(expr);
+            ASTNode* pattern = value != nullptr ? value->next_sibling : nullptr;
+            const DataType vt = infer_expr(value, scope);
+            const DataType pt = infer_expr(pattern, scope);
+            auto non_string = [](DataType t) {
+                const TypeCategory c = category_of(t);
+                return c != TypeCategory::String && c != TypeCategory::Wildcard;
+            };
+            if (non_string(vt) || non_string(pt)) {
+                add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                               "LIKE applied to a non-string operand", expr,
+                               Severity::Warning);
+            }
+            record_type(expr, DataType::Boolean);
+            record_nullability(expr,
+                               combine_nullable_any({null_of(value), null_of(pattern)}));
+            return DataType::Boolean;
+        }
+
+        // x IS [NOT] NULL: a single operand. The test itself is always a defined
+        // boolean, so the result is Boolean and never NULL regardless of the
+        // operand's nullability.
+        case NodeType::IsNullExpr: {
+            infer_expr(first_child(expr), scope);  // resolve the operand
+            record_type(expr, DataType::Boolean);
+            record_nullability(expr, 1);
+            return DataType::Boolean;
+        }
+
+        // A bind parameter ($1 / ?): its type is not known until the statement is
+        // bound, so it is Unknown and unifies with anything (wildcard). Marked
+        // nullable since a parameter may be bound to NULL.
+        case NodeType::Parameter: {
+            record_type(expr, DataType::Unknown);
+            record_nullability(expr, 2);
+            return DataType::Unknown;
+        }
+
         default: {
             // Unknown expression form: recurse so nested column refs still get
             // resolved, but do not claim a type.
@@ -1423,7 +1628,9 @@ namespace {
     }
     if (node->node_type == NodeType::FunctionCall ||
         node->node_type == NodeType::FunctionExpr) {
-        if (is_aggregate_name(to_upper(node->primary_text))) {
+        // A windowed aggregate (e.g. SUM(x) OVER (...)) does not collapse rows,
+        // so it does not make the query grouped.
+        if (is_aggregate_name(to_upper(node->primary_text)) && !has_window_spec(node)) {
             return true;
         }
     }
@@ -1511,15 +1718,19 @@ void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& k
 
     if (expr->node_type == NodeType::FunctionCall ||
         expr->node_type == NodeType::FunctionExpr) {
-        const bool is_agg = is_aggregate_name(to_upper(expr->primary_text));
+        // A windowed call is evaluated after grouping: it is not itself a
+        // grouping aggregate, and its arguments / OVER expressions are exempt
+        // from the grouping rule (like columns beneath an aggregate).
+        const bool windowed = has_window_spec(expr);
+        const bool is_agg = !windowed && is_aggregate_name(to_upper(expr->primary_text));
         if (is_agg && in_aggregate) {
             add_diagnostic(DiagnosticCode::NestedAggregate,
                            "aggregate function '" + std::string{expr->primary_text} +
                                "' nested inside another aggregate",
                            expr);
         }
-        // Columns beneath an aggregate are exempt from the grouping rule.
-        const bool inside = in_aggregate || is_agg;
+        // Columns beneath an aggregate or inside a window function are exempt.
+        const bool inside = in_aggregate || is_agg || windowed;
         for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
             check_grouping_expr(c, keys, inside);
         }

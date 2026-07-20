@@ -122,29 +122,136 @@ constexpr std::array<std::string_view, 5> kAggregateNames = {
     }
 }
 
-// Reconcile two column types for a set operation. `ok` is false only when the
-// types are genuinely incompatible; `type` is the unified result otherwise.
-// Conservative: exact match, NULL/Unknown unify with anything, and any two
-// numeric types unify by numeric promotion. Everything else is incompatible.
-struct TypeReconcile {
-    bool ok;
-    DataType type;
+// Which side of a join supplies NULLs for unmatched rows (and so makes the
+// other side's columns nullable). Determined from the join node: dedicated
+// Left/Right/Full join node types, or a JoinClause whose primary_text names the
+// join ("LEFT JOIN", "RIGHT OUTER JOIN", "FULL JOIN", …).
+enum class JoinNullSide {
+    None,   // INNER / CROSS: no side is null-supplied
+    Right,  // LEFT [OUTER] JOIN: right side becomes nullable
+    Left,   // RIGHT [OUTER] JOIN: left side becomes nullable
+    Both,   // FULL [OUTER] JOIN: both sides become nullable
 };
 
-[[nodiscard]] TypeReconcile reconcile_types(DataType a, DataType b) {
+[[nodiscard]] JoinNullSide join_null_side(const ASTNode* join) {
+    switch (join->node_type) {
+        case NodeType::LeftJoin: return JoinNullSide::Right;
+        case NodeType::RightJoin: return JoinNullSide::Left;
+        case NodeType::FullJoin: return JoinNullSide::Both;
+        case NodeType::InnerJoin:
+        case NodeType::CrossJoin:
+        case NodeType::LateralJoin: return JoinNullSide::None;
+        default: break;
+    }
+    // JoinClause carries the kind in primary_text, e.g. "LEFT JOIN".
+    const std::string kind = to_upper(join->primary_text);
+    if (kind.find("FULL") != std::string::npos) {
+        return JoinNullSide::Both;
+    }
+    if (kind.find("LEFT") != std::string::npos) {
+        return JoinNullSide::Right;
+    }
+    if (kind.find("RIGHT") != std::string::npos) {
+        return JoinNullSide::Left;
+    }
+    return JoinNullSide::None;  // INNER / CROSS / unqualified
+}
+
+// ---------------------------------------------------------------------------
+// Type coercion model
+// ---------------------------------------------------------------------------
+// A single, conservative, well-commented model that answers "given two types
+// and the syntactic context they meet in, what is the common/result type, and
+// is the pairing clean, an implicit conversion, or incompatible?". Comparison,
+// arithmetic, and set-operation (UNION/…) reconciliation are all routed through
+// it so the rules live in one place.
+
+// Broad type families the coercion rules reason over.
+enum class TypeCategory { Numeric, String, Temporal, Boolean, Wildcard, Other };
+
+[[nodiscard]] TypeCategory category_of(DataType t) {
+    switch (t) {
+        case DataType::TinyInt:
+        case DataType::SmallInt:
+        case DataType::Integer:
+        case DataType::BigInt:
+        case DataType::Decimal:
+        case DataType::Real:
+        case DataType::Double:
+            return TypeCategory::Numeric;
+        case DataType::Char:
+        case DataType::VarChar:
+        case DataType::Text:
+            return TypeCategory::String;
+        case DataType::Date:
+        case DataType::Time:
+        case DataType::Timestamp:
+        case DataType::Interval:
+            return TypeCategory::Temporal;
+        case DataType::Boolean:
+            return TypeCategory::Boolean;
+        // NULL / Unknown / ANY unify with anything (a wildcard).
+        case DataType::Null:
+        case DataType::Unknown:
+        case DataType::Any:
+            return TypeCategory::Wildcard;
+        default:
+            return TypeCategory::Other;
+    }
+}
+
+// The syntactic context two types meet in. It only changes what a *non-unifiable*
+// pairing means: a soft implicit coercion in a comparison, but an error in
+// arithmetic or set-operation reconciliation.
+enum class CoercionKind { Comparison, Arithmetic, UnionReconcile };
+
+enum class CoercionStatus {
+    Ok,                // unify cleanly (identical, wildcard, promotion, char/varchar/text)
+    ImplicitCoercion,  // cross-category but permitted in a comparison (soft)
+    Incompatible,      // cannot be reconciled in this context
+};
+
+struct Coercion {
+    CoercionStatus status;
+    DataType type;  // common/result type (Unknown when Incompatible)
+};
+
+[[nodiscard]] Coercion coerce(DataType a, DataType b, CoercionKind kind) {
+    // Identical types: trivially compatible.
     if (a == b) {
-        return {true, a};
+        return {CoercionStatus::Ok, a};
     }
-    if (a == DataType::Null || a == DataType::Unknown) {
-        return {true, b};
+    // NULL / Unknown / ANY unify with anything, taking the other operand's type.
+    if (category_of(a) == TypeCategory::Wildcard) {
+        return {CoercionStatus::Ok, b};
     }
-    if (b == DataType::Null || b == DataType::Unknown) {
-        return {true, a};
+    if (category_of(b) == TypeCategory::Wildcard) {
+        return {CoercionStatus::Ok, a};
     }
-    if (is_numeric(a) && is_numeric(b)) {
-        return {true, promote_numeric(a, b)};
+    const TypeCategory ca = category_of(a);
+    const TypeCategory cb = category_of(b);
+    // Numeric promotion: Integer < BigInt < Decimal < Double (see promote_numeric).
+    if (ca == TypeCategory::Numeric && cb == TypeCategory::Numeric) {
+        return {CoercionStatus::Ok, promote_numeric(a, b)};
     }
-    return {false, DataType::Unknown};
+    // char / varchar / text collapse to text.
+    if (ca == TypeCategory::String && cb == TypeCategory::String) {
+        return {CoercionStatus::Ok, DataType::Text};
+    }
+    // Everything else (cross-category, or two different temporals, boolean vs
+    // non-boolean, …) is not cleanly unifiable. In a comparison we still allow
+    // it as a soft implicit coercion; in arithmetic / set reconciliation it is
+    // an error.
+    if (kind == CoercionKind::Comparison) {
+        return {CoercionStatus::ImplicitCoercion, DataType::Boolean};
+    }
+    return {CoercionStatus::Incompatible, DataType::Unknown};
+}
+
+// Unify two types for a value-producing context (set-operation branch column,
+// COALESCE argument list): the common type, or Unknown when incompatible.
+[[nodiscard]] DataType unify_type(DataType a, DataType b) {
+    return coerce(a, b, CoercionKind::UnionReconcile).type;
 }
 
 // SUM widens integer inputs to BigInt (avoids overflow of the accumulator);
@@ -201,11 +308,60 @@ struct FunctionType {
     if (upper_name == "COALESCE") {
         DataType unified = DataType::Unknown;
         for (const DataType a : args) {
-            unified = reconcile_types(unified, a).type;
+            unified = unify_type(unified, a);
         }
         return {unified, true};
     }
     return {DataType::Unknown, false};
+}
+
+// ---------------------------------------------------------------------------
+// Nullability
+// ---------------------------------------------------------------------------
+// Nullability uses the parser's 2-bit encoding throughout: 0 = unknown,
+// 1 = not-null, 2 = nullable.
+
+// Combine operand nullabilities under the "nullable if any operand is nullable"
+// rule that governs arithmetic and most scalar functions: nullable (2) if any
+// part is nullable; not-null (1) if every part is known not-null; otherwise
+// unknown (0).
+[[nodiscard]] int combine_nullable_any(const std::vector<int>& parts) {
+    bool all_not_null = !parts.empty();
+    for (const int p : parts) {
+        if (p == 2) {
+            return 2;  // any nullable operand makes the result nullable
+        }
+        if (p != 1) {
+            all_not_null = false;  // an unknown operand blocks a not-null claim
+        }
+    }
+    return all_not_null ? 1 : 0;
+}
+
+// Nullability of a function-call result given its argument nullabilities.
+[[nodiscard]] int function_nullability(std::string_view upper_name,
+                                       const std::vector<int>& arg_nulls) {
+    if (upper_name == "COUNT") {
+        return 1;  // COUNT never returns NULL
+    }
+    if (upper_name == "SUM" || upper_name == "AVG" || upper_name == "MIN" ||
+        upper_name == "MAX") {
+        return 2;  // aggregates over an empty group yield NULL
+    }
+    if (upper_name == "COALESCE") {
+        // NOT NULL iff any argument is known not-null (in particular a not-null
+        // final default guarantees a non-NULL result).
+        bool any_not_null = false;
+        bool any_nullable = false;
+        for (const int p : arg_nulls) {
+            if (p == 1) any_not_null = true;
+            if (p == 2) any_nullable = true;
+        }
+        if (any_not_null) return 1;
+        return any_nullable ? 2 : 0;
+    }
+    // Ordinary scalar functions propagate nullability from their arguments.
+    return combine_nullable_any(arg_nulls);
 }
 
 }  // namespace
@@ -252,12 +408,30 @@ DataType Analyzer::type_of(const ASTNode* node) const {
     return it == inferred_.end() ? DataType::Unknown : it->second;
 }
 
+int Analyzer::nullability_of(const ASTNode* node) const {
+    const auto it = nullability_.find(node);
+    return it == nullability_.end() ? 0 : it->second;
+}
+
+int Analyzer::null_of(const ASTNode* node) const {
+    return nullability_of(node);
+}
+
 void Analyzer::record_type(ASTNode* node, DataType type) {
     if (node == nullptr) {
         return;
     }
     inferred_[node] = type;
     node->data_type = type;  // mirror onto the parser node
+}
+
+void Analyzer::record_nullability(ASTNode* node, int nullability) {
+    if (node == nullptr) {
+        return;
+    }
+    nullability_[node] = nullability;
+    // Mirror onto the parser node's analysis context (2-bit field).
+    node->context.analysis.nullability = static_cast<std::uint8_t>(nullability & 0x3);
 }
 
 void Analyzer::add_diagnostic(DiagnosticCode code, std::string message, const ASTNode* at,
@@ -320,6 +494,9 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
                 out.name = std::string{item->primary_text};
             }
             out.type = type;
+            // Not-null only when inference proved it; otherwise conservatively
+            // nullable. Flows into derived-table / CTE / set-op column lists.
+            out.nullable = (null_of(item) != 1);
             output.push_back(std::move(out));
         }
     }
@@ -383,7 +560,9 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
         }
         for (const auto& rel : scope.relations()) {
             for (const auto& col : rel.columns) {
-                output.push_back(col);
+                ResolvedColumn out = col;
+                out.nullable = out.nullable || rel.nullable_from_join;
+                output.push_back(std::move(out));
             }
         }
         return;
@@ -394,7 +573,9 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
         if (rel.matches_qualifier(qualifier)) {
             matched = true;
             for (const auto& col : rel.columns) {
-                output.push_back(col);
+                ResolvedColumn out = col;
+                out.nullable = out.nullable || rel.nullable_from_join;
+                output.push_back(std::move(out));
             }
         }
     }
@@ -434,8 +615,9 @@ std::vector<ResolvedColumn> Analyzer::analyze_setop(ASTNode* setop, Scope* paren
             continue;  // arity differs: pairwise type check is meaningless
         }
         for (std::size_t j = 0; j < result.size(); ++j) {
-            const TypeReconcile r = reconcile_types(result[j].type, branch[j].type);
-            if (!r.ok) {
+            const Coercion r =
+                coerce(result[j].type, branch[j].type, CoercionKind::UnionReconcile);
+            if (r.status == CoercionStatus::Incompatible) {
                 add_diagnostic(DiagnosticCode::SetOpTypeMismatch,
                                "incompatible types in set operation for output column " +
                                    std::to_string(j + 1),
@@ -520,6 +702,24 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
                 }
             }
             const std::size_t right_end = scope.relations().size();
+            // Outer-join nullability: the null-supplying side's columns become
+            // nullable regardless of their base NOT NULL constraint. The left
+            // side is the relations already in scope before this join
+            // ([0, left_end)); the right side is those just added
+            // ([left_end, right_end)). Marked before predicates / SELECT resolve.
+            switch (join_null_side(item)) {
+                case JoinNullSide::Right:
+                    scope.mark_join_nullable(left_end, right_end);
+                    break;
+                case JoinNullSide::Left:
+                    scope.mark_join_nullable(0, left_end);
+                    break;
+                case JoinNullSide::Both:
+                    scope.mark_join_nullable(0, right_end);
+                    break;
+                case JoinNullSide::None:
+                    break;
+            }
             // Pass 2: resolve the ON expression / USING columns against the now
             // fully-populated scope.
             for (ASTNode* child = first_child(item); child != nullptr;
@@ -591,7 +791,9 @@ ResolvedColumn Analyzer::resolve_column_ref(ASTNode* col_ref, Scope& scope) {
         record_type(col_ref, res.column.type);
         col_ref->context.analysis.table_id = res.column.table_id;
         col_ref->context.analysis.column_id = res.column.column_id;
-        col_ref->context.analysis.nullability = res.column.nullable ? 2 : 1;
+        // Nullability comes from the catalog column, already adjusted for the
+        // null-supplying side of an outer join by the scope resolver.
+        record_nullability(col_ref, res.column.nullable ? 2 : 1);
         return res.column;
     }
 
@@ -614,26 +816,34 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
     }
 
     switch (expr->node_type) {
+        // A non-NULL literal is, by construction, not-null; a NULL literal is
+        // nullable.
         case NodeType::IntegerLiteral:
             record_type(expr, DataType::Integer);
+            record_nullability(expr, 1);
             return DataType::Integer;
         case NodeType::FloatLiteral:
             record_type(expr, DataType::Double);
+            record_nullability(expr, 1);
             return DataType::Double;
         case NodeType::StringLiteral:
             record_type(expr, DataType::Text);
+            record_nullability(expr, 1);
             return DataType::Text;
         case NodeType::BooleanLiteral:
             record_type(expr, DataType::Boolean);
+            record_nullability(expr, 1);
             return DataType::Boolean;
         case NodeType::NullLiteral:
             record_type(expr, DataType::Null);
+            record_nullability(expr, 2);
             return DataType::Null;
 
         case NodeType::ColumnRef:
         // A bare column that is the direct argument of a function call is emitted
         // as an Identifier; resolve it the same way as a ColumnRef.
         case NodeType::Identifier:
+            // resolve_column_ref records both the type and the nullability.
             return resolve_column_ref(expr, scope).type;
 
         case NodeType::FunctionCall:
@@ -641,10 +851,12 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             // Infer argument types (recursion also resolves nested column refs).
             // A COUNT(*) star argument contributes no type and is skipped.
             std::vector<DataType> arg_types;
+            std::vector<int> arg_nulls;
             for (ASTNode* arg = first_child(expr); arg != nullptr; arg = arg->next_sibling) {
                 const DataType t = infer_expr(arg, scope);
                 if (arg->node_type != NodeType::Star) {
                     arg_types.push_back(t);
+                    arg_nulls.push_back(null_of(arg));
                 }
             }
             const std::string upper = to_upper(expr->primary_text);
@@ -656,6 +868,7 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                expr, Severity::Warning);
             }
             record_type(expr, ft.type);
+            record_nullability(expr, function_nullability(upper, arg_nulls));
             return ft.type;
         }
 
@@ -667,12 +880,35 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             const std::string_view op = expr->primary_text;
 
             DataType result = DataType::Unknown;
-            if (is_comparison_op(op) || is_logical_op(op)) {
+            if (is_comparison_op(op)) {
+                // Comparisons yield Boolean. A cross-category comparison (e.g.
+                // text vs integer) is permitted but flagged as a soft implicit
+                // coercion; numeric-vs-numeric and string-vs-string are clean.
+                const Coercion c = coerce(lt, rt, CoercionKind::Comparison);
+                if (c.status != CoercionStatus::Ok) {
+                    add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                                   "implicit coercion in comparison between operands of "
+                                   "different type categories",
+                                   expr, Severity::Warning);
+                }
+                result = DataType::Boolean;
+            } else if (is_logical_op(op)) {
                 result = DataType::Boolean;
             } else if (is_arithmetic_op(op)) {
-                result = promote_numeric(lt, rt);
+                // Arithmetic requires numerically-compatible operands; otherwise
+                // it is a hard type mismatch (e.g. text + integer).
+                const Coercion c = coerce(lt, rt, CoercionKind::Arithmetic);
+                if (c.status == CoercionStatus::Incompatible) {
+                    add_diagnostic(DiagnosticCode::TypeMismatch,
+                                   "incompatible operand types for arithmetic operator '" +
+                                       std::string{op} + "'",
+                                   expr);
+                }
+                result = c.type;
             }
             record_type(expr, result);
+            // A binary result is nullable if either operand can be NULL.
+            record_nullability(expr, combine_nullable_any({null_of(lhs), null_of(rhs)}));
             return result;
         }
 
@@ -683,6 +919,7 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             const DataType result =
                 (op == "NOT" || op == "not") ? DataType::Boolean : ot;
             record_type(expr, result);
+            record_nullability(expr, null_of(operand));
             return result;
         }
 

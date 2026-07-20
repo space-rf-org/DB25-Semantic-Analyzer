@@ -274,6 +274,52 @@ Columns beneath an aggregate are exempt from the grouping rule. GROUP BY and
 ORDER BY expressions are resolved against the FROM scope through the ordinary
 `infer_expr` path, so they emit the usual unresolved-column diagnostics.
 
+## Nullability propagation
+
+Every typed expression node also carries a **nullability** in the parser's 2-bit
+encoding (`0` = unknown, `1` = not-null, `2` = nullable), written both onto
+`context.analysis.nullability` and into an analyzer side map read back via
+`Analyzer::nullability_of(node)`. `infer_expr` computes it alongside the type:
+
+* a non-NULL literal is not-null; a `NULL` literal is nullable;
+* a column reference takes its catalog column's `nullable` flag;
+* arithmetic, comparison, and ordinary scalar functions are *nullable if any
+  operand is nullable* (`combine_nullable_any`), not-null only when every operand
+  is known not-null;
+* `COUNT` is not-null; `SUM`/`AVG`/`MIN`/`MAX` are nullable (empty group → NULL);
+  `COALESCE` is not-null iff **any** argument is not-null (`function_nullability`);
+* a scalar subquery is nullable (it may return no rows); `EXISTS` is not-null.
+
+**Outer-join nullability.** A relation on the null-supplying side of an outer
+join has every column made nullable regardless of its base `NOT NULL`. This is
+tracked with a `RelationBinding::nullable_from_join` flag set when the join is
+resolved (`join_null_side`: `LEFT` → right side, `RIGHT` → left side, `FULL` →
+both, `INNER`/`CROSS` → neither), keyed off the join node type or, for a
+`JoinClause`, its `primary_text` (`"LEFT JOIN"`, …). `Scope::resolve_bare` /
+`resolve_qualified` OR that flag into the resolved column's nullability, and
+`SELECT *` expansion does the same, so `o.id` in
+`users u LEFT JOIN orders o` resolves nullable even when `orders.id` is `NOT NULL`,
+while the preserved side (`u.id`) stays not-null.
+
+## Type coercion model
+
+The previous conservative set-op reconcile helper is generalized into a single
+`coerce(a, b, kind)` model (`CoercionKind` = `Comparison` / `Arithmetic` /
+`UnionReconcile`) returning `{status, type}` where status is `Ok`,
+`ImplicitCoercion`, or `Incompatible`. Rules: identical types and
+`NULL`/`Unknown`/`ANY` wildcards unify cleanly; numeric types unify by promotion
+(`Integer < BigInt < Decimal < Double`); `char`/`varchar`/`text` unify to `text`;
+different temporals, boolean-vs-other, and other cross-category pairings do not.
+The *kind* only changes what a non-unifiable pairing means:
+
+* **comparison** → allowed as a soft `ImplicitCoercion` **warning** (never trips
+  `has_errors()`); numeric-vs-numeric and string-vs-string stay clean;
+* **arithmetic** → a hard `TypeMismatch` **error** (e.g. `text + integer`);
+* **union-reconcile** → `SetOpTypeMismatch` (unchanged behavior).
+
+`BinaryExpr` comparison/arithmetic, set-operation column reconciliation, `IN`
+type-compatibility, and `COALESCE` unification are all routed through it.
+
 ## Roadmap / not yet implemented
 
 * Subquery cardinality checks and correlated-aggregate scoping.

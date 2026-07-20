@@ -37,6 +37,13 @@ struct RelationBinding {
     std::uint32_t table_id = 0;
     std::vector<ResolvedColumn> columns;
 
+    // True when this relation sits on the null-supplying side of an outer join
+    // (the right side of a LEFT JOIN, the left side of a RIGHT JOIN, or either
+    // side of a FULL JOIN). Every column resolved through it is then nullable
+    // regardless of its base NOT NULL constraint, because unmatched rows fill it
+    // with NULLs. Set on the binding after the join is resolved.
+    bool nullable_from_join = false;
+
     // Does the qualifier `q` (from `q.col`) address this relation?
     [[nodiscard]] bool matches_qualifier(std::string_view q) const {
         return alias.empty() ? (name == q) : (alias == q);
@@ -77,6 +84,15 @@ public:
         relations_.push_back(std::move(binding));
     }
 
+    // Mark the relations in the half-open index range [begin, end) of this
+    // scope's own relation list as null-supplied by an outer join. Called by the
+    // analyzer once it knows a join's type (see RelationBinding::nullable_from_join).
+    void mark_join_nullable(std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end && i < relations_.size(); ++i) {
+            relations_[i].nullable_from_join = true;
+        }
+    }
+
     // The relations made visible directly by this scope's own FROM clause, in
     // FROM/JOIN order. Used to expand `SELECT *` / `table.*` (which expand over
     // the current query block only, not outer scopes).
@@ -112,7 +128,13 @@ public:
                 }
                 qualifier_seen = true;
                 if (const auto* col = rel.find_column(column)) {
-                    return {true, false, false, *col};
+                    ColumnResolution res;
+                    res.found = true;
+                    res.column = *col;
+                    // A relation on the null-supplying side of an outer join
+                    // makes every column nullable, base constraint notwithstanding.
+                    res.column.nullable = res.column.nullable || rel.nullable_from_join;
+                    return res;
                 }
             }
         }
@@ -127,15 +149,21 @@ public:
     [[nodiscard]] ColumnResolution resolve_bare(std::string_view column) const {
         for (const Scope* s = this; s != nullptr; s = s->parent_) {
             const ResolvedColumn* hit = nullptr;
+            const RelationBinding* hit_rel = nullptr;
             int matches = 0;
             for (const auto& rel : s->relations_) {
                 if (const auto* col = rel.find_column(column)) {
                     ++matches;
                     hit = col;
+                    hit_rel = &rel;
                 }
             }
             if (matches == 1) {
-                return {true, false, false, *hit};
+                ColumnResolution res;
+                res.found = true;
+                res.column = *hit;
+                res.column.nullable = res.column.nullable || hit_rel->nullable_from_join;
+                return res;
             }
             if (matches > 1) {
                 ColumnResolution res;

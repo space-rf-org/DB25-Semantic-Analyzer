@@ -648,6 +648,140 @@ void test_aggregate_makes_query_grouped() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
+// A catalog for nullability / correlation / subquery tests:
+//   users(id INTEGER NOT NULL, note TEXT)
+//   orders(id INTEGER NOT NULL, uid INTEGER NOT NULL, amount DOUBLE)
+InMemoryCatalog make_catalog_null() {
+    InMemoryCatalog cat;
+    cat.add_table("users", {
+        ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+        ColumnInfo{"note", DataType::Text, /*nullable=*/true},
+    });
+    cat.add_table("orders", {
+        ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+        ColumnInfo{"uid", DataType::Integer, /*nullable=*/false},
+        ColumnInfo{"amount", DataType::Double, /*nullable=*/true},
+    });
+    return cat;
+}
+
+// --- Nullability propagation -------------------------------------------
+
+void test_nullability_columns_and_functions() {
+    std::printf("test_nullability_columns_and_functions\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // id is NOT NULL, note is nullable; COALESCE(note,'x') is not-null;
+    // SUM(id) is nullable; COUNT(*) is not-null.
+    auto res = p.parse(
+        "SELECT id, note, COALESCE(note, 'x'), SUM(id), COUNT(*) FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* id = first_child(list);
+    ASTNode* note = id ? id->next_sibling : nullptr;
+    ASTNode* coalesce = note ? note->next_sibling : nullptr;
+    ASTNode* sum = coalesce ? coalesce->next_sibling : nullptr;
+    ASTNode* count = sum ? sum->next_sibling : nullptr;
+
+    CHECK(id != nullptr && a.nullability_of(id) == 1);        // NOT NULL column
+    CHECK(note != nullptr && a.nullability_of(note) == 2);    // nullable column
+    CHECK(coalesce != nullptr && a.nullability_of(coalesce) == 1);  // COALESCE(.., 'x')
+    CHECK(sum != nullptr && a.nullability_of(sum) == 2);      // SUM -> nullable
+    CHECK(count != nullptr && a.nullability_of(count) == 1);  // COUNT -> not-null
+    // Mirrored onto the parser node's analysis context.
+    CHECK(id != nullptr && id->context.analysis.nullability == 1);
+}
+
+void test_left_join_nullability() {
+    std::printf("test_left_join_nullability\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // orders.id is NOT NULL in the catalog, but it is on the right of a LEFT
+    // JOIN, so o.id resolves as nullable; the left side (u.id) stays not-null.
+    auto res = p.parse("SELECT o.id, u.id FROM users u LEFT JOIN orders o ON u.id = o.uid");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* oid = first_child(list);
+    ASTNode* uid = oid ? oid->next_sibling : nullptr;
+    CHECK(oid != nullptr && a.nullability_of(oid) == 2);  // null-supplied side
+    CHECK(uid != nullptr && a.nullability_of(uid) == 1);  // preserved side
+}
+
+void test_inner_join_nullability_unchanged() {
+    std::printf("test_inner_join_nullability_unchanged\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // INNER JOIN: no side is null-supplied, so o.id keeps its NOT NULL.
+    auto res = p.parse("SELECT o.id FROM users u JOIN orders o ON u.id = o.uid");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* oid = first_child(list);
+    CHECK(oid != nullptr && a.nullability_of(oid) == 1);
+}
+
+// --- Type coercion -----------------------------------------------------
+
+void test_coercion_numeric_comparison_clean() {
+    std::printf("test_coercion_numeric_comparison_clean\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // amount is DOUBLE, id is INTEGER: numeric comparison, no coercion warning.
+    auto res = p.parse("SELECT id FROM orders WHERE amount > id");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 0);
+}
+
+void test_coercion_text_int_comparison_warns() {
+    std::printf("test_coercion_text_int_comparison_warns\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // note is TEXT compared to an integer literal: soft implicit-coercion warning.
+    auto res = p.parse("SELECT id FROM users WHERE note = 1");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
+    // A warning, not an error.
+    CHECK(!a.has_errors());
+}
+
+void test_coercion_arithmetic_text_int_error() {
+    std::printf("test_coercion_arithmetic_text_int_error\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // note (TEXT) + id (INTEGER): a hard arithmetic type mismatch.
+    auto res = p.parse("SELECT note + id FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 1);
+    CHECK(a.has_errors());
+}
+
 }  // namespace
 
 int main() {
@@ -688,6 +822,16 @@ int main() {
     test_scalar_function_type();
     test_unknown_function_degrades();
     test_aggregate_makes_query_grouped();
+
+    // Nullability propagation
+    test_nullability_columns_and_functions();
+    test_left_join_nullability();
+    test_inner_join_nullability_unchanged();
+
+    // Type coercion
+    test_coercion_numeric_comparison_clean();
+    test_coercion_text_int_comparison_warns();
+    test_coercion_arithmetic_text_int_error();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -53,6 +53,11 @@ public:
     // Inferred type recorded for a node (Unknown if none / not analyzed).
     [[nodiscard]] DataType type_of(const ASTNode* node) const;
 
+    // Inferred nullability recorded for a node, using the parser's 2-bit
+    // encoding: 0 = unknown, 1 = not-null, 2 = nullable. Returns 0 for nodes
+    // that were not analyzed / carry no nullability.
+    [[nodiscard]] int nullability_of(const ASTNode* node) const;
+
     // The resolved output projection of a query block (a SELECT statement or a
     // set-operation node), with `SELECT *` / `table.*` expanded to concrete
     // columns in FROM/JOIN order, and (for set operations) the reconciled
@@ -113,12 +118,23 @@ private:
     // Record an inferred type on the node and in the side map.
     void record_type(ASTNode* node, DataType type);
 
+    // Record inferred nullability (0=unknown, 1=not-null, 2=nullable) on the node
+    // (context.analysis.nullability) and in the side map.
+    void record_nullability(ASTNode* node, int nullability);
+
+    // Read back the recorded nullability of a node (0 if none). Used to combine
+    // operand nullabilities when typing a parent expression.
+    [[nodiscard]] int null_of(const ASTNode* node) const;
+
     void add_diagnostic(DiagnosticCode code, std::string message, const ASTNode* at,
                         Severity severity = Severity::Error);
 
     const Catalog& catalog_;
     std::vector<Diagnostic> diagnostics_;
     std::unordered_map<const ASTNode*, DataType> inferred_;
+    // Inferred nullability per node (parser 2-bit encoding); side mirror of
+    // context.analysis.nullability.
+    std::unordered_map<const ASTNode*, int> nullability_;
     // Per query-block resolved projection (stars expanded, set-op types
     // reconciled), keyed by the SELECT / set-operation node.
     std::unordered_map<const ASTNode*, std::vector<ResolvedColumn>> projections_;

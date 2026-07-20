@@ -33,6 +33,12 @@ enum class DiagnosticCode : std::uint16_t {
     // A function call whose name is not in the signature table; result type
     // degrades to Unknown. Emitted as a Warning (not an error).
     UnknownFunction,
+    // A cross-category comparison (e.g. text vs integer) that the coercion model
+    // permits by implicit conversion. Emitted as a Warning (not an error).
+    ImplicitCoercion,
+    // Operands of an arithmetic operator whose types cannot be coerced to a
+    // common numeric type (e.g. text + integer). An error.
+    TypeMismatch,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

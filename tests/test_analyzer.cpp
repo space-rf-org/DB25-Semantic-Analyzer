@@ -279,10 +279,11 @@ void test_select_star_no_from() {
     CHECK(count_code(a, DiagnosticCode::StarWithoutFrom) == 1);
 }
 
-// The consumed parser build cannot represent a qualified star `table.*` (it
-// misparses it and drops the FROM clause; see docs/DESIGN.md). We exercise the
-// analyzer's qualified-star path by synthesizing the node shape the parser is
-// meant to produce: a Star select-list item whose schema_name is the qualifier.
+// The parser emits a qualified star `table.*` as a Star select-list item whose
+// schema_name holds the qualifier (see docs/DESIGN.md). The end-to-end tests
+// below parse real `alias.*` SQL; this synthetic case additionally pins down the
+// behaviour when the qualifier matches only one of several visible relations by
+// pointing schema_name at an arena-owned alias.
 void test_qualified_star_expands() {
     std::printf("test_qualified_star_expands\n");
     auto cat = make_catalog_joins();
@@ -337,6 +338,87 @@ void test_qualified_star_bad_qualifier() {
     Analyzer a(cat);
     a.analyze(res.value());
     CHECK(count_code(a, DiagnosticCode::UnresolvedQualifier) == 1);
+}
+
+// --- Qualified star, end-to-end (parser emits the Star node itself) ------
+//
+// These parse real `alias.*` SQL, confirming the whole path works without any
+// hand-synthesized AST: the parser produces a Star whose schema_name carries the
+// qualifier, and expand_star turns it into exactly that relation's columns.
+
+void test_qualified_star_e2e_expands() {
+    std::printf("test_qualified_star_e2e_expands\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    auto res = p.parse("SELECT o.* FROM orders o");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    // The parser really does produce a Star with the qualifier in schema_name.
+    ASTNode* star = find_descendant(res.value(), NodeType::Star);
+    CHECK(star != nullptr && star->node_type == NodeType::Star);
+    CHECK(star != nullptr && alias_of(star) == "o");
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    const auto* proj = a.projection_of(res.value());
+    CHECK(proj != nullptr);
+    if (proj == nullptr) return;
+    // o.* -> orders' three columns, in catalog order, with types + nullability.
+    CHECK(proj->size() == 3);
+    if (proj->size() == 3) {
+        CHECK((*proj)[0].name == "order_id" &&
+              (*proj)[0].type == DataType::Integer && !(*proj)[0].nullable);
+        CHECK((*proj)[1].name == "user_id" &&
+              (*proj)[1].type == DataType::Integer && !(*proj)[1].nullable);
+        CHECK((*proj)[2].name == "total" &&
+              (*proj)[2].type == DataType::Double && (*proj)[2].nullable);
+    }
+}
+
+void test_qualified_star_e2e_mixed() {
+    std::printf("test_qualified_star_e2e_mixed\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    auto res = p.parse("SELECT o.*, o.order_id FROM orders o");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    const auto* proj = a.projection_of(res.value());
+    CHECK(proj != nullptr);
+    if (proj == nullptr) return;
+    // o.* expands to three columns, then the explicit o.order_id appends a fourth.
+    CHECK(proj->size() == 4);
+    if (proj->size() == 4) {
+        CHECK((*proj)[0].name == "order_id");
+        CHECK((*proj)[1].name == "user_id");
+        CHECK((*proj)[2].name == "total");
+        CHECK((*proj)[3].name == "order_id" &&
+              (*proj)[3].type == DataType::Integer);
+    }
+}
+
+void test_qualified_star_e2e_bad_qualifier() {
+    std::printf("test_qualified_star_e2e_bad_qualifier\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // `x` names no visible relation (the relation is aliased `o`).
+    auto res = p.parse("SELECT x.* FROM orders o");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedQualifier) == 1);
+    // Nothing is expanded for an unresolved qualifier.
+    const auto* proj = a.projection_of(res.value());
+    CHECK(proj != nullptr && proj->empty());
 }
 
 // --- JOIN ON / USING resolution ----------------------------------------
@@ -1900,6 +1982,9 @@ int main() {
     test_select_star_no_from();
     test_qualified_star_expands();
     test_qualified_star_bad_qualifier();
+    test_qualified_star_e2e_expands();
+    test_qualified_star_e2e_mixed();
+    test_qualified_star_e2e_bad_qualifier();
 
     // JOIN ON / USING resolution
     test_join_on_resolves();

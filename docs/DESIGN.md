@@ -259,10 +259,52 @@ from a small, extensible signature table (`function_result_type`):
 * **Unknown** names degrade to `Unknown` and raise a soft `UnknownFunction`
   **Warning** (never an error, so `has_errors()` is unaffected).
 
+### Window (OVER) functions
+
+A window function is a `FunctionCall` that carries a `WindowSpec` child (the
+`OVER` clause) alongside its ordinary arguments. `infer_expr` sets the
+`WindowSpec` aside so it is **not** miscounted as a function argument, resolves
+its `PARTITION BY` / `ORDER BY` expressions (their column references bind against
+the FROM scope), and types the call with window-aware rules:
+
+* ranking functions `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE` → `BigInt`, never
+  NULL;
+* distribution functions `PERCENT_RANK`/`CUME_DIST` → `Double`, never NULL;
+* value-navigation functions `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`
+  → the first argument's type, nullable (a frame boundary may yield no row);
+* an aggregate used as a window function (`SUM(x) OVER (…)`) keeps its ordinary
+  aggregate result type and nullability;
+* any other name with an `OVER` clause degrades to `Unknown` with a soft
+  `UnknownFunction` **Warning**.
+
+Because a window function is evaluated *after* grouping, a windowed aggregate
+does **not** make the query grouped (see below).
+
+### Other expression forms
+
+`infer_expr` also types the common non-function expression nodes rather than
+degrading them to `Unknown`:
+
+* **`CastExpr`** (`CAST(x AS type)`): the result takes the named target type
+  (mapped from the type node's `primary_text` via `data_type_from_name`; a
+  length such as `VARCHAR(10)` is ignored, an unrecognized name stays
+  `Unknown`), and preserves the operand's nullability.
+* **`BetweenExpr`** (`x BETWEEN lo AND hi`) and **`LikeExpr`** (`x LIKE p`):
+  `Boolean`, nullable if any operand is nullable. A cross-category `BETWEEN`
+  (e.g. text vs numeric bounds) or a non-string `LIKE` operand raises a soft
+  `ImplicitCoercion` **Warning**.
+* **`IsNullExpr`** (`x IS [NOT] NULL`): `Boolean` and **never NULL**, regardless
+  of the operand's nullability (the test itself is always defined).
+* **`Parameter`** (`$1` / `?`): `Unknown` until bound, so it unifies with any
+  type; marked nullable.
+
 ### GROUP BY / HAVING legality
 
-A query is *grouped* if it has a `GroupByClause` or any aggregate in the SELECT
-list. `analyze_grouping` collects the grouping keys (as resolved
+A query is *grouped* if it has a `GroupByClause` or any **non-windowed**
+aggregate in the SELECT list (a windowed aggregate like `SUM(x) OVER (…)` does
+not collapse rows and so does not force grouping — its arguments and `OVER`
+expressions are exempt from the grouping rule, as columns beneath an aggregate
+are). `analyze_grouping` collects the grouping keys (as resolved
 `(table_id, column_id)` identity, with the reference text as a fallback for
 unresolved / derived keys) and walks the SELECT list, ORDER BY, and HAVING:
 

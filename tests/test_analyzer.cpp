@@ -1629,26 +1629,27 @@ void test_full_join_nullability() {
 void test_parameter_typing() {
     std::printf("test_parameter_typing\n");
     auto cat = make_catalog_null();
-    parser::Parser p;
-    auto res = p.parse("SELECT id FROM users WHERE id = 1");
-    CHECK(res.has_value());
-    if (!res) return;
+    // Real end-to-end: the parser now emits a NodeType::Parameter node for `?`
+    // and `$1` placeholders (previously it dropped them, so this test had to
+    // synthesize the node). The RHS of the WHERE comparison parses as a genuine
+    // Parameter, which the analyzer then types.
+    for (const char* sql : {"SELECT id FROM users WHERE id = ?",
+                            "SELECT id FROM users WHERE id = $1"}) {
+        parser::Parser p;
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
 
-    // Locate the right-hand operand of the WHERE comparison and retype it as a
-    // bind parameter.
-    ASTNode* where = find_child(res.value(), NodeType::WhereClause);
-    ASTNode* cmp = where ? first_child(where) : nullptr;
-    ASTNode* lhs = cmp ? first_child(cmp) : nullptr;
-    ASTNode* param = lhs ? lhs->next_sibling : nullptr;
-    CHECK(param != nullptr);
-    if (param == nullptr) return;
-    param->node_type = NodeType::Parameter;
+        ASTNode* param = find_descendant(res.value(), NodeType::Parameter);
+        CHECK(param != nullptr);  // parser produced a real Parameter node
+        if (param == nullptr) continue;
 
-    Analyzer a(cat);
-    a.analyze(res.value());
-    // A parameter's type is unknown until bound, and it may be bound to NULL.
-    CHECK(a.type_of(param) == DataType::Unknown);
-    CHECK(a.nullability_of(param) == 2);
+        Analyzer a(cat);
+        a.analyze(res.value());
+        // A parameter's type is unknown until bound, and it may be bound to NULL.
+        CHECK(a.type_of(param) == DataType::Unknown);
+        CHECK(a.nullability_of(param) == 2);
+    }
 }
 
 // --- Correlated scalar subquery ----------------------------------------

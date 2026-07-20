@@ -290,6 +290,78 @@ struct Coercion {
     return coerce(a, b, CoercionKind::UnionReconcile).type;
 }
 
+// Temporal arithmetic. The plain numeric coercion model (`coerce`) cannot type
+// date/time arithmetic because the result depends on the *operator*, not just
+// the operand categories: `date - date` is an Interval, `date + interval` is a
+// Date, `date + date` is meaningless. This helper captures those operator-aware
+// rules; the caller consults it before falling back to numeric coercion.
+enum class TemporalArithStatus {
+    NotTemporal,  // neither operand is temporal: not our concern (use `coerce`)
+    Ok,           // a valid temporal operation; `type` is the result type
+    Invalid,      // a temporal operand combined in a way with no meaning
+};
+
+struct TemporalArith {
+    TemporalArithStatus status;
+    DataType type;  // result type when Ok (Unknown otherwise)
+};
+
+// Result of `lt <op> rt` when at least one operand is temporal. Supported forms:
+//   * temporal ± interval        -> same temporal   (date/time/timestamp shift)
+//   * interval + temporal        -> that temporal   (+ is commutative)
+//   * interval ± interval        -> interval
+//   * date ± integer             -> date            (day arithmetic)
+//   * integer + date             -> date
+//   * temporal - temporal (same) -> interval        (elapsed span)
+// Anything else touching a temporal (date + date, date + timestamp, date * n,
+// interval - date, timestamp + integer, …) is Invalid.
+[[nodiscard]] TemporalArith temporal_arith(DataType a, DataType b,
+                                           std::string_view op) {
+    const bool a_temporal = category_of(a) == TypeCategory::Temporal;
+    const bool b_temporal = category_of(b) == TypeCategory::Temporal;
+    if (!a_temporal && !b_temporal) {
+        return {TemporalArithStatus::NotTemporal, DataType::Unknown};
+    }
+    // Only + and - carry temporal meaning; *, /, % over a temporal are invalid.
+    const bool is_plus = (op == "+");
+    const bool is_minus = (op == "-");
+    if (!is_plus && !is_minus) {
+        return {TemporalArithStatus::Invalid, DataType::Unknown};
+    }
+
+    const bool a_interval = (a == DataType::Interval);
+    const bool b_interval = (b == DataType::Interval);
+    const bool a_numeric = category_of(a) == TypeCategory::Numeric;
+    const bool b_numeric = category_of(b) == TypeCategory::Numeric;
+
+    // interval ± interval -> interval.
+    if (a_interval && b_interval) {
+        return {TemporalArithStatus::Ok, DataType::Interval};
+    }
+    // temporal ± interval -> same temporal (the non-interval temporal is shifted).
+    if (a_temporal && !a_interval && b_interval) {
+        return {TemporalArithStatus::Ok, a};
+    }
+    // interval + temporal -> that temporal (+ only; `interval - date` is invalid).
+    if (a_interval && b_temporal && !b_interval) {
+        return is_plus ? TemporalArith{TemporalArithStatus::Ok, b}
+                       : TemporalArith{TemporalArithStatus::Invalid, DataType::Unknown};
+    }
+    // date ± integer -> date (day arithmetic); integer + date -> date.
+    if (a == DataType::Date && b_numeric) {
+        return {TemporalArithStatus::Ok, DataType::Date};
+    }
+    if (a_numeric && b == DataType::Date && is_plus) {
+        return {TemporalArithStatus::Ok, DataType::Date};
+    }
+    // temporal - temporal of the *same* kind -> interval (elapsed span).
+    if (is_minus && a_temporal && b_temporal && a == b) {
+        return {TemporalArithStatus::Ok, DataType::Interval};
+    }
+    // Any other combination involving a temporal has no defined meaning.
+    return {TemporalArithStatus::Invalid, DataType::Unknown};
+}
+
 // SUM widens integer inputs to BigInt (avoids overflow of the accumulator);
 // exact/approximate numerics keep their kind. Non-numeric inputs pass through
 // unchanged (degrading conservatively rather than guessing).
@@ -961,6 +1033,15 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             // Not-null only when inference proved it; otherwise conservatively
             // nullable. Flows into derived-table / CTE / set-op column lists.
             out.nullable = (null_of(item) != 1);
+            // A direct column reference carries its resolved base-column identity
+            // into the projection, matching what `expand_star` records for `*`.
+            // (An expression / function result has no single base column, so the
+            // ids stay 0.)
+            if (item->node_type == NodeType::ColumnRef ||
+                item->node_type == NodeType::Identifier) {
+                out.table_id = item->context.analysis.table_id;
+                out.column_id = item->context.analysis.column_id;
+            }
             output.push_back(std::move(out));
         }
     }
@@ -1407,17 +1488,37 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                 result = DataType::Boolean;
             } else if (is_logical_op(op)) {
                 result = DataType::Boolean;
+            } else if (op == "||") {
+                // String concatenation always yields text (operands are rendered
+                // to their string form). Nullability is combined below like any
+                // other binary operator.
+                result = DataType::Text;
             } else if (is_arithmetic_op(op)) {
-                // Arithmetic requires numerically-compatible operands; otherwise
-                // it is a hard type mismatch (e.g. text + integer).
-                const Coercion c = coerce(lt, rt, CoercionKind::Arithmetic);
-                if (c.status == CoercionStatus::Incompatible) {
+                // Temporal arithmetic (date/time ± interval, temporal − temporal,
+                // date ± integer) is operator-aware and handled first; a genuinely
+                // invalid temporal mix is a hard type mismatch.
+                const TemporalArith ta = temporal_arith(lt, rt, op);
+                if (ta.status == TemporalArithStatus::Ok) {
+                    result = ta.type;
+                } else if (ta.status == TemporalArithStatus::Invalid) {
                     add_diagnostic(DiagnosticCode::TypeMismatch,
                                    "incompatible operand types for arithmetic operator '" +
                                        std::string{op} + "'",
                                    expr);
+                    result = DataType::Unknown;
+                } else {
+                    // Plain numeric arithmetic requires numerically-compatible
+                    // operands; otherwise it is a hard type mismatch (e.g.
+                    // text + integer).
+                    const Coercion c = coerce(lt, rt, CoercionKind::Arithmetic);
+                    if (c.status == CoercionStatus::Incompatible) {
+                        add_diagnostic(DiagnosticCode::TypeMismatch,
+                                       "incompatible operand types for arithmetic operator '" +
+                                           std::string{op} + "'",
+                                       expr);
+                    }
+                    result = c.type;
                 }
-                result = c.type;
             }
             record_type(expr, result);
             // A binary result is nullable if either operand can be NULL.

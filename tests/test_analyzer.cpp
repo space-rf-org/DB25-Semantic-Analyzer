@@ -9,6 +9,7 @@
 #include "db25/semantic/catalog.hpp"
 
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -74,6 +75,33 @@ InMemoryCatalog make_catalog_emp() {
         ColumnInfo{"region", DataType::Text, /*nullable=*/true},
         ColumnInfo{"salary", DataType::Double, /*nullable=*/true},
         ColumnInfo{"age", DataType::Integer, /*nullable=*/true},
+    });
+    return cat;
+}
+
+// A catalog for temporal-arithmetic tests:
+//   events(d DATE NOT NULL, ts TIMESTAMP NOT NULL, iv INTERVAL NOT NULL,
+//          d2 DATE, n INTEGER NOT NULL)
+InMemoryCatalog make_catalog_temporal() {
+    InMemoryCatalog cat;
+    cat.add_table("events", {
+        ColumnInfo{"d", DataType::Date, /*nullable=*/false},
+        ColumnInfo{"ts", DataType::Timestamp, /*nullable=*/false},
+        ColumnInfo{"iv", DataType::Interval, /*nullable=*/false},
+        ColumnInfo{"d2", DataType::Date, /*nullable=*/true},
+        ColumnInfo{"n", DataType::Integer, /*nullable=*/false},
+    });
+    return cat;
+}
+
+// A catalog for string-concatenation tests:
+//   people(first TEXT NOT NULL, last TEXT NOT NULL, mid TEXT)
+InMemoryCatalog make_catalog_people() {
+    InMemoryCatalog cat;
+    cat.add_table("people", {
+        ColumnInfo{"first", DataType::Text, /*nullable=*/false},
+        ColumnInfo{"last", DataType::Text, /*nullable=*/false},
+        ColumnInfo{"mid", DataType::Text, /*nullable=*/true},
     });
     return cat;
 }
@@ -1966,6 +1994,179 @@ void test_intersect_except_roots() {
     }
 }
 
+// --- Temporal arithmetic ------------------------------------------------
+//
+// Analyze `SELECT <arith> FROM events`, returning the SELECT-list BinaryExpr.
+ASTNode* analyze_temporal(Analyzer& a, parser::Parser& p,
+                          std::optional<parser::ParseResult>& holder,
+                          const char* sql) {
+    holder = p.parse(sql);
+    CHECK(holder->has_value());
+    if (!holder->has_value()) return nullptr;
+    a.analyze(holder->value());
+    return find_descendant(holder->value(), NodeType::BinaryExpr);
+}
+
+// date + interval -> Date, and not-null since both operands are not-null.
+void test_temporal_date_plus_interval() {
+    std::printf("test_temporal_date_plus_interval\n");
+    auto cat = make_catalog_temporal();
+    parser::Parser p;
+    std::optional<parser::ParseResult> h;
+    Analyzer a(cat);
+    ASTNode* e = analyze_temporal(a, p, h, "SELECT d + iv FROM events");
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Date);
+    CHECK(e != nullptr && a.nullability_of(e) == 1);  // NOT NULL
+}
+
+// timestamp + interval -> Timestamp.
+void test_temporal_timestamp_plus_interval() {
+    std::printf("test_temporal_timestamp_plus_interval\n");
+    auto cat = make_catalog_temporal();
+    parser::Parser p;
+    std::optional<parser::ParseResult> h;
+    Analyzer a(cat);
+    ASTNode* e = analyze_temporal(a, p, h, "SELECT ts + iv FROM events");
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Timestamp);
+}
+
+// date + integer -> Date (day arithmetic).
+void test_temporal_date_plus_integer() {
+    std::printf("test_temporal_date_plus_integer\n");
+    auto cat = make_catalog_temporal();
+    parser::Parser p;
+    std::optional<parser::ParseResult> h;
+    Analyzer a(cat);
+    ASTNode* e = analyze_temporal(a, p, h, "SELECT d + n FROM events");
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Date);
+}
+
+// timestamp - timestamp -> Interval (elapsed span, not Timestamp).
+void test_temporal_timestamp_minus_timestamp() {
+    std::printf("test_temporal_timestamp_minus_timestamp\n");
+    auto cat = make_catalog_temporal();
+    parser::Parser p;
+    std::optional<parser::ParseResult> h;
+    Analyzer a(cat);
+    ASTNode* e = analyze_temporal(a, p, h, "SELECT ts - ts FROM events");
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Interval);
+}
+
+// date - date -> Interval (not Date).
+void test_temporal_date_minus_date() {
+    std::printf("test_temporal_date_minus_date\n");
+    auto cat = make_catalog_temporal();
+    parser::Parser p;
+    std::optional<parser::ParseResult> h;
+    Analyzer a(cat);
+    ASTNode* e = analyze_temporal(a, p, h, "SELECT d - d FROM events");
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Interval);
+}
+
+// A nullable temporal operand makes the temporal result nullable.
+void test_temporal_nullable_operand() {
+    std::printf("test_temporal_nullable_operand\n");
+    auto cat = make_catalog_temporal();
+    parser::Parser p;
+    std::optional<parser::ParseResult> h;
+    Analyzer a(cat);
+    ASTNode* e = analyze_temporal(a, p, h, "SELECT d2 + iv FROM events");
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Date);
+    CHECK(e != nullptr && a.nullability_of(e) == 2);  // nullable
+}
+
+// date + timestamp has no defined meaning -> TypeMismatch, result Unknown.
+void test_temporal_invalid_date_plus_timestamp() {
+    std::printf("test_temporal_invalid_date_plus_timestamp\n");
+    auto cat = make_catalog_temporal();
+    parser::Parser p;
+    std::optional<parser::ParseResult> h;
+    Analyzer a(cat);
+    ASTNode* e = analyze_temporal(a, p, h, "SELECT d + ts FROM events");
+    CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 1);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Unknown);
+}
+
+// --- String concatenation (||) ------------------------------------------
+
+// first || last -> Text, not-null when both operands are not-null.
+void test_concat_text_notnull() {
+    std::printf("test_concat_text_notnull\n");
+    auto cat = make_catalog_people();
+    parser::Parser p;
+    auto res = p.parse("SELECT first || last FROM people");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    ASTNode* e = find_descendant(res.value(), NodeType::BinaryExpr);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Text);
+    CHECK(e != nullptr && a.nullability_of(e) == 1);  // NOT NULL
+}
+
+// first || mid -> Text, nullable because `mid` is nullable.
+void test_concat_text_nullable() {
+    std::printf("test_concat_text_nullable\n");
+    auto cat = make_catalog_people();
+    parser::Parser p;
+    auto res = p.parse("SELECT first || mid FROM people");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    ASTNode* e = find_descendant(res.value(), NodeType::BinaryExpr);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Text);
+    CHECK(e != nullptr && a.nullability_of(e) == 2);  // nullable
+}
+
+// --- projection_of column identity --------------------------------------
+
+// A direct column reference in the SELECT list carries its resolved base
+// (table_id, column_id) into projection_of, matching what `SELECT *` records.
+void test_projection_column_identity() {
+    std::printf("test_projection_column_identity\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("SELECT users.id, name FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+
+    const auto* proj = a.projection_of(res.value());
+    CHECK(proj != nullptr);
+    if (proj != nullptr) {
+        CHECK(proj->size() == 2);
+        // Both output columns carry a non-zero base identity.
+        CHECK((*proj)[0].name == "id" && (*proj)[0].table_id != 0 &&
+              (*proj)[0].column_id != 0);
+        CHECK((*proj)[1].name == "name" && (*proj)[1].table_id != 0 &&
+              (*proj)[1].column_id != 0);
+    }
+
+    // The identities must match what `SELECT *` produces for the same table.
+    auto star = p.parse("SELECT * FROM users");
+    CHECK(star.has_value());
+    if (star && proj != nullptr && proj->size() == 2) {
+        Analyzer a2(cat);
+        a2.analyze(star.value());
+        const auto* sp = a2.projection_of(star.value());
+        CHECK(sp != nullptr && sp->size() == 2);
+        if (sp != nullptr && sp->size() == 2) {
+            CHECK((*proj)[0].table_id == (*sp)[0].table_id &&
+                  (*proj)[0].column_id == (*sp)[0].column_id);
+            CHECK((*proj)[1].table_id == (*sp)[1].table_id &&
+                  (*proj)[1].column_id == (*sp)[1].column_id);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2106,6 +2307,22 @@ int main() {
     test_sum_integer_promotes_bigint();
     test_min_max_preserve_type();
     test_intersect_except_roots();
+
+    // Temporal arithmetic
+    test_temporal_date_plus_interval();
+    test_temporal_timestamp_plus_interval();
+    test_temporal_date_plus_integer();
+    test_temporal_timestamp_minus_timestamp();
+    test_temporal_date_minus_date();
+    test_temporal_nullable_operand();
+    test_temporal_invalid_date_plus_timestamp();
+
+    // String concatenation (||)
+    test_concat_text_notnull();
+    test_concat_text_nullable();
+
+    // projection_of column identity
+    test_projection_column_identity();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

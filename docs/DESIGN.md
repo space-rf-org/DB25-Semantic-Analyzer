@@ -41,6 +41,8 @@ the nodes and/or produces diagnostics.
    |   * column refs -> catalog column type                       |
    |   * comparison / logical ops -> Boolean                      |
    |   * arithmetic on numerics -> promoted numeric type          |
+   |   * temporal arithmetic (date/time +/- interval, etc.)       |
+   |   * `||` concatenation -> Text                               |
    +-------------------------------------------------------------+
                        |
                        v
@@ -104,6 +106,15 @@ because the arena is parser-owned and because a resolved `(name, type,
 nullable, table_id, column_id)` list is exactly what downstream consumers
 (derived-table column lists, optimizers) need. `analyze_query` / `analyze_setop`
 also *return* this list so it flows into derived-table and CTE column sets.
+
+**Base-column identity.** Every projected `ResolvedColumn` that traces back to a
+single base column carries that column's `(table_id, column_id)`. This holds
+symmetrically for both projection sources: `expand_star` copies the ids from the
+catalog, and a **direct `ColumnRef`/`Identifier` select item** copies the ids
+resolved onto its node (`context.analysis.table_id` / `column_id`). So
+`SELECT users.id, name FROM users` and `SELECT * FROM users` yield identical
+`(table_id, column_id)` pairs for the shared columns. An expression or function
+result has no single base column, so its ids stay `0`.
 
 ## AST conventions relied upon (KNOWN COUPLINGS)
 
@@ -384,6 +395,32 @@ The *kind* only changes what a non-unifiable pairing means:
 
 `BinaryExpr` comparison/arithmetic, set-operation column reconciliation, `IN`
 type-compatibility, and `COALESCE` unification are all routed through it.
+
+### Temporal arithmetic
+
+Plain numeric coercion cannot type date/time arithmetic because the result
+depends on the **operator**, not just the operand categories. `temporal_arith(a,
+b, op)` captures the operator-aware rules, consulted by the `BinaryExpr`
+arithmetic branch **before** falling back to numeric `coerce`:
+
+* `temporal ± interval` → same temporal (`date`/`time`/`timestamp` shifted); `interval + temporal` is the commutative form;
+* `interval ± interval` → `interval`;
+* `date ± integer` → `date` (day arithmetic); `integer + date` → `date`;
+* `temporal − temporal` of the **same** kind → `interval` (elapsed span, e.g.
+  `timestamp − timestamp` is an `interval`, **not** a `timestamp`);
+* anything else touching a temporal (`date + date`, `date + timestamp`,
+  `interval − date`, `date * n`, `timestamp + integer`, …) → `TypeMismatch`
+  **error**, result `Unknown`.
+
+Nullability follows the ordinary binary rule: the result is not-null only when
+both operands are not-null.
+
+### String concatenation (`||`)
+
+The `||` operator always yields `Text` (operands are rendered to string form),
+nullable if either operand is nullable. It is handled explicitly in the
+`BinaryExpr` branch rather than degrading to `Unknown`. (Bitwise operators are
+not yet modeled and still degrade to `Unknown`.)
 
 ## Subquery correlation, scalar & IN subqueries
 

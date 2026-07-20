@@ -1555,6 +1555,184 @@ void test_window_aggregate_does_not_force_grouping() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
 }
 
+// --- Ambiguous column resolution ---------------------------------------
+
+void test_ambiguous_column() {
+    std::printf("test_ambiguous_column\n");
+    auto cat = make_catalog_null();  // users(id, note) and orders(id, uid, amount)
+    parser::Parser p;
+    // `id` exists in both joined relations and is referenced UNqualified, so it
+    // cannot be resolved to a single relation.
+    auto res = p.parse("SELECT id FROM users u JOIN orders o ON u.id = o.uid");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AmbiguousColumn) == 1);
+    CHECK(a.has_errors());
+}
+
+// --- RIGHT / FULL JOIN nullability -------------------------------------
+
+void test_right_join_nullability() {
+    std::printf("test_right_join_nullability\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // RIGHT JOIN: the LEFT relation (users u) is null-supplied, so u.id becomes
+    // nullable even though it is NOT NULL in the catalog; the right side (orders
+    // o) keeps its NOT NULL. The parser emits this as a JoinClause whose
+    // primary_text is "RIGHT JOIN", which drives the join_null_side path.
+    auto res = p.parse("SELECT o.id, u.id FROM users u RIGHT JOIN orders o ON u.id = o.uid");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* oid = first_child(list);
+    ASTNode* uid = oid ? oid->next_sibling : nullptr;
+    CHECK(oid != nullptr && a.nullability_of(oid) == 1);  // preserved (right side)
+    CHECK(uid != nullptr && a.nullability_of(uid) == 2);  // null-supplied (left side)
+}
+
+void test_full_join_nullability() {
+    std::printf("test_full_join_nullability\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // FULL JOIN: both sides are null-supplied, so both o.id and u.id become
+    // nullable regardless of their base NOT NULL constraints.
+    auto res = p.parse("SELECT o.id, u.id FROM users u FULL JOIN orders o ON u.id = o.uid");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* oid = first_child(list);
+    ASTNode* uid = oid ? oid->next_sibling : nullptr;
+    CHECK(oid != nullptr && a.nullability_of(oid) == 2);  // null-supplied
+    CHECK(uid != nullptr && a.nullability_of(uid) == 2);  // null-supplied
+}
+
+// --- Bind-parameter typing ---------------------------------------------
+
+// The consumed parser build drops bind parameters ($1 / ?) before the analyzer
+// sees them (they never appear as a NodeType::Parameter in a parse tree; see
+// docs/DESIGN.md). We exercise the analyzer's Parameter typing path directly by
+// synthesizing the node shape the parser is meant to produce: an expression leaf
+// whose node_type is Parameter, sitting where an operand is inferred.
+void test_parameter_typing() {
+    std::printf("test_parameter_typing\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    auto res = p.parse("SELECT id FROM users WHERE id = 1");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    // Locate the right-hand operand of the WHERE comparison and retype it as a
+    // bind parameter.
+    ASTNode* where = find_child(res.value(), NodeType::WhereClause);
+    ASTNode* cmp = where ? first_child(where) : nullptr;
+    ASTNode* lhs = cmp ? first_child(cmp) : nullptr;
+    ASTNode* param = lhs ? lhs->next_sibling : nullptr;
+    CHECK(param != nullptr);
+    if (param == nullptr) return;
+    param->node_type = NodeType::Parameter;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // A parameter's type is unknown until bound, and it may be bound to NULL.
+    CHECK(a.type_of(param) == DataType::Unknown);
+    CHECK(a.nullability_of(param) == 2);
+}
+
+// --- Correlated scalar subquery ----------------------------------------
+
+void test_correlated_scalar_subquery() {
+    std::printf("test_correlated_scalar_subquery\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // The scalar subquery in the SELECT list references the outer u.id, so it
+    // resolves against the enclosing query and is marked correlated (no
+    // diagnostic: this is legal). It projects one column (amount -> Double).
+    auto res = p.parse(
+        "SELECT (SELECT amount FROM orders o WHERE o.uid = u.id) FROM users u");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    ASTNode* subq = find_descendant(res.value(), NodeType::Subquery);
+    CHECK(subq != nullptr && a.is_correlated(subq));
+    CHECK(subq != nullptr && a.type_of(subq) == DataType::Double);
+}
+
+// --- Aggregate result typing (SUM promotion, MIN/MAX preservation) ------
+
+void test_sum_integer_promotes_bigint() {
+    std::printf("test_sum_integer_promotes_bigint\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // SUM over an INTEGER column widens to BIGINT (overflow-safe accumulation).
+    auto res = p.parse("SELECT SUM(age) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* sum = find_function(res.value(), "SUM");
+    CHECK(sum != nullptr && a.type_of(sum) == DataType::BigInt);
+}
+
+void test_min_max_preserve_type() {
+    std::printf("test_min_max_preserve_type\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // MIN/MAX return the input column's type unchanged.
+    auto res = p.parse("SELECT MIN(salary), MAX(age) FROM emp");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* mn = find_function(res.value(), "MIN");
+    ASTNode* mx = find_function(res.value(), "MAX");
+    CHECK(mn != nullptr && a.type_of(mn) == DataType::Double);   // salary is DOUBLE
+    CHECK(mx != nullptr && a.type_of(mx) == DataType::Integer);  // age is INTEGER
+}
+
+// --- INTERSECT / EXCEPT set-operation roots ----------------------------
+
+void test_intersect_except_roots() {
+    std::printf("test_intersect_except_roots\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // INTERSECT and EXCEPT produce their own dedicated root statement node types.
+    auto in = p.parse("SELECT id FROM emp INTERSECT SELECT age FROM emp");
+    CHECK(in.has_value());
+    if (in) {
+        Analyzer a(cat);
+        a.analyze(in.value());
+        CHECK(in.value()->node_type == NodeType::IntersectStmt);
+    }
+    auto ex = p.parse("SELECT id FROM emp EXCEPT SELECT age FROM emp");
+    CHECK(ex.has_value());
+    if (ex) {
+        Analyzer a(cat);
+        a.analyze(ex.value());
+        CHECK(ex.value()->node_type == NodeType::ExceptStmt);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1666,6 +1844,24 @@ int main() {
     test_window_rank_type();
     test_window_sum_over_type();
     test_window_aggregate_does_not_force_grouping();
+
+    // Ambiguous column resolution
+    test_ambiguous_column();
+
+    // RIGHT / FULL JOIN nullability
+    test_right_join_nullability();
+    test_full_join_nullability();
+
+    // Bind-parameter typing
+    test_parameter_typing();
+
+    // Correlated scalar subquery
+    test_correlated_scalar_subquery();
+
+    // Aggregate result typing & INTERSECT / EXCEPT roots
+    test_sum_integer_promotes_bigint();
+    test_min_max_preserve_type();
+    test_intersect_except_roots();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

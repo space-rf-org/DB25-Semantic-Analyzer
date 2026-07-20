@@ -53,6 +53,17 @@ public:
     // Inferred type recorded for a node (Unknown if none / not analyzed).
     [[nodiscard]] DataType type_of(const ASTNode* node) const;
 
+    // Inferred nullability recorded for a node, using the parser's 2-bit
+    // encoding: 0 = unknown, 1 = not-null, 2 = nullable. Returns 0 for nodes
+    // that were not analyzed / carry no nullability.
+    [[nodiscard]] int nullability_of(const ASTNode* node) const;
+
+    // Whether the given subquery node (a Subquery / SubqueryExpr used as a
+    // scalar, IN, or EXISTS operand) was found to be correlated: it references a
+    // column resolved in an enclosing query block. False for uncorrelated
+    // subqueries and for nodes that are not analyzed subqueries.
+    [[nodiscard]] bool is_correlated(const ASTNode* subquery) const;
+
     // The resolved output projection of a query block (a SELECT statement or a
     // set-operation node), with `SELECT *` / `table.*` expanded to concrete
     // columns in FROM/JOIN order, and (for set operations) the reconciled
@@ -94,6 +105,12 @@ private:
     // Infer and record the type of an expression subtree.
     DataType infer_expr(ASTNode* expr, Scope& scope);
 
+    // Analyze a subquery used in an expression position (scalar / IN / EXISTS):
+    // analyze its inner query block under a child scope of `enclosing` so that
+    // correlated column references resolve outward, record whether it turned out
+    // correlated, and return its projected columns.
+    std::vector<ResolvedColumn> analyze_subquery(ASTNode* subquery, Scope& enclosing);
+
     // GROUP BY / HAVING legality. Called after FROM/SELECT/WHERE have been
     // resolved. Resolves the GROUP BY keys, decides whether the query is
     // "grouped" (a GROUP BY clause is present, or the SELECT list contains an
@@ -113,12 +130,29 @@ private:
     // Record an inferred type on the node and in the side map.
     void record_type(ASTNode* node, DataType type);
 
+    // Record inferred nullability (0=unknown, 1=not-null, 2=nullable) on the node
+    // (context.analysis.nullability) and in the side map.
+    void record_nullability(ASTNode* node, int nullability);
+
+    // Read back the recorded nullability of a node (0 if none). Used to combine
+    // operand nullabilities when typing a parent expression.
+    [[nodiscard]] int null_of(const ASTNode* node) const;
+
     void add_diagnostic(DiagnosticCode code, std::string message, const ASTNode* at,
                         Severity severity = Severity::Error);
 
     const Catalog& catalog_;
     std::vector<Diagnostic> diagnostics_;
     std::unordered_map<const ASTNode*, DataType> inferred_;
+    // Inferred nullability per node (parser 2-bit encoding); side mirror of
+    // context.analysis.nullability.
+    std::unordered_map<const ASTNode*, int> nullability_;
+    // Whether a subquery node resolved a correlated (outer-scope) reference.
+    std::unordered_map<const ASTNode*, bool> correlated_;
+    // While analyzing a subquery's body, points at that subquery's correlation
+    // flag so a correlated column resolution can set it. Saved/restored around
+    // each nested subquery so the innermost active subquery is marked.
+    bool* corr_sink_ = nullptr;
     // Per query-block resolved projection (stars expanded, set-op types
     // reconciled), keyed by the SELECT / set-operation node.
     std::unordered_map<const ASTNode*, std::vector<ResolvedColumn>> projections_;

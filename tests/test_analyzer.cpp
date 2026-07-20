@@ -1674,6 +1674,61 @@ void test_correlated_scalar_subquery() {
     CHECK(subq != nullptr && a.type_of(subq) == DataType::Double);
 }
 
+void test_correlated_aggregate_subquery_not_grouped() {
+    std::printf("test_correlated_aggregate_subquery_not_grouped\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // A correlated COUNT(*) subquery in the SELECT list. The aggregate lives in
+    // the INNER query block; it must NOT make the OUTER query grouped, and the
+    // outer grouping legality rule must NOT reach across the subquery boundary.
+    // The correlated reference to the outer u.id (and the inner o.uid) are not
+    // columns of the outer relation, so neither may be flagged NonGroupedColumn.
+    auto res = p.parse(
+        "SELECT (SELECT COUNT(*) FROM orders o WHERE o.uid = u.id) FROM users u");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
+
+    ASTNode* subq = find_descendant(res.value(), NodeType::Subquery);
+    CHECK(subq != nullptr && a.is_correlated(subq));
+}
+
+void test_subquery_grouping_boundary_guard() {
+    std::printf("test_subquery_grouping_boundary_guard\n");
+    parser::Parser p;
+
+    // Guard 1: a single-block query with an aggregate but no GROUP BY still
+    // flags the bare non-grouped column (the fix must not weaken this).
+    {
+        auto cat = make_catalog_emp();
+        auto res = p.parse("SELECT dept, COUNT(*) FROM emp");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+        }
+    }
+
+    // Guard 2: an INNER subquery that is itself illegally grouped still fires a
+    // NonGroupedColumn from its OWN grouping analysis. Stopping the outer pass
+    // at the subquery boundary must not disable the inner block's own check.
+    {
+        auto cat = make_catalog_null();
+        auto res = p.parse("SELECT (SELECT uid FROM orders GROUP BY id) FROM users");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+        }
+    }
+}
+
 // --- Aggregate result typing (SUM promotion, MIN/MAX preservation) ------
 
 void test_sum_integer_promotes_bigint() {
@@ -1857,6 +1912,8 @@ int main() {
 
     // Correlated scalar subquery
     test_correlated_scalar_subquery();
+    test_correlated_aggregate_subquery_not_grouped();
+    test_subquery_grouping_boundary_guard();
 
     // Aggregate result typing & INTERSECT / EXCEPT roots
     test_sum_integer_promotes_bigint();

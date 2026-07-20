@@ -35,12 +35,20 @@ jobs:
 
       # 3. Build + install the parser dependency (portable / non-native build:
       #    ENABLE_NATIVE is intentionally NOT passed so the binaries run on any
-      #    runner). Pinned to the parser's default branch (main). The tokenizer
-      #    is a git submodule and must be pulled recursively.
+      #    runner). Pinned to an exact parser commit (see PARSER_SHA below) for
+      #    a reproducible contract. The tokenizer is a git submodule and must be
+      #    pulled recursively.
       - name: Build and install DB25 SQL parser
         run: |
-          git clone --branch main https://github.com/space-rf-org/db25-sql-parser
+          # Pin the parser to an exact commit for a reproducible build
+          # contract (do not float on the parser's moving main branch).
+          # To bump: set PARSER_SHA to the desired db25-sql-parser commit,
+          # e.g. its current main tip from:
+          #   git ls-remote https://github.com/space-rf-org/db25-sql-parser main
+          PARSER_SHA=c6c0817561312e3cf8fdd3670a863beba06730bc
+          git clone https://github.com/space-rf-org/db25-sql-parser
           cd db25-sql-parser
+          git checkout "$PARSER_SHA"
           git submodule update --init --recursive
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -85,8 +93,15 @@ jobs:
       # Parser install stays a plain Release build (no sanitizers needed).
       - name: Build and install DB25 SQL parser
         run: |
-          git clone --branch main https://github.com/space-rf-org/db25-sql-parser
+          # Pin the parser to an exact commit for a reproducible build
+          # contract (do not float on the parser's moving main branch).
+          # To bump: set PARSER_SHA to the desired db25-sql-parser commit,
+          # e.g. its current main tip from:
+          #   git ls-remote https://github.com/space-rf-org/db25-sql-parser main
+          PARSER_SHA=c6c0817561312e3cf8fdd3670a863beba06730bc
+          git clone https://github.com/space-rf-org/db25-sql-parser
           cd db25-sql-parser
+          git checkout "$PARSER_SHA"
           git submodule update --init --recursive
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \

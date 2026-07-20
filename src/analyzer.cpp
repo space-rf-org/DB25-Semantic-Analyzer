@@ -1626,6 +1626,14 @@ namespace {
     if (node == nullptr) {
         return false;
     }
+    // A nested subquery is a separate query block: an aggregate inside it does
+    // not collapse the enclosing query's rows and so does not make the enclosing
+    // query grouped. Stop at the boundary (the subquery runs its own grouping
+    // analysis independently).
+    if (node->node_type == NodeType::Subquery ||
+        node->node_type == NodeType::SubqueryExpr) {
+        return false;
+    }
     if (node->node_type == NodeType::FunctionCall ||
         node->node_type == NodeType::FunctionExpr) {
         // A windowed aggregate (e.g. SUM(x) OVER (...)) does not collapse rows,
@@ -1713,6 +1721,16 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
 void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& keys,
                                    bool in_aggregate) {
     if (expr == nullptr) {
+        return;
+    }
+
+    // Do not descend into a nested subquery: it is a distinct query block with
+    // its own FROM scope and its own grouping analysis. Its columns (including a
+    // correlated reference to an OUTER block's column) are not columns of THIS
+    // grouped relation, so the GROUP BY legality rule here does not apply to
+    // them. Crossing this boundary would spuriously flag them as non-grouped.
+    if (expr->node_type == NodeType::Subquery ||
+        expr->node_type == NodeType::SubqueryExpr) {
         return;
     }
 

@@ -786,6 +786,53 @@ void test_order_by_non_grouped() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
+void test_groupby_positional_single() {
+    std::printf("test_groupby_positional_single\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // GROUP BY 1 refers to the 1st output column (dept); COUNT(*) is aggregated.
+    auto res = p.parse("SELECT dept, COUNT(*) FROM emp GROUP BY 1");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // Clean: positional key groups by dept, so dept is a grouping key.
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
+}
+
+void test_groupby_positional_multi() {
+    std::printf("test_groupby_positional_multi\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // GROUP BY 1, 2 groups by the 1st (dept) and 2nd (age) output columns.
+    auto res = p.parse("SELECT dept, age, COUNT(*) FROM emp GROUP BY 1, 2");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // Clean: both dept and age are grouping keys via their positions.
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
+}
+
+void test_groupby_positional_still_flags_non_grouped() {
+    std::printf("test_groupby_positional_still_flags_non_grouped\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // GROUP BY 1 groups by dept; age is neither grouped nor aggregated, so it
+    // is still an illegal non-grouped column (the fix must not silence this).
+    auto res = p.parse("SELECT dept, age FROM emp GROUP BY 1");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
 void test_avg_result_type() {
     std::printf("test_avg_result_type\n");
     auto cat = make_catalog_emp();
@@ -2303,6 +2350,9 @@ int main() {
     test_having_non_grouped_column();
     test_nested_aggregate();
     test_order_by_non_grouped();
+    test_groupby_positional_single();
+    test_groupby_positional_multi();
+    test_groupby_positional_still_flags_non_grouped();
     test_avg_result_type();
     test_scalar_function_type();
     test_unknown_function_degrades();

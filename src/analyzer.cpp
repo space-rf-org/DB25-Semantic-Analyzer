@@ -1935,10 +1935,38 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
     std::vector<GroupKey> keys;
     if (group_by != nullptr) {
         for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
+            // Positional GROUP BY: `GROUP BY n` refers to the n-th (1-based)
+            // output column of the SELECT list (legal in Postgres / MySQL /
+            // SQLite / DuckDB). The key node is an IntegerLiteral carrying the
+            // ordinal in primary_text; take the identity of that SELECT item so
+            // a SELECT reference to the same column matches the key. When n is
+            // out of range we leave the literal key as-is (no crash).
+            const ASTNode* identity = key;
+            if (key->node_type == NodeType::IntegerLiteral && select_list != nullptr) {
+                std::size_t ordinal = 0;
+                bool valid = !key->primary_text.empty();
+                for (const char c : key->primary_text) {
+                    if (c < '0' || c > '9') {
+                        valid = false;
+                        break;
+                    }
+                    ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
+                }
+                if (valid && ordinal >= 1) {
+                    std::size_t i = 1;
+                    for (ASTNode* item = first_child(select_list); item != nullptr;
+                         item = item->next_sibling, ++i) {
+                        if (i == ordinal) {
+                            identity = item;
+                            break;
+                        }
+                    }
+                }
+            }
             GroupKey k;
-            k.table_id = key->context.analysis.table_id;
-            k.column_id = key->context.analysis.column_id;
-            k.text = key->primary_text;
+            k.table_id = identity->context.analysis.table_id;
+            k.column_id = identity->context.analysis.column_id;
+            k.text = identity->primary_text;
             keys.push_back(k);
         }
     }

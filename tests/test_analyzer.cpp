@@ -513,6 +513,98 @@ void test_join_using_missing() {
     CHECK(count_code(a, DiagnosticCode::UsingColumnMissing) == 1);
 }
 
+// A USING column is COALESCED into one output column, so a bare (unqualified)
+// reference to it must resolve, not report ambiguity.
+void test_join_using_coalesces_bare_ref() {
+    std::printf("test_join_using_coalesces_bare_ref\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    auto res = p.parse("SELECT user_id FROM orders o JOIN sessions s USING (user_id)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AmbiguousColumn) == 0);
+    CHECK(!a.has_errors());
+}
+
+// A NATURAL join coalesces every common column (here user_id), so a bare
+// reference resolves unambiguously - and a qualified reference still works.
+void test_natural_join_coalesces_bare_ref() {
+    std::printf("test_natural_join_coalesces_bare_ref\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    auto res = p.parse("SELECT user_id, s.token FROM orders o NATURAL JOIN sessions s");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AmbiguousColumn) == 0);
+    CHECK(!a.has_errors());
+}
+
+// Coalescing is specific to USING / NATURAL: a plain ON join over a shared
+// column name leaves BOTH copies visible, so a bare reference stays ambiguous.
+void test_join_on_shared_name_still_ambiguous() {
+    std::printf("test_join_on_shared_name_still_ambiguous\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    auto res = p.parse(
+        "SELECT user_id FROM orders o JOIN sessions s ON o.user_id = s.user_id");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AmbiguousColumn) == 1);
+}
+
+// `SELECT *` over a USING / NATURAL join emits the shared column exactly ONCE
+// (the coalesced right-hand copy is dropped from the expansion), so the
+// projection is narrower than the un-coalesced left++right frame.
+void test_star_over_using_coalesces() {
+    std::printf("test_star_over_using_coalesces\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // orders(order_id,user_id,total) + sessions(user_id,token), user_id shared.
+    auto res = p.parse("SELECT * FROM orders o JOIN sessions s USING (user_id)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    const auto* proj = a.projection_of(res.value());
+    CHECK(proj != nullptr);
+    if (proj == nullptr) return;
+    // [order_id, user_id, total, token] - user_id once, not twice (would be 5).
+    CHECK(proj->size() == 4);
+    int user_id_count = 0;
+    for (const auto& c : *proj) {
+        if (c.name == "user_id") ++user_id_count;
+    }
+    CHECK(user_id_count == 1);
+}
+
+void test_star_over_natural_coalesces() {
+    std::printf("test_star_over_natural_coalesces\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    auto res = p.parse("SELECT * FROM orders o NATURAL JOIN sessions s");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    const auto* proj = a.projection_of(res.value());
+    CHECK(proj != nullptr);
+    if (proj == nullptr) return;
+    CHECK(proj->size() == 4);  // user_id coalesced to one
+}
+
 // --- Set-operation reconciliation --------------------------------------
 
 void test_setop_union_clean() {
@@ -2192,6 +2284,11 @@ int main() {
     test_join_on_unresolved_column();
     test_join_using_resolves();
     test_join_using_missing();
+    test_join_using_coalesces_bare_ref();
+    test_natural_join_coalesces_bare_ref();
+    test_join_on_shared_name_still_ambiguous();
+    test_star_over_using_coalesces();
+    test_star_over_natural_coalesces();
 
     // Set-operation reconciliation
     test_setop_union_clean();

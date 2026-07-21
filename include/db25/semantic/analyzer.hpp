@@ -123,6 +123,11 @@ private:
     void resolve_using(ASTNode* using_clause, Scope& scope, std::size_t left_end,
                        std::size_t right_end);
 
+    // Coalesce the columns common to a NATURAL join's left ([0, left_end)) and
+    // right ([left_end, right_end)) relations, so a bare reference to a shared
+    // column is not ambiguous.
+    void resolve_natural(Scope& scope, std::size_t left_end, std::size_t right_end);
+
     // Resolve a column reference against `scope`, recording type + context and
     // emitting a diagnostic on failure.
     ResolvedColumn resolve_column_ref(ASTNode* col_ref, Scope& scope);

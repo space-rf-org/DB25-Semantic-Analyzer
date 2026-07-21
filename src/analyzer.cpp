@@ -1124,8 +1124,17 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
         }
         for (const auto& rel : scope.relations()) {
             for (const auto& col : rel.columns) {
+                // A USING / NATURAL join coalesces a shared column to ONE output
+                // column: the right-hand copy is marked coalesced, so `SELECT *`
+                // emits it once (the surviving left copy). The flag is a property
+                // of this join's scope, so clear it on the projected column - the
+                // result is a fresh relation where the column is unqualified-plain.
+                if (col.coalesced) {
+                    continue;
+                }
                 ResolvedColumn out = col;
                 out.nullable = out.nullable || rel.nullable_from_join;
+                out.coalesced = false;
                 output.push_back(std::move(out));
             }
         }
@@ -1136,9 +1145,12 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
     for (const auto& rel : scope.relations()) {
         if (rel.matches_qualifier(qualifier)) {
             matched = true;
+            // A qualified `t.*` is table-scoped: it lists every column of `t`,
+            // including a coalesced shared column (still addressable as `t.col`).
             for (const auto& col : rel.columns) {
                 ResolvedColumn out = col;
                 out.nullable = out.nullable || rel.nullable_from_join;
+                out.coalesced = false;  // the projection is a fresh relation
                 output.push_back(std::move(out));
             }
         }
@@ -1296,6 +1308,12 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
                     infer_expr(child, scope);
                 }
             }
+            // A NATURAL join (recorded in the JoinClause primary_text) has no ON
+            // or USING clause; coalesce its common columns so bare references to
+            // them resolve unambiguously.
+            if (to_upper(item->primary_text).find("NATURAL") != std::string::npos) {
+                resolve_natural(scope, left_end, right_end);
+            }
             return;
         }
         default:
@@ -1333,10 +1351,37 @@ void Analyzer::resolve_using(ASTNode* using_clause, Scope& scope,
             continue;
         }
         // A USING column collapses to a single merged output column; record its
-        // resolved type on the node so downstream consumers see it.
+        // resolved type on the node so downstream consumers see it, and coalesce
+        // the right-hand copy so a bare reference is not ambiguous.
         record_type(col, left_hit->type);
         col->context.analysis.table_id = left_hit->table_id;
         col->context.analysis.column_id = left_hit->column_id;
+        scope.mark_column_coalesced(left_end, right_end, name);
+    }
+}
+
+// A NATURAL join is USING over every column common to both inputs: coalesce each
+// column that appears in both the left ([0, left_end)) and right
+// ([left_end, right_end)) relations, so a bare reference to it resolves to the
+// single left copy rather than reporting ambiguity. (An out-of-scope subtlety:
+// a common column that is itself ambiguous on the left stays ambiguous - the
+// left copy is not coalesced, so resolve_bare still sees more than one.)
+void Analyzer::resolve_natural(Scope& scope, std::size_t left_end,
+                               std::size_t right_end) {
+    const auto& relations = scope.relations();
+    for (std::size_t li = 0; li < left_end && li < relations.size(); ++li) {
+        for (const auto& lc : relations[li].columns) {
+            bool in_right = false;
+            for (std::size_t ri = left_end; ri < right_end && ri < relations.size(); ++ri) {
+                if (relations[ri].find_column(lc.name) != nullptr) {
+                    in_right = true;
+                    break;
+                }
+            }
+            if (in_right) {
+                scope.mark_column_coalesced(left_end, right_end, lc.name);
+            }
+        }
     }
 }
 

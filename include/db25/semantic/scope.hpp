@@ -25,6 +25,11 @@ struct ResolvedColumn {
     bool nullable = true;
     std::uint32_t table_id = 0;
     std::uint32_t column_id = 0;
+    // A USING / NATURAL join coalesces the shared column into ONE output column.
+    // The right-hand relation's copy is marked coalesced so a bare (unqualified)
+    // reference resolves to the single left copy instead of being reported
+    // ambiguous. A qualified reference (`b.id`) still resolves against it.
+    bool coalesced = false;
 };
 
 // A relation visible in a scope: a base table, an aliased table, a derived
@@ -91,6 +96,20 @@ public:
     // Mark the relations in the half-open index range [begin, end) of this
     // scope's own relation list as null-supplied by an outer join. Called by the
     // analyzer once it knows a join's type (see RelationBinding::nullable_from_join).
+    // Mark the copy of column `name` in relations [begin, end) as coalesced (the
+    // right-hand side of a USING / NATURAL join), so a bare reference to it
+    // resolves to the surviving left copy rather than reporting ambiguity.
+    void mark_column_coalesced(std::size_t begin, std::size_t end,
+                               std::string_view name) {
+        for (std::size_t i = begin; i < end && i < relations_.size(); ++i) {
+            for (auto& c : relations_[i].columns) {
+                if (c.name == name) {
+                    c.coalesced = true;
+                }
+            }
+        }
+    }
+
     void mark_join_nullable(std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end && i < relations_.size(); ++i) {
             relations_[i].nullable_from_join = true;
@@ -158,6 +177,12 @@ public:
             int matches = 0;
             for (const auto& rel : s->relations_) {
                 if (const auto* col = rel.find_column(column)) {
+                    // The right-hand copy of a USING / NATURAL coalesced column
+                    // is not a distinct match for a bare reference - it merged
+                    // into the left copy - so it must not trigger ambiguity.
+                    if (col->coalesced) {
+                        continue;
+                    }
                     ++matches;
                     hit = col;
                     hit_rel = &rel;

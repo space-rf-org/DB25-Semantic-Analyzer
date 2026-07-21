@@ -1470,18 +1470,33 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             std::vector<DataType> arg_types;
             std::vector<int> arg_nulls;
             ASTNode* window_spec = nullptr;
+            const std::string upper = to_upper(expr->primary_text);
+            // EXTRACT(field FROM ts) / DATE_PART(field, ts): the leading field is
+            // a date-part keyword (YEAR, MONTH, DAY, ...) that the parser emits as
+            // a bare Identifier. It is NOT a column reference, so skip resolving it
+            // - otherwise it is wrongly reported as an unresolved column and the
+            // whole EXTRACT call fails to analyze.
+            const bool datepart_head = (upper == "EXTRACT" || upper == "DATE_PART");
+            bool first_arg = true;
             for (ASTNode* arg = first_child(expr); arg != nullptr; arg = arg->next_sibling) {
                 if (arg->node_type == NodeType::WindowSpec) {
                     window_spec = arg;
                     continue;
                 }
+                if (datepart_head && first_arg &&
+                    (arg->node_type == NodeType::Identifier ||
+                     arg->node_type == NodeType::ColumnRef)) {
+                    first_arg = false;
+                    record_type(arg, DataType::Unknown);  // keyword, not a value
+                    continue;
+                }
+                first_arg = false;
                 const DataType t = infer_expr(arg, scope);
                 if (arg->node_type != NodeType::Star) {
                     arg_types.push_back(t);
                     arg_nulls.push_back(null_of(arg));
                 }
             }
-            const std::string upper = to_upper(expr->primary_text);
             if (window_spec != nullptr) {
                 // Resolve the OVER clause's partition/order expressions (the
                 // default recursion binds their column references) and type the

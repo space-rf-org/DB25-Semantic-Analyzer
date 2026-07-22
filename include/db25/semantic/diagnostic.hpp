@@ -54,6 +54,14 @@ enum class DiagnosticCode : std::uint16_t {
     // A LIMIT / OFFSET operand that is a literal but is negative or not an
     // integer (e.g. `LIMIT -1`, `LIMIT 1.5`).
     InvalidLimit,
+    // An aggregate function call appears in a WHERE clause. Aggregates are
+    // evaluated after grouping, so they belong in HAVING, not WHERE.
+    AggregateInWhere,
+    // The same correlation name (table alias, or table name when unaliased) is
+    // specified more than once in a single FROM clause.
+    DuplicateRelation,
+    // A target column is named more than once in an INSERT column list.
+    DuplicateColumn,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

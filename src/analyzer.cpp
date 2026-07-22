@@ -1906,6 +1906,20 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             return DataType::Unknown;
         }
 
+        // ARRAY[elem, ...]: a constructed array. Each element is inferred (which
+        // also resolves nested column refs); the constructor itself has array
+        // type and is never NULL, even when an element is. Element-type unification
+        // is left to a later pass - a flat DataType has no element parameter, so
+        // the element types remain recoverable from the children.
+        case NodeType::ArrayConstructor: {
+            for (ASTNode* el = first_child(expr); el != nullptr; el = el->next_sibling) {
+                infer_expr(el, scope);
+            }
+            record_type(expr, DataType::Array);
+            record_nullability(expr, 1);
+            return DataType::Array;
+        }
+
         default: {
             // Unknown expression form: recurse so nested column refs still get
             // resolved, but do not claim a type.

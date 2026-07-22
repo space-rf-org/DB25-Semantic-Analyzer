@@ -749,8 +749,27 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
     std::vector<const ColumnInfo*> target_cols;
     std::vector<bool> covered(table->columns.size(), false);
     if (ASTNode* col_list = find_child(insert_stmt, NodeType::ColumnList)) {
+        std::vector<std::string_view> named;  // target columns already listed
         for (ASTNode* c = first_child(col_list); c != nullptr; c = c->next_sibling) {
             const std::string_view col_name = split_column_ref(c->primary_text).column;
+            // A target column may be named only once: repeating it would assign
+            // the same column twice ("column specified more than once").
+            bool repeated = false;
+            for (const std::string_view prior : named) {
+                if (prior == col_name) {
+                    repeated = true;
+                    break;
+                }
+            }
+            if (repeated) {
+                add_diagnostic(DiagnosticCode::DuplicateColumn,
+                               "column '" + std::string{col_name} +
+                                   "' specified more than once in INSERT into '" +
+                                   std::string{table_name} + "'",
+                               c);
+            } else {
+                named.push_back(col_name);
+            }
             const ColumnInfo* info = table->find_column(col_name);
             if (info == nullptr) {
                 add_diagnostic(DiagnosticCode::UnresolvedColumn,
@@ -1211,6 +1230,34 @@ std::vector<ResolvedColumn> Analyzer::analyze_setop(ASTNode* setop, Scope* paren
 void Analyzer::resolve_from(ASTNode* from_clause, Scope& scope) {
     for (ASTNode* item = first_child(from_clause); item != nullptr; item = item->next_sibling) {
         resolve_from_item(item, scope);
+    }
+
+    // Every relation brought into scope must have a distinct correlation name:
+    // the alias when one is given, otherwise the base-table name (this is what a
+    // qualified reference addresses). A repeated one is ambiguous - the same
+    // qualifier would name two relations - and SQL rejects it ("table name/alias
+    // specified more than once"). Unnamed relations (empty qualifier) are skipped.
+    std::vector<std::string_view> seen;
+    for (const auto& rel : scope.relations()) {
+        const std::string_view qualifier = rel.alias.empty() ? rel.name : rel.alias;
+        if (qualifier.empty()) {
+            continue;
+        }
+        bool duplicate = false;
+        for (const std::string_view prior : seen) {
+            if (prior == qualifier) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            add_diagnostic(DiagnosticCode::DuplicateRelation,
+                           "table name or alias '" + std::string{qualifier} +
+                               "' specified more than once in FROM",
+                           from_clause);
+        } else {
+            seen.push_back(qualifier);
+        }
     }
 }
 
@@ -1927,6 +1974,18 @@ namespace {
 
 void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope) {
     (void)scope;  // resolution already happened; this pass is structural.
+
+    // An aggregate in the WHERE clause is illegal regardless of grouping:
+    // aggregates are computed after the WHERE filter has selected rows, so they
+    // belong in HAVING. `contains_aggregate` stops at subquery boundaries, so an
+    // aggregate that legitimately lives in a WHERE subquery is not flagged here.
+    if (ASTNode* where = find_child(select_stmt, NodeType::WhereClause)) {
+        if (ASTNode* pred = first_child(where); pred != nullptr && contains_aggregate(pred)) {
+            add_diagnostic(DiagnosticCode::AggregateInWhere,
+                           "aggregate functions are not allowed in WHERE (use HAVING)",
+                           pred);
+        }
+    }
 
     ASTNode* select_list = find_child(select_stmt, NodeType::SelectList);
 

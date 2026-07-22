@@ -470,6 +470,66 @@ void test_join_on_resolves() {
     CHECK(uid != nullptr && a.type_of(uid) == DataType::Integer);
 }
 
+void test_from_duplicate_alias_flagged() {
+    std::printf("test_from_duplicate_alias_flagged\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // The correlation name `o` is specified twice in the FROM clause.
+    auto res = p.parse("SELECT o.user_id FROM orders o, orders o");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::DuplicateRelation) == 1);
+    CHECK(a.has_errors());
+}
+
+void test_join_duplicate_alias_flagged() {
+    std::printf("test_join_duplicate_alias_flagged\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // A self-join that reuses the same alias `a` on both sides is ambiguous.
+    auto res = p.parse(
+        "SELECT a.user_id FROM orders a JOIN orders a ON a.order_id = a.order_id");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::DuplicateRelation) == 1);
+}
+
+void test_from_distinct_aliases_not_flagged() {
+    std::printf("test_from_distinct_aliases_not_flagged\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // Distinct aliases for the same base table are legal (comma self-join).
+    auto res = p.parse("SELECT a.user_id FROM orders a, orders b");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::DuplicateRelation) == 0);
+}
+
+void test_self_join_distinct_aliases_not_flagged() {
+    std::printf("test_self_join_distinct_aliases_not_flagged\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // A plain self-join with distinct aliases must not be flagged.
+    auto res = p.parse(
+        "SELECT a.user_id FROM orders a JOIN orders b ON a.order_id = b.order_id");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::DuplicateRelation) == 0);
+    CHECK(!a.has_errors());
+}
+
 void test_join_on_unresolved_column() {
     std::printf("test_join_on_unresolved_column\n");
     auto cat = make_catalog_joins();
@@ -770,6 +830,49 @@ void test_nested_aggregate() {
     Analyzer a(cat);
     a.analyze(res.value());
     CHECK(count_code(a, DiagnosticCode::NestedAggregate) == 1);
+}
+
+void test_aggregate_in_where_flagged() {
+    std::printf("test_aggregate_in_where_flagged\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // COUNT(*) in WHERE is illegal: aggregates belong in HAVING.
+    auto res = p.parse("SELECT dept FROM emp WHERE COUNT(*) > 1 GROUP BY dept");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AggregateInWhere) == 1);
+    CHECK(a.has_errors());
+}
+
+void test_normal_where_not_flagged() {
+    std::printf("test_normal_where_not_flagged\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // A plain predicate in WHERE has no aggregate: nothing to flag.
+    auto res = p.parse("SELECT dept FROM emp WHERE salary > 1000 GROUP BY dept");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AggregateInWhere) == 0);
+}
+
+void test_aggregate_in_having_not_flagged() {
+    std::printf("test_aggregate_in_having_not_flagged\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // The same aggregate placed correctly in HAVING must not trip the WHERE rule.
+    auto res = p.parse("SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > 1");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AggregateInWhere) == 0);
 }
 
 void test_order_by_non_grouped() {
@@ -1388,6 +1491,35 @@ void test_insert_explicit_unknown_column() {
     Analyzer a(cat);
     a.analyze(res.value());
     CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
+}
+
+void test_insert_duplicate_column_flagged() {
+    std::printf("test_insert_duplicate_column_flagged\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // `id` is named twice in the target column list.
+    auto res = p.parse("INSERT INTO users (id, id) VALUES (1, 2)");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::DuplicateColumn) == 1);
+    CHECK(a.has_errors());
+}
+
+void test_insert_distinct_columns_not_flagged() {
+    std::printf("test_insert_distinct_columns_not_flagged\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // A normal INSERT with distinct target columns has no duplicate.
+    auto res = p.parse("INSERT INTO users (id, name) VALUES (1, 'a')");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::DuplicateColumn) == 0);
 }
 
 void test_insert_not_null_violation() {
@@ -2345,6 +2477,10 @@ int main() {
 
     // JOIN ON / USING resolution
     test_join_on_resolves();
+    test_from_duplicate_alias_flagged();
+    test_join_duplicate_alias_flagged();
+    test_from_distinct_aliases_not_flagged();
+    test_self_join_distinct_aliases_not_flagged();
     test_join_on_unresolved_column();
     test_join_using_resolves();
     test_join_using_missing();
@@ -2366,6 +2502,9 @@ int main() {
     test_groupby_having_aggregate_clean();
     test_having_non_grouped_column();
     test_nested_aggregate();
+    test_aggregate_in_where_flagged();
+    test_normal_where_not_flagged();
+    test_aggregate_in_having_not_flagged();
     test_order_by_non_grouped();
     test_groupby_positional_single();
     test_groupby_positional_multi();
@@ -2410,6 +2549,8 @@ int main() {
     test_insert_unknown_table();
     test_insert_explicit_columns_clean();
     test_insert_explicit_unknown_column();
+    test_insert_duplicate_column_flagged();
+    test_insert_distinct_columns_not_flagged();
     test_insert_not_null_violation();
     test_insert_not_null_with_default_ok();
 

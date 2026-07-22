@@ -2146,6 +2146,23 @@ ASTNode* analyze_temporal(Analyzer& a, parser::Parser& p,
     return find_descendant(holder->value(), NodeType::BinaryExpr);
 }
 
+// EXTRACT(YEAR FROM ts): the leading YEAR is a date-part keyword, NOT a column.
+// It must not be reported as an unresolved column, and the call types as Double.
+void test_extract_datepart_not_column() {
+    std::printf("test_extract_datepart_not_column\n");
+    auto cat = make_catalog_temporal();
+    parser::Parser p;
+    auto h = p.parse("SELECT EXTRACT(YEAR FROM ts) FROM events");
+    CHECK(h.has_value());
+    if (!h.has_value()) return;
+    Analyzer a(cat);
+    a.analyze(h.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+    const ASTNode* ex = find_descendant(h.value(), NodeType::FunctionCall);
+    CHECK(ex != nullptr && a.type_of(ex) == DataType::Double);
+}
+
 // date + interval -> Date, and not-null since both operands are not-null.
 void test_temporal_date_plus_interval() {
     std::printf("test_temporal_date_plus_interval\n");
@@ -2456,6 +2473,7 @@ int main() {
     test_intersect_except_roots();
 
     // Temporal arithmetic
+    test_extract_datepart_not_column();
     test_temporal_date_plus_interval();
     test_temporal_timestamp_plus_interval();
     test_temporal_date_plus_integer();

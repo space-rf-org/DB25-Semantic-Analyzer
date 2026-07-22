@@ -2573,6 +2573,30 @@ void test_array_constructor_resolves_columns() {
     CHECK(!a.has_errors());
 }
 
+// COLLATE annotates a value: the CollateClause takes its operand's type and
+// nullability, and the operand column resolves (regression against the analyzer
+// losing the column when COLLATE appears in a projection).
+void test_collate_takes_operand_type() {
+    std::printf("test_collate_takes_operand_type\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("SELECT name COLLATE \"C\" FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    CHECK(list != nullptr);
+    ASTNode* coll = list ? first_child(list) : nullptr;
+    CHECK(coll != nullptr && coll->node_type == NodeType::CollateClause);
+    // name is Text and nullable; the collation annotation preserves both.
+    CHECK(coll != nullptr && a.type_of(coll) == DataType::Text);
+    CHECK(coll != nullptr && coll->context.analysis.nullability == 2);
+}
+
 }  // namespace
 
 int main() {
@@ -2752,6 +2776,7 @@ int main() {
     test_projection_column_identity();
     test_array_constructor_typed();
     test_array_constructor_resolves_columns();
+    test_collate_takes_operand_type();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

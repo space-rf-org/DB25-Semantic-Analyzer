@@ -45,7 +45,7 @@ jobs:
           # To bump: set PARSER_SHA to the desired db25-sql-parser commit,
           # e.g. its current main tip from:
           #   git ls-remote https://github.com/space-rf-org/db25-sql-parser main
-          PARSER_SHA=694ceceb524fcf23330a3cc34f15807f5413ced0
+          PARSER_SHA=ca47fc0
           git clone https://github.com/space-rf-org/db25-sql-parser
           cd db25-sql-parser
           git checkout "$PARSER_SHA"
@@ -98,7 +98,7 @@ jobs:
           # To bump: set PARSER_SHA to the desired db25-sql-parser commit,
           # e.g. its current main tip from:
           #   git ls-remote https://github.com/space-rf-org/db25-sql-parser main
-          PARSER_SHA=694ceceb524fcf23330a3cc34f15807f5413ced0
+          PARSER_SHA=ca47fc0
           git clone https://github.com/space-rf-org/db25-sql-parser
           cd db25-sql-parser
           git checkout "$PARSER_SHA"

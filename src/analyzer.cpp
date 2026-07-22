@@ -1920,6 +1920,18 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             return DataType::Array;
         }
 
+        // <value> COLLATE <name>: a collation annotation. It changes how the
+        // value compares/sorts, not its type or nullability, so the CollateClause
+        // takes the operand's type and nullability. Inferring the operand also
+        // resolves it (a bare column argument).
+        case NodeType::CollateClause: {
+            ASTNode* operand = first_child(expr);
+            const DataType t = infer_expr(operand, scope);
+            record_type(expr, t);
+            record_nullability(expr, null_of(operand));
+            return t;
+        }
+
         default: {
             // Unknown expression form: recurse so nested column refs still get
             // resolved, but do not claim a type.

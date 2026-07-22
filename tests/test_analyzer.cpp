@@ -2536,6 +2536,43 @@ void test_projection_column_identity() {
     }
 }
 
+void test_array_constructor_typed() {
+    std::printf("test_array_constructor_typed\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("SELECT ARRAY[1, 2, 3] FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    // The ARRAY[...] constructor has array type and is not itself NULL; its
+    // elements resolve (nested column refs would too).
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    CHECK(list != nullptr);
+    ASTNode* arr = list ? first_child(list) : nullptr;
+    CHECK(arr != nullptr && arr->node_type == NodeType::ArrayConstructor);
+    CHECK(arr != nullptr && a.type_of(arr) == DataType::Array);
+    CHECK(arr != nullptr && arr->context.analysis.nullability == 1);
+}
+
+// An array over a column resolves the column (regression against the analyzer
+// silently skipping constructor children).
+void test_array_constructor_resolves_columns() {
+    std::printf("test_array_constructor_resolves_columns\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("SELECT ARRAY[id, id] FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+}
+
 }  // namespace
 
 int main() {
@@ -2713,6 +2750,8 @@ int main() {
 
     // projection_of column identity
     test_projection_column_identity();
+    test_array_constructor_typed();
+    test_array_constructor_resolves_columns();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

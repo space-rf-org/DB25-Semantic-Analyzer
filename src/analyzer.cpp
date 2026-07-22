@@ -1462,10 +1462,23 @@ ResolvedColumn Analyzer::resolve_column_ref(ASTNode* col_ref, Scope& scope) {
         // Nullability comes from the catalog column, already adjusted for the
         // null-supplying side of an outer join by the scope resolver.
         record_nullability(col_ref, res.column.nullable ? 2 : 1);
-        // A reference that resolved in an enclosing scope makes the subquery we
-        // are currently analyzing correlated (no diagnostic: this is legal).
-        if (res.from_outer && corr_sink_ != nullptr) {
-            *corr_sink_ = true;
+        // A reference that resolved in an enclosing scope makes correlated EVERY
+        // active subquery that sits between this reference's block and the scope
+        // that owns the matched relation (no diagnostic: correlation is legal).
+        // An intermediate subquery in a multiply-nested chain cannot be evaluated
+        // independently of the owning row either, so it must be flagged too - not
+        // only the innermost. A subquery qualifies when the owning scope is at or
+        // outside its enclosing scope (i.e. the owning scope is an ancestor of,
+        // or equal to, that subquery's enclosing scope).
+        if (res.from_outer && res.owner != nullptr) {
+            for (const auto& [enclosing, flag] : corr_stack_) {
+                for (const Scope* s = enclosing; s != nullptr; s = s->parent()) {
+                    if (s == res.owner) {
+                        *flag = true;
+                        break;
+                    }
+                }
+            }
         }
         return res.column;
     }
@@ -1920,17 +1933,19 @@ std::vector<ResolvedColumn> Analyzer::analyze_subquery(ASTNode* subquery, Scope&
         }
     }
 
-    // Track correlation for this subquery: while analyzing its body, point the
-    // correlation sink at a local flag so a column that resolves in an enclosing
-    // scope sets it. Saved/restored so nested subqueries mark their own flag.
+    // Track correlation for this subquery: push it onto the active-subquery
+    // stack (paired with its enclosing scope) while its body is analyzed, so a
+    // column that resolves in an enclosing scope can mark this subquery - and
+    // every intervening one - correlated. Popped afterward. Keeping the whole
+    // stack (rather than a single innermost sink) is what lets an intermediate
+    // subquery be flagged when a reference reaches two-or-more scopes out.
     bool correlated = false;
-    bool* saved = corr_sink_;
-    corr_sink_ = &correlated;
+    corr_stack_.emplace_back(&enclosing, &correlated);
     std::vector<ResolvedColumn> proj;
     if (inner != nullptr) {
         proj = analyze_stmt(inner, &enclosing);
     }
-    corr_sink_ = saved;
+    corr_stack_.pop_back();
 
     correlated_[subquery] = correlated;
     if (correlated) {

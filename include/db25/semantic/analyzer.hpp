@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace db25::semantic {
@@ -179,10 +180,14 @@ private:
     std::unordered_map<const ASTNode*, int> nullability_;
     // Whether a subquery node resolved a correlated (outer-scope) reference.
     std::unordered_map<const ASTNode*, bool> correlated_;
-    // While analyzing a subquery's body, points at that subquery's correlation
-    // flag so a correlated column resolution can set it. Saved/restored around
-    // each nested subquery so the innermost active subquery is marked.
-    bool* corr_sink_ = nullptr;
+    // Stack of the currently-active subqueries (outermost first), each paired
+    // with its enclosing scope and its correlation flag. A subquery is pushed
+    // while its body is analyzed and popped afterward. When a column resolves in
+    // an enclosing scope, EVERY active subquery whose enclosing scope is at or
+    // outside the resolving (owning) scope is marked correlated - not just the
+    // innermost - so an intermediate subquery in a multiply-nested chain is
+    // correctly flagged when a reference reaches two-or-more scopes out.
+    std::vector<std::pair<const Scope*, bool*>> corr_stack_;
     // Per query-block resolved projection (stars expanded, set-op types
     // reconciled), keyed by the SELECT / set-operation node.
     std::unordered_map<const ASTNode*, std::vector<ResolvedColumn>> projections_;

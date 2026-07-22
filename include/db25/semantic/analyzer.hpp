@@ -148,15 +148,22 @@ private:
     // aggregate), and, if so, verifies that every column reference outside an
     // aggregate in the SELECT list / ORDER BY / HAVING is a grouping key and
     // that no aggregate is nested directly inside another aggregate.
-    void analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope);
+    void analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
+                          const std::vector<ResolvedColumn>& output);
 
     // Recursively check an expression subtree for grouping legality:
-    //   * a bare column reference not under an aggregate must be a grouping key
-    //     (else NonGroupedColumn);
+    //   * a bare column reference not exempt from the grouping rule must be a
+    //     grouping key (else NonGroupedColumn);
     //   * an aggregate call inside another aggregate is a NestedAggregate.
-    // `in_aggregate` is true while walking inside an aggregate function call.
+    // Two independent contexts are tracked:
+    //   * `grouping_exempt` - true while walking beneath an aggregate OR inside a
+    //     window function (arguments and OVER clause): such columns need not be
+    //     grouping keys.
+    //   * `in_aggregate` - true only while inside a plain (non-window) aggregate's
+    //     arguments, used solely for nested-aggregate detection. A window boundary
+    //     resets it, so an aggregate inside an OVER clause is not "nested".
     void check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& keys,
-                             bool in_aggregate);
+                             bool grouping_exempt, bool in_aggregate);
 
     // Record an inferred type on the node and in the side map.
     void record_type(ASTNode* node, DataType type);

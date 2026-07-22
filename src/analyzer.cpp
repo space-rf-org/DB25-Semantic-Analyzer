@@ -1120,7 +1120,7 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     }
 
     // 9. Aggregate / GROUP BY / HAVING legality (validation pass).
-    analyze_grouping(select_stmt, group_by, scope);
+    analyze_grouping(select_stmt, group_by, scope, output);
 
     projections_[select_stmt] = output;
     return output;
@@ -2025,7 +2025,8 @@ namespace {
 
 }  // namespace
 
-void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope) {
+void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
+                                const std::vector<ResolvedColumn>& output) {
     (void)scope;  // resolution already happened; this pass is structural.
 
     // An aggregate in the WHERE clause is illegal regardless of grouping:
@@ -2102,25 +2103,48 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
     if (select_list != nullptr) {
         for (ASTNode* item = first_child(select_list); item != nullptr;
              item = item->next_sibling) {
-            check_grouping_expr(item, keys, /*in_aggregate=*/false);
+            check_grouping_expr(item, keys, /*grouping_exempt=*/false, /*in_aggregate=*/false);
         }
     }
     if (ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
         for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
-            check_grouping_expr(item, keys, /*in_aggregate=*/false);
+            // An UNQUALIFIED ORDER BY item that names a SELECT output column (by
+            // name or alias) references the already-grouped projection, not an
+            // input column, so it is exempt from the grouping rule. Otherwise
+            // "SELECT dept, COUNT(*) AS c ... GROUP BY dept ORDER BY c" is falsely
+            // flagged (the alias 'c' text-mismatches every group key). The
+            // reference must be unqualified: a qualified `t.col` names a base
+            // column and resolves against the FROM scope (an output alias is only
+            // visible to ORDER BY by a bare name), so it must still obey the
+            // grouping rule - exempting it by column name alone would silently
+            // accept e.g. "SELECT dept, MAX(age) AS salary ... GROUP BY dept
+            // ORDER BY emp.salary".
+            if (is_column_ref_node(item->node_type)) {
+                const QualifiedRef qref = split_column_ref(item->primary_text);
+                if (qref.qualifier.empty()) {
+                    bool is_output_ref = false;
+                    for (const ResolvedColumn& col : output) {
+                        if (col.name == qref.column) { is_output_ref = true; break; }
+                    }
+                    if (is_output_ref) {
+                        continue;
+                    }
+                }
+            }
+            check_grouping_expr(item, keys, /*grouping_exempt=*/false, /*in_aggregate=*/false);
         }
     }
     // HAVING may reference grouping keys and aggregates; a bare non-grouped
     // column outside an aggregate is illegal here too.
     if (ASTNode* having = find_child(select_stmt, NodeType::HavingClause)) {
         if (ASTNode* pred = first_child(having)) {
-            check_grouping_expr(pred, keys, /*in_aggregate=*/false);
+            check_grouping_expr(pred, keys, /*grouping_exempt=*/false, /*in_aggregate=*/false);
         }
     }
 }
 
 void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& keys,
-                                   bool in_aggregate) {
+                                   bool grouping_exempt, bool in_aggregate) {
     if (expr == nullptr) {
         return;
     }
@@ -2148,16 +2172,21 @@ void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& k
                                "' nested inside another aggregate",
                            expr);
         }
-        // Columns beneath an aggregate or inside a window function are exempt.
-        const bool inside = in_aggregate || is_agg || windowed;
+        // Columns beneath an aggregate or inside a window function are exempt from
+        // the grouping-key rule. But a window boundary is NOT aggregate nesting:
+        // an aggregate inside an OVER clause (e.g. RANK() OVER (ORDER BY SUM(x)))
+        // is legal, so `in_aggregate` is reset to false through a window and only
+        // set through a plain aggregate.
+        const bool child_exempt = grouping_exempt || is_agg || windowed;
+        const bool child_in_aggregate = is_agg ? true : (windowed ? false : in_aggregate);
         for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
-            check_grouping_expr(c, keys, inside);
+            check_grouping_expr(c, keys, child_exempt, child_in_aggregate);
         }
         return;
     }
 
     if (is_column_ref_node(expr->node_type)) {
-        if (!in_aggregate) {
+        if (!grouping_exempt) {
             bool ok = false;
             for (const GroupKey& k : keys) {
                 if (key_matches(k, expr)) {
@@ -2177,7 +2206,7 @@ void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& k
     }
 
     for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
-        check_grouping_expr(c, keys, in_aggregate);
+        check_grouping_expr(c, keys, grouping_exempt, in_aggregate);
     }
 }
 

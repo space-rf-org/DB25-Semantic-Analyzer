@@ -907,6 +907,71 @@ void test_order_by_non_grouped() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
+// An ORDER BY item that references a SELECT output column by its alias is a
+// reference to the (already grouped) projection, so it is legal in a grouped
+// query - the idiomatic "ORDER BY <aggregate-alias>" / "top-N" pattern. Both
+// an aggregate alias and a grouped-column alias must be accepted.
+void test_order_by_output_alias_in_grouped_clean() {
+    std::printf("test_order_by_output_alias_in_grouped_clean\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    const char* cases[] = {
+        "SELECT dept, COUNT(*) AS c FROM emp GROUP BY dept ORDER BY c",
+        "SELECT dept AS d FROM emp GROUP BY dept ORDER BY d",
+        "SELECT COUNT(*) AS c FROM emp ORDER BY c",  // aggregate-only (implicitly grouped)
+    };
+    for (const char* sql : cases) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
+    }
+
+    // The exemption is only for a BARE output-name reference. A qualified
+    // reference names a base column and must still obey the grouping rule, even
+    // when its column name collides with an output alias.
+    auto q = p.parse("SELECT dept, MAX(age) AS salary FROM emp GROUP BY dept "
+                     "ORDER BY emp.salary");
+    CHECK(q.has_value());
+    if (q) {
+        Analyzer a(cat);
+        a.analyze(q.value());
+        CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+    }
+}
+
+// An aggregate inside a window function's OVER clause is legal (it is a grouped
+// aggregate the window is computed over) and must NOT be reported as a nested
+// aggregate; a genuine aggregate-inside-aggregate must still be flagged.
+void test_aggregate_in_over_clause_not_nested() {
+    std::printf("test_aggregate_in_over_clause_not_nested\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    const char* clean[] = {
+        "SELECT RANK() OVER (ORDER BY SUM(salary)) FROM emp",
+        "SELECT dept, SUM(salary) OVER (PARTITION BY dept ORDER BY COUNT(*)) "
+        "FROM emp GROUP BY dept",
+    };
+    for (const char* sql : clean) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::NestedAggregate) == 0);
+    }
+    // Genuine nesting (no window boundary) is still an error.
+    auto res = p.parse("SELECT SUM(COUNT(*)) FROM emp");
+    CHECK(res.has_value());
+    if (res) {
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::NestedAggregate) == 1);
+    }
+}
+
 void test_groupby_positional_single() {
     std::printf("test_groupby_positional_single\n");
     auto cat = make_catalog_emp();
@@ -2649,6 +2714,8 @@ int main() {
     test_normal_where_not_flagged();
     test_aggregate_in_having_not_flagged();
     test_order_by_non_grouped();
+    test_order_by_output_alias_in_grouped_clean();
+    test_aggregate_in_over_clause_not_nested();
     test_groupby_positional_single();
     test_groupby_positional_multi();
     test_groupby_positional_still_flags_non_grouped();

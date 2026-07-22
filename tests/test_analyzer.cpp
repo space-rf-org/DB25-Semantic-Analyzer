@@ -513,6 +513,24 @@ void test_join_using_missing() {
     CHECK(count_code(a, DiagnosticCode::UsingColumnMissing) == 1);
 }
 
+// A parenthesized join group `( a JOIN b ) JOIN c` brings every relation of the
+// group into scope, so references across the group and the outer join resolve.
+void test_parenthesized_join_group_resolves() {
+    std::printf("test_parenthesized_join_group_resolves\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    auto res = p.parse(
+        "SELECT u.id FROM (users u JOIN orders o ON o.user_id = u.id) "
+        "JOIN sessions s ON s.user_id = o.user_id");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+}
+
 // A USING column is COALESCED into one output column, so a bare (unqualified)
 // reference to it must resolve, not report ambiguity.
 void test_join_using_coalesces_bare_ref() {
@@ -2348,6 +2366,7 @@ int main() {
     test_join_on_unresolved_column();
     test_join_using_resolves();
     test_join_using_missing();
+    test_parenthesized_join_group_resolves();
     test_join_using_coalesces_bare_ref();
     test_natural_join_coalesces_bare_ref();
     test_join_on_shared_name_still_ambiguous();

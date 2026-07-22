@@ -1258,6 +1258,18 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
             scope.add_relation(std::move(binding));
             return;
         }
+        // A parenthesized join group `( a JOIN b ... )` in table-reference
+        // position: the parser represents it as a nested FromClause. Resolve its
+        // items into the SAME scope so every relation of the group is visible to
+        // any outer join written over it (its inner join predicates resolve as
+        // they are visited, just like a top-level FROM).
+        case NodeType::FromClause: {
+            for (ASTNode* child = first_child(item); child != nullptr;
+                 child = child->next_sibling) {
+                resolve_from_item(child, scope);
+            }
+            return;
+        }
         // Joins: bring every relation on the right side into scope, then
         // resolve the join predicate now that both sides are visible. The left
         // side is the FROM-clause sibling processed before this join, so it is

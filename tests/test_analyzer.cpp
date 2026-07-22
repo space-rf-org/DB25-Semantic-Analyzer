@@ -1272,6 +1272,69 @@ void test_exists_correlated_clean() {
     CHECK(subq != nullptr && a.is_correlated(subq));
 }
 
+// Given the first (outermost) Subquery descendant, return the first Subquery
+// nested strictly inside it, or nullptr. Used to reach the inner block of a
+// doubly-nested subquery.
+ASTNode* inner_subquery(ASTNode* outer) {
+    if (outer == nullptr) return nullptr;
+    for (ASTNode* c = first_child(outer); c != nullptr; c = c->next_sibling) {
+        if (ASTNode* hit = find_descendant(c, NodeType::Subquery)) return hit;
+    }
+    return nullptr;
+}
+
+void test_nested_correlation_marks_intermediate() {
+    std::printf("test_nested_correlation_marks_intermediate\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // Doubly-nested EXISTS: `u.id` inside the innermost (sessions) block resolves
+    // two scopes out, against the outermost `users u`. Both the middle (orders)
+    // and inner (sessions) subqueries are correlated: neither can be evaluated
+    // independently of the outer row. The middle one is the regression guard -
+    // previously only the innermost active subquery was flagged.
+    auto res = p.parse(
+        "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE "
+        "EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = u.id))");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+
+    ASTNode* middle = find_descendant(res.value(), NodeType::Subquery);
+    ASTNode* inner = inner_subquery(middle);
+    CHECK(middle != nullptr && inner != nullptr && middle != inner);
+    CHECK(middle != nullptr && a.is_correlated(middle));
+    CHECK(inner != nullptr && a.is_correlated(inner));
+}
+
+void test_nested_correlation_intermediate_uncorrelated() {
+    std::printf("test_nested_correlation_intermediate_uncorrelated\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // Control: the inner (sessions) block references only the middle block's
+    // `orders o` - one scope out - so the inner subquery is correlated but the
+    // middle subquery references nothing outside itself and stays uncorrelated.
+    auto res = p.parse(
+        "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE "
+        "EXISTS (SELECT 1 FROM sessions s WHERE s.user_id = o.user_id))");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+
+    ASTNode* middle = find_descendant(res.value(), NodeType::Subquery);
+    ASTNode* inner = inner_subquery(middle);
+    CHECK(middle != nullptr && inner != nullptr && middle != inner);
+    CHECK(middle != nullptr && !a.is_correlated(middle));
+    CHECK(inner != nullptr && a.is_correlated(inner));
+}
+
 void test_subquery_unresolved_in_neither_scope() {
     std::printf("test_subquery_unresolved_in_neither_scope\n");
     auto cat = make_catalog_null();
@@ -2551,6 +2614,8 @@ int main() {
 
     // Subquery correlation & scalar / IN subqueries
     test_exists_correlated_clean();
+    test_nested_correlation_marks_intermediate();
+    test_nested_correlation_intermediate_uncorrelated();
     test_subquery_unresolved_in_neither_scope();
     test_scalar_subquery_single_column();
     test_scalar_subquery_too_many_columns();

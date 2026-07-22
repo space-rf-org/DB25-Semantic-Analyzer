@@ -18,6 +18,8 @@ namespace db25::semantic {
 
 using ast::DataType;
 
+class Scope;
+
 // A column made visible by a relation binding, already resolved to a type.
 struct ResolvedColumn {
     std::string name;
@@ -80,6 +82,11 @@ struct ColumnResolution {
     // scope it was looked up from: a correlated reference. Used to mark a
     // subquery correlated (no diagnostic; correlation is legal).
     bool from_outer = false;
+    // The scope in which the reference actually resolved (the scope that OWNS
+    // the matched relation). For a correlated reference this is an enclosing
+    // scope; the analyzer uses it to mark every subquery between the reference's
+    // block and this owning scope as correlated - not just the innermost.
+    const Scope* owner = nullptr;
     ResolvedColumn column;
 };
 
@@ -154,6 +161,7 @@ public:
                     ColumnResolution res;
                     res.found = true;
                     res.from_outer = (s != this);
+                    res.owner = s;
                     res.column = *col;
                     // A relation on the null-supplying side of an outer join
                     // makes every column nullable, base constraint notwithstanding.
@@ -192,6 +200,7 @@ public:
                 ColumnResolution res;
                 res.found = true;
                 res.from_outer = (s != this);
+                res.owner = s;
                 res.column = *hit;
                 res.column.nullable = res.column.nullable || hit_rel->nullable_from_join;
                 return res;

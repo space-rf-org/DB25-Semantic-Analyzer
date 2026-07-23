@@ -10,8 +10,10 @@
 #include "db25/ast/node_types.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace db25::semantic {
@@ -19,6 +21,15 @@ namespace db25::semantic {
 using ast::DataType;
 
 class Scope;
+
+// Transparent hash so a name->index map can be probed with a std::string_view
+// without materializing a std::string per lookup (paired with std::equal_to<>).
+struct TransparentStringHash {
+    using is_transparent = void;
+    [[nodiscard]] std::size_t operator()(std::string_view s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
 
 // A column made visible by a relation binding, already resolved to a type.
 struct ResolvedColumn {
@@ -57,6 +68,23 @@ struct RelationBinding {
     }
 
     [[nodiscard]] const ResolvedColumn* find_column(std::string_view col) const {
+        // Wide relations: consult a lazily-built name -> first-index map so a
+        // lookup is O(1) instead of O(columns). Resolving a wide SELECT list is
+        // otherwise O(refs * columns) - the analyzer's worst-case blowup. Narrow
+        // relations keep the linear scan, which beats hashing for a few columns.
+        // The map records each name's FIRST index, matching the linear scan's
+        // first match exactly; indices are positional (valid across moves/copies,
+        // since `columns` is never reordered after the binding is built).
+        if (columns.size() > kIndexThreshold) {
+            if (name_index_.empty()) {
+                name_index_.reserve(columns.size());
+                for (std::uint32_t i = 0; i < columns.size(); ++i) {
+                    name_index_.emplace(columns[i].name, i);  // first occurrence wins
+                }
+            }
+            const auto it = name_index_.find(col);
+            return it == name_index_.end() ? nullptr : &columns[it->second];
+        }
         for (const auto& c : columns) {
             if (c.name == col) {
                 return &c;
@@ -64,6 +92,18 @@ struct RelationBinding {
         }
         return nullptr;
     }
+
+private:
+    // Relations with more than this many columns build a name index; below it the
+    // linear scan above is used (cheaper than hashing for a handful of columns).
+    static constexpr std::size_t kIndexThreshold = 16;
+    // Lazily built name -> first-occurrence index over `columns`. `mutable` so the
+    // const find_column can memoize it; owned string keys keep it copy/move-safe.
+    // The lazy build assumes single-threaded analysis (the analyzer never shares a
+    // Scope/binding across threads); it would need synchronization otherwise.
+    mutable std::unordered_map<std::string, std::uint32_t, TransparentStringHash,
+                               std::equal_to<>>
+        name_index_;
 };
 
 // A named relation that a FROM clause may reference by name (a CTE). Distinct

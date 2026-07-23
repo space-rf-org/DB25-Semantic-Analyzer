@@ -79,6 +79,20 @@ InMemoryCatalog make_catalog_emp() {
     return cat;
 }
 
+// A deliberately WIDE table (more columns than RelationBinding's index
+// threshold, 16) so column resolution exercises the hashed name-index path
+// rather than the linear scan. w0..w23; even-indexed columns are nullable.
+InMemoryCatalog make_catalog_wide() {
+    InMemoryCatalog cat;
+    std::vector<ColumnInfo> cols;
+    for (int i = 0; i < 24; ++i) {
+        cols.push_back(ColumnInfo{"w" + std::to_string(i), DataType::Integer,
+                                  /*nullable=*/(i % 2 == 0)});
+    }
+    cat.add_table("wide", std::move(cols));
+    return cat;
+}
+
 // A catalog for temporal-arithmetic tests:
 //   events(d DATE NOT NULL, ts TIMESTAMP NOT NULL, iv INTERVAL NOT NULL,
 //          d2 DATE, n INTEGER NOT NULL)
@@ -975,6 +989,51 @@ void test_aggregate_in_over_clause_not_nested() {
 // A very long operator chain parses to a deeply left-nested tree that the parser
 // does not depth-bound. The analyzer must not overflow the stack on it: past the
 // recursion limit it abandons the over-deep subtree and reports it once.
+// Resolution over a wide relation goes through the hashed name index. Verify it
+// resolves the right columns (type + nullability), expands SELECT *, flags a
+// missing column, and detects ambiguity on a self-join - exactly as the linear
+// path does.
+void test_wide_relation_resolution() {
+    std::printf("test_wide_relation_resolution\n");
+    auto cat = make_catalog_wide();
+    parser::Parser p;
+
+    // Bare refs across the width resolve with the right nullability (even = nullable).
+    { auto r = p.parse("SELECT w0, w7, w23 FROM wide");
+      CHECK(r.has_value());
+      if (r) { Analyzer a(cat); a.analyze(r.value());
+               CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+               CHECK(a.diagnostics().empty()); } }
+
+    // A missing column is still flagged (index miss == linear miss).
+    { auto r = p.parse("SELECT w99 FROM wide");
+      CHECK(r.has_value());
+      if (r) { Analyzer a(cat); a.analyze(r.value());
+               CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1); } }
+
+    // SELECT * over the wide table expands to all 24 columns.
+    { auto r = p.parse("SELECT * FROM wide");
+      CHECK(r.has_value());
+      if (r) { Analyzer a(cat); a.analyze(r.value());
+               const auto* proj = a.projection_of(r.value());
+               CHECK(proj != nullptr);
+               if (proj) CHECK(proj->size() == 24); } }
+
+    // A bare ref common to both sides of a self-join is ambiguous (the index must
+    // not mask the second relation's match).
+    { auto r = p.parse("SELECT w5 FROM wide a JOIN wide b ON a.w0 = b.w0");
+      CHECK(r.has_value());
+      if (r) { Analyzer a(cat); a.analyze(r.value());
+               CHECK(count_code(a, DiagnosticCode::AmbiguousColumn) == 1); } }
+
+    // Qualified refs resolve to the intended side of the self-join.
+    { auto r = p.parse("SELECT a.w5, b.w6 FROM wide a JOIN wide b ON a.w0 = b.w0");
+      CHECK(r.has_value());
+      if (r) { Analyzer a(cat); a.analyze(r.value());
+               CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+               CHECK(count_code(a, DiagnosticCode::AmbiguousColumn) == 0); } }
+}
+
 void test_deep_expression_does_not_crash() {
     std::printf("test_deep_expression_does_not_crash\n");
     auto cat = make_catalog();  // users(id, name)
@@ -2737,6 +2796,7 @@ int main() {
     test_order_by_output_alias_in_grouped_clean();
     test_aggregate_in_over_clause_not_nested();
     test_deep_expression_does_not_crash();
+    test_wide_relation_resolution();
     test_groupby_positional_single();
     test_groupby_positional_multi();
     test_groupby_positional_still_flags_non_grouped();

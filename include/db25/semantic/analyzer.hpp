@@ -198,6 +198,14 @@ private:
     // Per query-block resolved projection (stars expanded, set-op types
     // reconciled), keyed by the SELECT / set-operation node.
     std::unordered_map<const ASTNode*, std::vector<ResolvedColumn>> projections_;
+
+    // Recursion-depth guard for the expression walkers (infer_expr /
+    // check_grouping_expr). SQL operator chains (AND/OR, arithmetic, ...) parse
+    // to unbounded left-deep trees that the parser does not depth-limit, so a
+    // pathologically long chain would overflow the stack; past the limit the
+    // over-deep subtree is abandoned (reported once via ExpressionTooComplex).
+    int expr_depth_ = 0;
+    bool expr_depth_reported_ = false;
 };
 
 }  // namespace db25::semantic

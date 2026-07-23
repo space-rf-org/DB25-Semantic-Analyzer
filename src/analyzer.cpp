@@ -660,6 +660,8 @@ void Analyzer::analyze(ASTNode* root) {
     if (root == nullptr) {
         return;
     }
+    expr_depth_ = 0;
+    expr_depth_reported_ = false;
     if (root->node_type == NodeType::SelectStmt || is_setop(root->node_type)) {
         analyze_stmt(root, nullptr);
         return;
@@ -1496,10 +1498,41 @@ ResolvedColumn Analyzer::resolve_column_ref(ASTNode* col_ref, Scope& scope) {
     return ResolvedColumn{};
 }
 
+namespace {
+// Maximum expression-tree recursion depth. SQL operator chains (a AND b AND ...,
+// a+b+c+..., etc.) parse to left-deep trees the parser does not bound, so a long
+// chain would overflow the stack during analysis. Real expressions nest only a
+// few levels; this cap is far above any genuine query yet well below the stack
+// limit. Shared by infer_expr, check_grouping_expr, and contains_aggregate.
+constexpr int kMaxExprDepth = 1000;
+
+// RAII: increment a depth counter for the current recursion level, decrement on
+// any exit (including the many early returns in infer_expr).
+struct DepthGuard {
+    int& depth;
+    explicit DepthGuard(int& d) noexcept : depth(d) { ++depth; }
+    ~DepthGuard() { --depth; }
+    DepthGuard(const DepthGuard&) = delete;
+    DepthGuard& operator=(const DepthGuard&) = delete;
+};
+}  // namespace
+
 DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
     if (expr == nullptr) {
         return DataType::Unknown;
     }
+    if (expr_depth_ >= kMaxExprDepth) {
+        // Over-deep subtree: abandon analysis of it rather than overflow the
+        // stack. Report once so a pathological expression yields a diagnostic
+        // instead of a crash or a flood of messages.
+        if (!expr_depth_reported_) {
+            expr_depth_reported_ = true;
+            add_diagnostic(DiagnosticCode::ExpressionTooComplex,
+                           "expression nesting is too deep to analyze", expr);
+        }
+        return DataType::Unknown;
+    }
+    const DepthGuard depth_guard{expr_depth_};
 
     switch (expr->node_type) {
         // A non-NULL literal is, by construction, not-null; a NULL literal is
@@ -1983,8 +2016,16 @@ std::vector<ResolvedColumn> Analyzer::analyze_subquery(ASTNode* subquery, Scope&
 namespace {
 
 // Does the subtree rooted at `node` contain an aggregate function call?
-[[nodiscard]] bool contains_aggregate(const ASTNode* node) {
+[[nodiscard]] bool contains_aggregate(const ASTNode* node, int depth = 0) {
     if (node == nullptr) {
+        return false;
+    }
+    // Bail on a pathologically deep tree (same bound as the analyzer's expression
+    // walkers) so this grouped-ness probe cannot overflow the stack. A subtree
+    // beyond this depth is treated as containing no aggregate; the query is
+    // already over-depth and will get an ExpressionTooComplex diagnostic from
+    // infer_expr.
+    if (depth >= kMaxExprDepth) {
         return false;
     }
     // A nested subquery is a separate query block: an aggregate inside it does
@@ -2004,7 +2045,7 @@ namespace {
         }
     }
     for (const ASTNode* c = node->first_child; c != nullptr; c = c->next_sibling) {
-        if (contains_aggregate(c)) {
+        if (contains_aggregate(c, depth + 1)) {
             return true;
         }
     }
@@ -2148,6 +2189,10 @@ void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& k
     if (expr == nullptr) {
         return;
     }
+    if (expr_depth_ >= kMaxExprDepth) {
+        return;  // over-deep; infer_expr already reported ExpressionTooComplex.
+    }
+    const DepthGuard depth_guard{expr_depth_};
 
     // Do not descend into a nested subquery: it is a distinct query block with
     // its own FROM scope and its own grouping analysis. Its columns (including a

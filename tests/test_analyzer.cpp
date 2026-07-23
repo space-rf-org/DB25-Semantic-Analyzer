@@ -972,6 +972,26 @@ void test_aggregate_in_over_clause_not_nested() {
     }
 }
 
+// A very long operator chain parses to a deeply left-nested tree that the parser
+// does not depth-bound. The analyzer must not overflow the stack on it: past the
+// recursion limit it abandons the over-deep subtree and reports it once.
+void test_deep_expression_does_not_crash() {
+    std::printf("test_deep_expression_does_not_crash\n");
+    auto cat = make_catalog();  // users(id, name)
+    parser::Parser p;
+    std::string sql = "SELECT * FROM users WHERE id > 0";
+    for (int i = 0; i < 5000; ++i) {
+        sql += " AND id > 0";
+    }
+    auto res = p.parse(sql);
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());  // must return, not overflow the stack
+    CHECK(count_code(a, DiagnosticCode::ExpressionTooComplex) == 1);
+}
+
 void test_groupby_positional_single() {
     std::printf("test_groupby_positional_single\n");
     auto cat = make_catalog_emp();
@@ -2716,6 +2736,7 @@ int main() {
     test_order_by_non_grouped();
     test_order_by_output_alias_in_grouped_clean();
     test_aggregate_in_over_clause_not_nested();
+    test_deep_expression_does_not_crash();
     test_groupby_positional_single();
     test_groupby_positional_multi();
     test_groupby_positional_still_flags_non_grouped();

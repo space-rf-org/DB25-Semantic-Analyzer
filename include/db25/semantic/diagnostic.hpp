@@ -62,6 +62,10 @@ enum class DiagnosticCode : std::uint16_t {
     DuplicateRelation,
     // A target column is named more than once in an INSERT column list.
     DuplicateColumn,
+    // An expression is nested more deeply than the analyzer will recurse (e.g. a
+    // chain of many thousands of operators, which the parser does not bound).
+    // Analysis of the over-deep subtree is abandoned to avoid a stack overflow.
+    ExpressionTooComplex,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

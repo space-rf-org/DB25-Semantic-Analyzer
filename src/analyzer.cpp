@@ -1957,6 +1957,16 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             return DataType::Boolean;
         }
 
+        // x IS [NOT] TRUE / FALSE / UNKNOWN: like IsNull, a single operand whose
+        // 3VL truth value is tested. The result is always a defined boolean
+        // (never NULL) regardless of the operand's nullability.
+        case NodeType::BooleanTestExpr: {
+            infer_expr(first_child(expr), scope);  // resolve the operand
+            record_type(expr, DataType::Boolean);
+            record_nullability(expr, 1);
+            return DataType::Boolean;
+        }
+
         // A bind parameter ($1 / ?): its type is not known until the statement is
         // bound, so it is Unknown and unifies with anything (wildcard). Marked
         // nullable since a parameter may be bound to NULL.

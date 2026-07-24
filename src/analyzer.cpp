@@ -1997,6 +1997,20 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             return DataType::Array;
         }
 
+        // ROW(a, b, ...) / (a, b, ...): a row/tuple constructor. Each element is
+        // inferred (which also resolves nested column refs). A flat DataType has
+        // no row type, so the constructor itself is typed Unknown; it is only
+        // meaningful inside a row comparison, which yields a Boolean. Marked
+        // nullable since any element may be NULL.
+        case NodeType::RowConstructor: {
+            for (ASTNode* el = first_child(expr); el != nullptr; el = el->next_sibling) {
+                infer_expr(el, scope);
+            }
+            record_type(expr, DataType::Unknown);
+            record_nullability(expr, 2);
+            return DataType::Unknown;
+        }
+
         // <value> COLLATE <name>: a collation annotation. It changes how the
         // value compares/sorts, not its type or nullability, so the CollateClause
         // takes the operand's type and nullability. Inferring the operand also

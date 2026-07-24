@@ -869,6 +869,14 @@ void Analyzer::analyze_update(ASTNode* update_stmt) {
     ASTNode* table_ref = find_child(update_stmt, NodeType::TableRef);
     const TableInfo* table = bind_base_table(table_ref, scope);
 
+    // UPDATE ... FROM extra_relations: bring those relations into scope so SET
+    // values and the WHERE predicate can reference them (e.g. `SET x = o.status
+    // ... FROM orders o WHERE ...`). Without this every such column was reported
+    // unresolved.
+    if (ASTNode* from = find_child(update_stmt, NodeType::FromClause)) {
+        resolve_from(from, scope);
+    }
+
     // SET assignments: each is a BinaryExpr whose primary_text is the target
     // column name and whose (first) child is the value expression.
     if (ASTNode* set_clause = find_child(update_stmt, NodeType::SetClause)) {
@@ -903,6 +911,13 @@ void Analyzer::analyze_delete(ASTNode* delete_stmt) {
     Scope scope(nullptr);
     ASTNode* table_ref = find_child(delete_stmt, NodeType::TableRef);
     bind_base_table(table_ref, scope);
+
+    // DELETE ... USING extra_relations: bring those relations into scope so the
+    // WHERE predicate can join against them (e.g. `... USING orders o WHERE
+    // t.id = o.user_id`). resolve_from iterates the clause's TableRef children.
+    if (ASTNode* using_clause = find_child(delete_stmt, NodeType::UsingClause)) {
+        resolve_from(using_clause, scope);
+    }
 
     if (ASTNode* where = find_child(delete_stmt, NodeType::WhereClause)) {
         if (ASTNode* pred = first_child(where)) {
@@ -1019,6 +1034,18 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             cte.name = std::string{def->primary_text};
             if (body != nullptr) {
                 cte.columns = analyze_query(body, &scope);
+            }
+            // Optional column-list rename `WITH t(a, b) AS (...)`: rename the CTE's
+            // output columns positionally so a later `SELECT a FROM t` resolves.
+            // Without this the renamed names never entered the relation.
+            if (ASTNode* col_list = find_child(def, NodeType::ColumnList)) {
+                std::size_t i = 0;
+                for (ASTNode* cn = first_child(col_list);
+                     cn != nullptr && i < cte.columns.size();
+                     cn = cn->next_sibling, ++i) {
+                    cte.columns[i].name =
+                        std::string{split_column_ref(cn->primary_text).column};
+                }
             }
             scope.add_cte(std::move(cte));
         }

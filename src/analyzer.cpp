@@ -1615,6 +1615,13 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                     window_spec = arg;
                     continue;
                 }
+                if (arg->node_type == NodeType::WhereClause) {
+                    // The FILTER (WHERE p) clause of an aggregate. Resolve the
+                    // predicate so its column references bind, but it is not a
+                    // function argument and does not contribute to arg types.
+                    infer_expr(first_child(arg), scope);
+                    continue;
+                }
                 if (datepart_head && first_arg &&
                     (arg->node_type == NodeType::Identifier ||
                      arg->node_type == NodeType::ColumnRef)) {

@@ -617,6 +617,43 @@ void test_alter_column_default() {
     std::remove(path.c_str());
 }
 
+// ALTER TABLE ALTER COLUMN SET / DROP NOT NULL: toggles the column's
+// nullability, is idempotent (no-op when already in that state), and durable.
+void test_alter_column_not_null() {
+    const std::string path = scratch_path("ddl_alter_notnull.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    CHECK(run(p, mgr, "CREATE TABLE t (a INTEGER)").ok);
+    CHECK(mgr.catalog().find_table("t")->find_column("a")->nullable);  // nullable by default
+
+    // SET NOT NULL flips it.
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN a SET NOT NULL").ok);
+    CHECK(!mgr.catalog().find_table("t")->find_column("a")->nullable);
+    // Idempotent: setting again is a no-op success.
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN a SET NOT NULL").ok);
+    CHECK(!mgr.catalog().find_table("t")->find_column("a")->nullable);
+
+    // DROP NOT NULL flips it back.
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN a DROP NOT NULL").ok);
+    CHECK(mgr.catalog().find_table("t")->find_column("a")->nullable);
+
+    // Missing table / column are rejected.
+    CHECK(!run(p, mgr, "ALTER TABLE nope ALTER COLUMN a SET NOT NULL").ok);
+    CHECK(!run(p, mgr, "ALTER TABLE t ALTER COLUMN ghost SET NOT NULL").ok);
+
+    // Durable across reload.
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN a SET NOT NULL").ok);
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        CHECK(!mgr2.catalog().find_table("t")->find_column("a")->nullable);
+    }
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -639,6 +676,7 @@ int main() {
     test_alter_drop_column();
     test_alter_validation();
     test_alter_column_default();
+    test_alter_column_not_null();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

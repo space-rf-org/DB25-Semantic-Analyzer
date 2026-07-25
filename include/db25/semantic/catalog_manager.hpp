@@ -88,7 +88,8 @@ public:
                                          std::vector<ColumnInfo> columns,
                                          std::vector<ForeignKeySpec> foreign_keys = {},
                                          std::vector<CheckSpec> checks = {},
-                                         std::vector<std::string> primary_key = {}) {
+                                         std::vector<std::string> primary_key = {},
+                                         std::vector<std::vector<std::string>> unique = {}) {
         if (catalog_.find_table(name) != nullptr) {
             return fail("table already exists: " + name);
         }
@@ -113,6 +114,24 @@ public:
                 ci->nullable = false;
             }
             self.constraints.push_back(std::move(c));
+        }
+
+        // Each UNIQUE (column-level or table-level) becomes its own first-class
+        // constraint. Unlike a primary key, a table may have several and its
+        // columns are NOT forced NOT NULL (a UNIQUE column may still be null).
+        for (const std::vector<std::string>& key : unique) {
+            Constraint c;
+            c.kind = Constraint::Kind::Unique;
+            for (const std::string& col : key) {
+                const ColumnInfo* ci = self.find_column(col);
+                if (ci == nullptr) {
+                    return fail("UNIQUE on '" + name + "': no column '" + col + "'");
+                }
+                c.columns.push_back(ci->column_id);
+            }
+            if (!c.columns.empty()) {
+                self.constraints.push_back(std::move(c));
+            }
         }
 
         for (const ForeignKeySpec& fk : foreign_keys) {

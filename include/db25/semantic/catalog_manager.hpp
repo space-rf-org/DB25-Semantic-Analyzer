@@ -68,13 +68,24 @@ public:
         std::vector<std::string> ref_columns;  // referenced column names
     };
 
+    // A CHECK constraint expressed by its verbatim source text plus the local
+    // columns it references (by NAME, resolved to column_ids at commit). The
+    // expression is stored, not evaluated, at this layer; the referenced columns
+    // are recorded so the constraint's dependencies are known.
+    struct CheckSpec {
+        std::string name;                   // "" if unnamed
+        std::string expr;                   // verbatim expression text
+        std::vector<std::string> columns;   // local column names referenced
+    };
+
     // CREATE TABLE. Fails if a table of that name already exists. Any foreign
     // keys are validated and resolved to column_ids here (the serialized commit
     // point), where cross-object references are sound: the referenced table and
     // columns must exist and the local/referenced column counts must match.
     [[nodiscard]] DdlResult create_table(const std::string& name,
                                          std::vector<ColumnInfo> columns,
-                                         std::vector<ForeignKeySpec> foreign_keys = {}) {
+                                         std::vector<ForeignKeySpec> foreign_keys = {},
+                                         std::vector<CheckSpec> checks = {}) {
         if (catalog_.find_table(name) != nullptr) {
             return fail("table already exists: " + name);
         }
@@ -111,6 +122,21 @@ public:
                                 "' has no column '" + col + "'");
                 }
                 c.ref_columns.push_back(ci->column_id);
+            }
+            self.constraints.push_back(std::move(c));
+        }
+
+        for (CheckSpec& chk : checks) {
+            Constraint c;
+            c.kind = Constraint::Kind::Check;
+            c.name = std::move(chk.name);
+            c.expr = std::move(chk.expr);
+            for (const std::string& col : chk.columns) {
+                const ColumnInfo* ci = self.find_column(col);
+                if (ci == nullptr) {
+                    return fail("CHECK on '" + name + "': no local column '" + col + "'");
+                }
+                c.columns.push_back(ci->column_id);
             }
             self.constraints.push_back(std::move(c));
         }

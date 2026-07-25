@@ -367,11 +367,65 @@ void test_check_default_validation() {
     CHECK(!validate_ddl(parse(p, "CREATE TABLE t (a INTEGER DEFAULT b, b INTEGER)"), e));
 }
 
+// The CHECK expression text and the DEFAULT expression text captured by the
+// parser must be persisted into the catalog (and survive a snapshot reload),
+// so the constraint/default can be reproduced faithfully downstream.
+void test_check_default_persistence() {
+    const std::string path = scratch_path("ddl_expr_persist.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    const DdlResult r = run(p, mgr,
+        "CREATE TABLE t (age INTEGER DEFAULT 0 CHECK (age >= 0), "
+        "b INTEGER, CHECK (age < b))");
+    CHECK(r.ok);
+
+    auto check_expr = [](const std::string& s) {
+        return [s](const Constraint& c) {
+            return c.kind == Constraint::Kind::Check && c.expr == s;
+        };
+    };
+    auto has_check = [&](const TableInfo& t, const std::string& expr) {
+        for (const Constraint& c : t.constraints) {
+            if (check_expr(expr)(c)) return true;
+        }
+        return false;
+    };
+
+    const TableInfo* t = mgr.catalog().find_table("t");
+    CHECK(t != nullptr);
+    if (t != nullptr) {
+        const ColumnInfo* age = t->find_column("age");
+        CHECK(age != nullptr && age->has_default && age->default_expr == "0");
+        // Both the column-level and the table-level CHECK are persisted verbatim.
+        CHECK(has_check(*t, "age >= 0"));
+        CHECK(has_check(*t, "age < b"));
+    }
+
+    // Durable: the expression text survives a snapshot reload verbatim.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        const TableInfo* t2 = mgr2.catalog().find_table("t");
+        CHECK(t2 != nullptr);
+        if (t2 != nullptr) {
+            const ColumnInfo* age = t2->find_column("age");
+            CHECK(age != nullptr && age->default_expr == "0");
+            CHECK(has_check(*t2, "age >= 0"));
+            CHECK(has_check(*t2, "age < b"));
+        }
+    }
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
     test_create_table_end_to_end();
     test_check_default_validation();
+    test_check_default_persistence();
     test_statement_validation_layer();
     test_catalog_integrity_layer();
     test_drop_table();

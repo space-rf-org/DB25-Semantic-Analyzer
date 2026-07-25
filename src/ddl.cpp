@@ -48,6 +48,7 @@ struct ColFlags {
     bool not_null = false;
     bool primary_key = false;
     bool has_default = false;
+    std::string default_expr;  // verbatim DEFAULT text; empty when has_default is false
 };
 
 // Collect every column reference in an expression subtree (a bare column name
@@ -119,9 +120,37 @@ ColFlags column_flags(const ASTNode* coldef) {
             f.primary_key = true;  // column-level PRIMARY KEY
         } else if (c->node_type == NodeType::DefaultClause) {
             f.has_default = true;
+            // The parser stores the DEFAULT expression's verbatim source text on
+            // the clause's primary_text (e.g. "0", "now()"). Persist it so the
+            // catalog can reproduce the default faithfully.
+            f.default_expr = std::string(c->primary_text);
         }
     }
     return f;
+}
+
+// Extract every CHECK constraint (column-level and table-level) from a CREATE
+// TABLE node into by-name specs the catalog manager resolves at commit. The
+// expression's verbatim text is on the CheckConstraint node's primary_text; the
+// referenced local columns are collected from the expression subtree.
+std::vector<CatalogManager::CheckSpec> collect_checks(const ASTNode* create_stmt) {
+    std::vector<CatalogManager::CheckSpec> out;
+    auto emit = [&](const ASTNode* check) {
+        CatalogManager::CheckSpec spec;
+        spec.expr = std::string(check->primary_text);
+        collect_column_refs(check, spec.columns);
+        out.push_back(std::move(spec));
+    };
+    for (const ASTNode* c = create_stmt->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type == NodeType::CheckConstraint) {
+            emit(c);  // table-level CHECK (...)
+        } else if (c->node_type == NodeType::ColumnDefinition) {
+            for (const ASTNode* k = c->first_child; k != nullptr; k = k->next_sibling) {
+                if (k->node_type == NodeType::CheckConstraint) emit(k);  // column-level
+            }
+        }
+    }
+    return out;
 }
 
 }  // namespace
@@ -295,12 +324,14 @@ DdlResult execute_ddl(const ASTNode* stmt, CatalogManager& mgr) {
         const ASTNode* type_node = first_child_of_type(c, NodeType::DataTypeNode);
         ci.type = (type_node != nullptr) ? data_type_from_name(type_node->primary_text)
                                          : DataType::Unknown;
-        const ColFlags f = column_flags(c);
+        ColFlags f = column_flags(c);
         ci.nullable = !(f.not_null || f.primary_key);  // PRIMARY KEY implies NOT NULL
         ci.has_default = f.has_default;
+        ci.default_expr = std::move(f.default_expr);
         columns.push_back(std::move(ci));
     }
-    return mgr.create_table(name, std::move(columns), collect_foreign_keys(d));
+    return mgr.create_table(name, std::move(columns), collect_foreign_keys(d),
+                            collect_checks(d));
 }
 
 }  // namespace db25::semantic

@@ -120,16 +120,40 @@ public:
     }
 
     // DROP TABLE. With `if_exists`, dropping a missing table is a no-op success
-    // (and does NOT bump the version). Without it, a missing table fails.
-    [[nodiscard]] DdlResult drop_table(const std::string& name, bool if_exists = false) {
+    // (and does NOT bump the version).
+    //
+    // Referential dependencies are enforced at this serialized commit point.
+    // A foreign key in ANOTHER table that references this one is a dependency:
+    //   - RESTRICT (the default, `cascade == false`): the drop is refused.
+    //   - CASCADE (`cascade == true`): the drop proceeds and those referencing
+    //     foreign keys are removed from the dependent tables.
+    // A self-referencing foreign key is not a dependency (its only referrer is
+    // the table going away). The table's own secondary indexes are always
+    // dropped with it, regardless of RESTRICT/CASCADE.
+    [[nodiscard]] DdlResult drop_table(const std::string& name, bool if_exists = false,
+                                       bool cascade = false) {
         if (catalog_.find_table(name) == nullptr) {
             if (if_exists) {
                 return DdlResult{true, {}, catalog_.schema_version()};
             }
             return fail("no such table: " + name);
         }
+        // Find dependents: foreign keys in OTHER tables referencing `name`.
+        for (const TableInfo* t : catalog_.tables()) {
+            if (t->name == name) continue;  // self-reference is not a dependency
+            for (const Constraint& c : t->constraints) {
+                if (c.kind == Constraint::Kind::ForeignKey && c.ref_table == name && !cascade) {
+                    return fail("cannot drop table '" + name + "': table '" + t->name +
+                                "' has a foreign key referencing it (use CASCADE)");
+                }
+            }
+        }
         InMemoryCatalog next = catalog_;  // copy
         next.remove_table(name);
+        next.drop_indexes_on(name);                  // the table's own indexes go with it
+        if (cascade) {
+            next.drop_foreign_keys_referencing(name);  // detach dependent FKs
+        }
         next.set_schema_version(catalog_.schema_version() + 1);
         return commit(std::move(next));
     }

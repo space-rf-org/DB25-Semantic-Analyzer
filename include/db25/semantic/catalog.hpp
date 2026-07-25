@@ -174,6 +174,33 @@ public:
         return indexes_.erase(std::string{name}) != 0;
     }
 
+    // Cascade-cleanup helpers used by DROP TABLE. Remove every secondary index
+    // built on `table`, and every foreign key (in any table) that references
+    // `ref_table`. Both return the number removed.
+    std::size_t drop_indexes_on(std::string_view table) {
+        std::size_t removed = 0;
+        for (auto it = indexes_.begin(); it != indexes_.end();) {
+            if (it->second.table == table) { it = indexes_.erase(it); ++removed; }
+            else { ++it; }
+        }
+        return removed;
+    }
+    std::size_t drop_foreign_keys_referencing(std::string_view ref_table) {
+        std::size_t removed = 0;
+        for (auto& [_, t] : tables_) {
+            auto& cs = t.constraints;
+            const std::size_t before = cs.size();
+            cs.erase(std::remove_if(cs.begin(), cs.end(),
+                         [&](const Constraint& c) {
+                             return c.kind == Constraint::Kind::ForeignKey &&
+                                    c.ref_table == ref_table;
+                         }),
+                     cs.end());
+            removed += before - cs.size();
+        }
+        return removed;
+    }
+
     // Every index, ordered by index_id for a deterministic enumeration.
     [[nodiscard]] std::vector<const IndexInfo*> indexes() const {
         std::vector<const IndexInfo*> out;

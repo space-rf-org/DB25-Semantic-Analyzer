@@ -300,6 +300,47 @@ void test_self_referencing_foreign_key() {
     std::remove(path.c_str());
 }
 
+void test_drop_restrict_and_cascade() {
+    const std::string path = scratch_path("ddl_dropdep.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+    CHECK(run(p, mgr, "CREATE TABLE users (id INTEGER PRIMARY KEY)").ok);            // v1
+    CHECK(run(p, mgr, "CREATE TABLE orders (uid INTEGER REFERENCES users (id))").ok); // v2
+
+    // RESTRICT is the default: dropping the referenced table is refused.
+    CHECK(!run(p, mgr, "DROP TABLE users").ok);
+    CHECK(mgr.catalog().find_table("users") != nullptr);
+    CHECK(mgr.schema_version() == 2);
+
+    // CASCADE drops the table and detaches the dependent FK from orders.
+    const DdlResult c = run(p, mgr, "DROP TABLE users CASCADE");
+    CHECK(c.ok);
+    CHECK(mgr.catalog().find_table("users") == nullptr);
+    CHECK(first_fk(mgr.catalog().find_table("orders")) == nullptr);  // FK detached
+    CHECK(mgr.catalog().find_table("orders") != nullptr);            // orders itself remains
+    std::remove(path.c_str());
+}
+
+void test_drop_self_ref_and_index_cleanup() {
+    const std::string path = scratch_path("ddl_dropself.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+    // A self-referencing FK is not an external dependency: DROP (RESTRICT) works.
+    CHECK(run(p, mgr,
+        "CREATE TABLE emp (id INTEGER PRIMARY KEY, mgr INTEGER REFERENCES emp (id))").ok);
+    CHECK(run(p, mgr, "CREATE INDEX idx_mgr ON emp (mgr)").ok);
+    CHECK(mgr.catalog().find_index("idx_mgr") != nullptr);
+    CHECK(run(p, mgr, "DROP TABLE emp").ok);
+    CHECK(mgr.catalog().find_table("emp") == nullptr);
+    // The table's index is dropped with it (no dangling index metadata).
+    CHECK(mgr.catalog().find_index("idx_mgr") == nullptr);
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -313,6 +354,8 @@ int main() {
     test_foreign_key_column_and_table_level();
     test_foreign_key_integrity();
     test_self_referencing_foreign_key();
+    test_drop_restrict_and_cascade();
+    test_drop_self_ref_and_index_cleanup();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

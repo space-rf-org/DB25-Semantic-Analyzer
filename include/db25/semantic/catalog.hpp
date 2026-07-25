@@ -115,6 +115,13 @@ public:
         tables_.insert_or_assign(key, std::move(info));
     }
 
+    // Remove a table by name. Returns true if a table was removed, false if no
+    // such table existed. The id allocator is not rewound (dropped ids are not
+    // reused), so a later CREATE never collides with a dropped table's id.
+    bool remove_table(std::string_view name) {
+        return tables_.erase(std::string{name}) != 0;
+    }
+
 private:
     std::unordered_map<std::string, TableInfo> tables_;
     std::uint32_t next_table_id_ = 1;

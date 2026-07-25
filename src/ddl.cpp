@@ -1,6 +1,9 @@
 // DB25 Semantic Analyzer - DDL utility dispatch (implementation).
 
 #include "db25/semantic/ddl.hpp"
+#include "db25/semantic/analyzer.hpp"
+#include "db25/semantic/catalog.hpp"
+#include "db25/semantic/scope.hpp"
 #include "db25/semantic/type_names.hpp"
 
 #include "db25/ast/node_types.hpp"
@@ -11,6 +14,7 @@
 namespace db25::semantic {
 
 using ast::ASTNode;
+using ast::DataType;
 using ast::NodeType;
 
 namespace {
@@ -23,16 +27,17 @@ constexpr std::uint16_t kFlagCascade = 0x04;              // DROP ... CASCADE
 constexpr std::uint16_t kFlagDropTable = 0x10;            // DROP TABLE
 constexpr std::uint16_t kFlagDropIndex = 0x20;            // DROP INDEX
 
-// Locate the single DDL statement in a (possibly wrapping) parse tree.
-const ASTNode* find_ddl(const ASTNode* n) {
+// Locate the single DDL statement in a (possibly wrapping) parse tree. Returns
+// a mutable node: layer-1 type checking annotates the AST with inferred types.
+ASTNode* find_ddl(ASTNode* n) {
     if (n == nullptr) return nullptr;
     if (n->node_type == NodeType::CreateTableStmt ||
         n->node_type == NodeType::CreateIndexStmt ||
         n->node_type == NodeType::DropStmt) {
         return n;
     }
-    for (const ASTNode* c = n->first_child; c != nullptr; c = c->next_sibling) {
-        if (const ASTNode* h = find_ddl(c)) return h;
+    for (ASTNode* c = n->first_child; c != nullptr; c = c->next_sibling) {
+        if (ASTNode* h = find_ddl(c)) return h;
     }
     return nullptr;
 }
@@ -153,10 +158,86 @@ std::vector<CatalogManager::CheckSpec> collect_checks(const ASTNode* create_stmt
     return out;
 }
 
+// A CHECK predicate whose inferred type is one of these is accepted: Boolean is
+// the intended type; a wildcard (NULL / Unknown / Any) means the type could not
+// be pinned down (e.g. an unmodeled function) and is left to run time rather
+// than reported as a false positive.
+[[nodiscard]] bool check_type_ok(DataType t) {
+    return t == DataType::Boolean || t == DataType::Null ||
+           t == DataType::Unknown || t == DataType::Any;
+}
+
+// Layer-1 type checking for a CREATE TABLE's CHECK / DEFAULT expressions. Runs
+// only after the structural and reference checks pass. Builds a synthetic
+// single-relation scope from the statement's OWN declared columns (so it stays
+// catalog-independent) and reuses the analyzer's type engine: a CHECK predicate
+// must be Boolean; a DEFAULT value must be assignment-compatible with its
+// column's declared type (same rule as an INSERT value into that column).
+void typecheck_create_table(ASTNode* create, std::vector<std::string>& errors) {
+    auto column_type = [](const ASTNode* coldef) {
+        const ASTNode* type_node = first_child_of_type(coldef, NodeType::DataTypeNode);
+        return type_node != nullptr ? data_type_from_name(type_node->primary_text)
+                                    : DataType::Unknown;
+    };
+
+    // Synthetic relation: the table's own columns, resolved to their types.
+    RelationBinding rel;
+    rel.name = std::string(create->primary_text);
+    std::uint32_t col_id = 0;
+    for (const ASTNode* c = create->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type != NodeType::ColumnDefinition) continue;
+        ResolvedColumn rc;
+        rc.name = std::string(c->primary_text);
+        rc.type = column_type(c);
+        rc.column_id = col_id++;
+        rel.columns.push_back(std::move(rc));
+    }
+    Scope scope;
+    scope.add_relation(std::move(rel));
+
+    // The expressions reference only this table's columns; no catalog is needed.
+    InMemoryCatalog empty;
+    Analyzer analyzer(empty);
+
+    auto check_predicate = [&](ASTNode* check_node, const std::string& where) {
+        ASTNode* expr = check_node->first_child;
+        if (expr == nullptr) return;
+        const DataType t = analyzer.infer_scalar(expr, scope);
+        if (!check_type_ok(t)) {
+            errors.emplace_back(where + ": CHECK expression must be Boolean, not " +
+                                std::string(data_type_name(t)));
+        }
+    };
+
+    for (ASTNode* c = create->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type == NodeType::CheckConstraint) {
+            check_predicate(c, "table CHECK");
+        } else if (c->node_type == NodeType::ColumnDefinition) {
+            const std::string col(c->primary_text);
+            const DataType col_type = column_type(c);
+            for (ASTNode* k = c->first_child; k != nullptr; k = k->next_sibling) {
+                if (k->node_type == NodeType::CheckConstraint) {
+                    check_predicate(k, "CHECK on column '" + col + "'");
+                } else if (k->node_type == NodeType::DefaultClause) {
+                    ASTNode* expr = k->first_child;
+                    if (expr == nullptr) continue;
+                    const DataType t = analyzer.infer_scalar(expr, scope);
+                    if (!Analyzer::assignment_compatible(col_type, t)) {
+                        errors.emplace_back("column '" + col + "': DEFAULT value of type " +
+                                            std::string(data_type_name(t)) +
+                                            " is not compatible with column type " +
+                                            std::string(data_type_name(col_type)));
+                    }
+                }
+            }
+        }
+    }
+}
+
 }  // namespace
 
-bool validate_ddl(const ASTNode* stmt, std::vector<std::string>& errors) {
-    const ASTNode* d = find_ddl(stmt);
+bool validate_ddl(ASTNode* stmt, std::vector<std::string>& errors) {
+    ASTNode* d = find_ddl(stmt);
     if (d == nullptr) {
         errors.emplace_back("not a DDL statement");
         return false;
@@ -273,10 +354,17 @@ bool validate_ddl(const ASTNode* stmt, std::vector<std::string>& errors) {
         }
     }
 
+    // Third pass: type-check the CHECK / DEFAULT expressions. Only meaningful once
+    // structure and references are sound, so skip it if anything failed above -
+    // an unresolved column would otherwise be re-reported by type inference.
+    if (errors.empty()) {
+        typecheck_create_table(d, errors);
+    }
+
     return errors.empty();
 }
 
-DdlResult execute_ddl(const ASTNode* stmt, CatalogManager& mgr) {
+DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
     std::vector<std::string> errors;
     if (!validate_ddl(stmt, errors)) {
         std::string joined;
@@ -287,7 +375,7 @@ DdlResult execute_ddl(const ASTNode* stmt, CatalogManager& mgr) {
         return DdlResult{false, joined, mgr.schema_version()};
     }
 
-    const ASTNode* d = find_ddl(stmt);
+    ASTNode* d = find_ddl(stmt);
 
     if (d->node_type == NodeType::DropStmt) {
         const bool if_exists = (d->semantic_flags & kFlagIfExistsOrNotExists) != 0;

@@ -975,6 +975,15 @@ DataType Analyzer::type_of(const ASTNode* node) const {
     return it == inferred_.end() ? DataType::Unknown : it->second;
 }
 
+DataType Analyzer::infer_scalar(ASTNode* expr, Scope& scope) {
+    return infer_expr(expr, scope);
+}
+
+bool Analyzer::assignment_compatible(DataType target, DataType value) {
+    return coerce(target, value, CoercionKind::Assignment).status !=
+           CoercionStatus::Incompatible;
+}
+
 int Analyzer::nullability_of(const ASTNode* node) const {
     const auto it = nullability_.find(node);
     return it == nullability_.end() ? 0 : it->second;

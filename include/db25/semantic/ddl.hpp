@@ -27,7 +27,9 @@ namespace db25::semantic {
 // `errors` and returns true iff the statement is well-formed. Catalog state is
 // NOT consulted. Handles CREATE TABLE and DROP TABLE; other DDL is reported as
 // unsupported (for now) rather than silently accepted.
-[[nodiscard]] bool validate_ddl(const ast::ASTNode* stmt,
+// The node is annotated with inferred types during type checking, hence the
+// mutable pointer; the parser AST it points into is caller-owned and transient.
+[[nodiscard]] bool validate_ddl(ast::ASTNode* stmt,
                                 std::vector<std::string>& errors);
 
 // Validate (layer 1) then apply (layer 2) a DDL statement. A malformed
@@ -36,6 +38,6 @@ namespace db25::semantic {
 // applied via the manager, whose commit-time checks decide the final outcome.
 // `stmt` may be the DDL node itself or any ancestor that contains exactly one
 // DDL statement (the node is located within the tree).
-[[nodiscard]] DdlResult execute_ddl(const ast::ASTNode* stmt, CatalogManager& mgr);
+[[nodiscard]] DdlResult execute_ddl(ast::ASTNode* stmt, CatalogManager& mgr);
 
 }  // namespace db25::semantic

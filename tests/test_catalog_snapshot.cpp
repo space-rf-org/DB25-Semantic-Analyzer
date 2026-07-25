@@ -28,10 +28,18 @@ void check(bool cond, const char* expr, const char* file, int line) {
 
 #define CHECK(cond) check((cond), #cond, __FILE__, __LINE__)
 
-// Deep structural equality: version, id allocator, and every table/column field.
+// Deep structural equality: version, id allocators, and every table / column /
+// constraint / index field the snapshot persists.
+bool constraints_equal(const Constraint& a, const Constraint& b) {
+    return a.kind == b.kind && a.name == b.name && a.columns == b.columns &&
+           a.ref_table == b.ref_table && a.ref_columns == b.ref_columns &&
+           a.expr == b.expr;
+}
+
 bool catalogs_equal(const InMemoryCatalog& a, const InMemoryCatalog& b) {
     if (a.schema_version() != b.schema_version()) return false;
     if (a.next_table_id() != b.next_table_id()) return false;
+    if (a.next_index_id() != b.next_index_id()) return false;
     const auto ta = a.tables();
     const auto tb = b.tables();
     if (ta.size() != tb.size()) return false;
@@ -47,25 +55,55 @@ bool catalogs_equal(const InMemoryCatalog& a, const InMemoryCatalog& b) {
             if (ca.type != cb.type) return false;
             if (ca.nullable != cb.nullable) return false;
             if (ca.has_default != cb.has_default) return false;
+            if (ca.default_expr != cb.default_expr) return false;
         }
+        if (ta[i]->constraints.size() != tb[i]->constraints.size()) return false;
+        for (std::size_t j = 0; j < ta[i]->constraints.size(); ++j) {
+            if (!constraints_equal(ta[i]->constraints[j], tb[i]->constraints[j])) return false;
+        }
+    }
+    const auto ia = a.indexes();
+    const auto ib = b.indexes();
+    if (ia.size() != ib.size()) return false;
+    for (std::size_t i = 0; i < ia.size(); ++i) {
+        if (ia[i]->index_id != ib[i]->index_id) return false;
+        if (ia[i]->name != ib[i]->name) return false;
+        if (ia[i]->table != ib[i]->table) return false;
+        if (ia[i]->columns != ib[i]->columns) return false;
+        if (ia[i]->unique != ib[i]->unique) return false;
     }
     return true;
 }
 
-// A catalog exercising mixed types, null/notnull, with/without default, and a
-// name containing a space (to pin the end-of-line name parsing).
+// A catalog exercising mixed types, null/notnull, defaults (with expression
+// text), table constraints (PK / FK / CHECK), a secondary index, and names /
+// expressions containing spaces (to pin the end-of-line sub-record parsing).
 InMemoryCatalog sample_catalog() {
     InMemoryCatalog cat;
-    cat.add_table("users", {
+    TableInfo& users = cat.add_table("users", {
         ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
         ColumnInfo{"name", DataType::VarChar, /*nullable=*/true},
         ColumnInfo{"created at", DataType::Timestamp, /*nullable=*/true,
                    /*has_default=*/true},
     });
-    cat.add_table("order lines", {
+    users.columns[2].default_expr = "now ( )";  // spaces -> sub-record parsing
+    users.constraints.push_back(Constraint{
+        Constraint::Kind::PrimaryKey, "users_pk", {1}, {}, {}, {}});
+    users.constraints.push_back(Constraint{
+        Constraint::Kind::Check, "adult check", {}, {}, {}, "age >= 18"});
+
+    TableInfo& lines = cat.add_table("order lines", {
         ColumnInfo{"order_id", DataType::BigInt, /*nullable=*/false},
+        ColumnInfo{"user_id", DataType::Integer, /*nullable=*/false},
         ColumnInfo{"amount", DataType::Double, /*nullable=*/true},
     });
+    lines.constraints.push_back(Constraint{
+        Constraint::Kind::ForeignKey, "fk lines users",
+        /*columns=*/{2}, /*ref_table=*/"users", /*ref_columns=*/{1}, /*expr=*/{}});
+
+    cat.add_index("idx_amount", "order lines", {3}, /*unique=*/false);
+    cat.add_index("uq_user_name", "users", {1, 2}, /*unique=*/true);
+
     cat.set_schema_version(7);
     return cat;
 }
@@ -173,6 +211,34 @@ void test_newline_name_rejected() {
     CHECK(std::fopen(path.c_str(), "rb") == nullptr);
 }
 
+void test_reads_format_v1() {
+    // A hand-written format-1 snapshot (no next_index_id, no constraint/index
+    // records) must still load: its tables simply carry no constraints, no
+    // indexes, and no default expression text.
+    const char* v1 =
+        "DB25CATALOG 1\n"
+        "version 3\n"
+        "next_table_id 2\n"
+        "table 1 users\n"
+        "col 1 INTEGER notnull nodefault id\n"
+        "col 2 VARCHAR null nodefault name\n";
+    std::string err;
+    const std::optional<InMemoryCatalog> c = deserialize_catalog(v1, err);
+    CHECK(c.has_value());
+    if (c) {
+        CHECK(c->schema_version() == 3);
+        CHECK(c->next_index_id() == 1);       // default when absent
+        const TableInfo* t = c->find_table("users");
+        CHECK(t != nullptr);
+        if (t) {
+            CHECK(t->columns.size() == 2);
+            CHECK(t->constraints.empty());
+            CHECK(t->columns[0].default_expr.empty());
+        }
+        CHECK(c->indexes().empty());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -182,6 +248,7 @@ int main() {
     test_crash_safety_ignores_temp();
     test_malformed_is_rejected();
     test_newline_name_rejected();
+    test_reads_format_v1();
 
     std::printf("catalog_snapshot: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -1,6 +1,30 @@
 // DB25 Semantic Analyzer - persistent catalog snapshot store (implementation).
 //
-// See catalog_snapshot.hpp for the on-disk format and the crash-safety contract.
+// See catalog_snapshot.hpp for the crash-safety contract. The on-disk format is
+// line-oriented and self-describing; format 2 extends format 1 with table
+// constraints, secondary indexes, and per-column DEFAULT expression text.
+// Format 1 snapshots still load (their tables simply carry no constraints,
+// indexes, or default text). Records with more than one free-text field use
+// one-value-per-line sub-records so a trailing name/expression may contain
+// spaces:
+//
+//   DB25CATALOG 2
+//   version <schema_version>
+//   next_table_id <n>
+//   next_index_id <n>
+//   table <table_id> <name...>
+//   col <column_id> <TYPE> <null|notnull> <default|nodefault> <name...>
+//   coldefault <expr...>                 (follows its col; only when default)
+//   constraint <PK|UNIQUE|FK|CHECK>      (belongs to the current table)
+//   cname <name...>                      (optional)
+//   ccol <column_id>                     (repeatable: local columns)
+//   creftable <table name...>            (FK)
+//   crefcol <column_id>                  (repeatable: FK referenced columns)
+//   cexpr <expr...>                      (CHECK)
+//   index <index_id> <unique|plain>
+//   iname <index name...>
+//   itable <table name...>
+//   icol <column_id>                     (repeatable)
 
 #include "db25/semantic/catalog_snapshot.hpp"
 
@@ -14,9 +38,6 @@
 namespace db25::semantic {
 
 namespace {
-
-// ---- DataType <-> token. Explicit and self-contained so the on-disk spelling
-//   is stable regardless of any display-name changes elsewhere. --------------
 
 const char* type_to_token(DataType t) {
     switch (t) {
@@ -67,9 +88,23 @@ bool token_to_type(std::string_view s, DataType& out) {
     return false;
 }
 
-// ---- Minimal line tokenizer. Splits on single spaces; `rest_after(line, k)`
-//   returns everything past the k-th space (so a trailing name may contain
-//   spaces). ------------------------------------------------------------------
+const char* constraint_kind_token(Constraint::Kind k) {
+    switch (k) {
+        case Constraint::Kind::PrimaryKey: return "PK";
+        case Constraint::Kind::Unique:     return "UNIQUE";
+        case Constraint::Kind::ForeignKey: return "FK";
+        case Constraint::Kind::Check:      return "CHECK";
+    }
+    return "CHECK";
+}
+
+bool token_to_constraint_kind(std::string_view s, Constraint::Kind& out) {
+    if (s == "PK") { out = Constraint::Kind::PrimaryKey; return true; }
+    if (s == "UNIQUE") { out = Constraint::Kind::Unique; return true; }
+    if (s == "FK") { out = Constraint::Kind::ForeignKey; return true; }
+    if (s == "CHECK") { out = Constraint::Kind::Check; return true; }
+    return false;
+}
 
 std::vector<std::string_view> split_ws(std::string_view line) {
     std::vector<std::string_view> out;
@@ -83,8 +118,7 @@ std::vector<std::string_view> split_ws(std::string_view line) {
     return out;
 }
 
-// Everything after the k-th space-delimited field of `line` (the trailing name).
-// Returns empty if the line has fewer than k fields.
+// Everything after the k-th space-delimited field (the trailing name/expr).
 std::string_view rest_after(std::string_view line, int k) {
     std::size_t i = 0;
     int fields = 0;
@@ -94,7 +128,7 @@ std::string_view rest_after(std::string_view line, int k) {
         while (i < line.size() && line[i] != ' ') ++i;
         if (i > start) ++fields;
     }
-    while (i < line.size() && line[i] == ' ') ++i;  // skip the single delimiter run
+    while (i < line.size() && line[i] == ' ') ++i;
     return line.substr(i);
 }
 
@@ -110,18 +144,18 @@ bool parse_u32(std::string_view s, std::uint32_t& out) {
     return true;
 }
 
-bool name_is_representable(const std::string& name) {
-    return name.find('\n') == std::string::npos &&
-           name.find('\r') == std::string::npos;
+bool representable(const std::string& s) {
+    return s.find('\n') == std::string::npos && s.find('\r') == std::string::npos;
 }
 
 }  // namespace
 
 std::string serialize_catalog(const InMemoryCatalog& catalog) {
     std::string out;
-    out += "DB25CATALOG 1\n";
+    out += "DB25CATALOG 2\n";
     out += "version " + std::to_string(catalog.schema_version()) + "\n";
     out += "next_table_id " + std::to_string(catalog.next_table_id()) + "\n";
+    out += "next_index_id " + std::to_string(catalog.next_index_id()) + "\n";
     for (const TableInfo* t : catalog.tables()) {
         out += "table " + std::to_string(t->table_id) + " " + t->name + "\n";
         for (const ColumnInfo& c : t->columns) {
@@ -130,6 +164,36 @@ std::string serialize_catalog(const InMemoryCatalog& catalog) {
             out += c.nullable ? " null" : " notnull";
             out += c.has_default ? " default" : " nodefault";
             out += " " + c.name + "\n";
+            if (c.has_default && !c.default_expr.empty()) {
+                out += "coldefault " + c.default_expr + "\n";
+            }
+        }
+        for (const Constraint& k : t->constraints) {
+            out += "constraint ";
+            out += constraint_kind_token(k.kind);
+            out += "\n";
+            if (!k.name.empty()) out += "cname " + k.name + "\n";
+            for (const std::uint32_t id : k.columns) {
+                out += "ccol " + std::to_string(id) + "\n";
+            }
+            if (k.kind == Constraint::Kind::ForeignKey) {
+                out += "creftable " + k.ref_table + "\n";
+                for (const std::uint32_t id : k.ref_columns) {
+                    out += "crefcol " + std::to_string(id) + "\n";
+                }
+            }
+            if (k.kind == Constraint::Kind::Check && !k.expr.empty()) {
+                out += "cexpr " + k.expr + "\n";
+            }
+        }
+    }
+    for (const IndexInfo* idx : catalog.indexes()) {
+        out += "index " + std::to_string(idx->index_id);
+        out += idx->unique ? " unique\n" : " plain\n";
+        out += "iname " + idx->name + "\n";
+        out += "itable " + idx->table + "\n";
+        for (const std::uint32_t id : idx->columns) {
+            out += "icol " + std::to_string(id) + "\n";
         }
     }
     return out;
@@ -141,15 +205,40 @@ std::optional<InMemoryCatalog> deserialize_catalog(const std::string& text,
     bool header_seen = false;
     bool have_version = false;
     bool have_next_id = false;
-    TableInfo current;
-    bool have_current = false;
 
+    TableInfo current;             // table under construction
+    bool have_table = false;
+    Constraint constraint;         // constraint under construction
+    bool have_constraint = false;
+    IndexInfo index;               // index under construction
+    bool have_index = false;
+
+    auto flush_constraint = [&]() {
+        if (have_constraint) {
+            current.constraints.push_back(std::move(constraint));
+            constraint = Constraint{};
+            have_constraint = false;
+        }
+    };
     auto flush_table = [&]() {
-        if (have_current) {
+        flush_constraint();
+        if (have_table) {
             cat.restore_table(std::move(current));
             current = TableInfo{};
-            have_current = false;
+            have_table = false;
         }
+    };
+    auto flush_index = [&]() {
+        if (have_index) {
+            cat.restore_index(std::move(index));
+            index = IndexInfo{};
+            have_index = false;
+        }
+    };
+
+    auto fail = [&](const std::string& msg, int line) -> std::optional<InMemoryCatalog> {
+        error = msg + " (line " + std::to_string(line) + ")";
+        return std::nullopt;
     };
 
     std::size_t pos = 0;
@@ -158,79 +247,115 @@ std::optional<InMemoryCatalog> deserialize_catalog(const std::string& text,
         const std::size_t nl = text.find('\n', pos);
         const std::size_t end = (nl == std::string::npos) ? text.size() : nl;
         std::string_view line(text.data() + pos, end - pos);
-        pos = (nl == std::string::npos) ? text.size() + 1 : nl + 1;
+        const bool last = (nl == std::string::npos);
+        pos = last ? text.size() + 1 : nl + 1;
         ++line_no;
-        if (line.empty()) {
-            if (nl == std::string::npos) break;
-            continue;  // tolerate blank lines
-        }
+        if (line.empty()) { if (last) break; else continue; }
 
         const std::vector<std::string_view> tok = split_ws(line);
-        if (tok.empty()) continue;
+        if (tok.empty()) { if (last) break; else continue; }
         const std::string_view kind = tok[0];
 
         if (!header_seen) {
-            if (kind != "DB25CATALOG" || tok.size() != 2 || tok[1] != "1") {
-                error = "bad snapshot header (line " + std::to_string(line_no) + ")";
-                return std::nullopt;
+            if (kind != "DB25CATALOG" || tok.size() != 2 ||
+                (tok[1] != "1" && tok[1] != "2")) {
+                return fail("bad snapshot header", line_no);
             }
             header_seen = true;
+            if (last) break;
             continue;
         }
 
+        std::uint32_t n = 0;
         if (kind == "version") {
-            std::uint32_t v = 0;
-            if (tok.size() != 2 || !parse_u32(tok[1], v)) {
-                error = "bad version (line " + std::to_string(line_no) + ")";
-                return std::nullopt;
-            }
-            cat.set_schema_version(v);
+            if (tok.size() != 2 || !parse_u32(tok[1], n)) return fail("bad version", line_no);
+            cat.set_schema_version(n);
             have_version = true;
         } else if (kind == "next_table_id") {
-            std::uint32_t n = 0;
-            if (tok.size() != 2 || !parse_u32(tok[1], n)) {
-                error = "bad next_table_id (line " + std::to_string(line_no) + ")";
-                return std::nullopt;
-            }
+            if (tok.size() != 2 || !parse_u32(tok[1], n)) return fail("bad next_table_id", line_no);
             cat.set_next_table_id(n);
             have_next_id = true;
+        } else if (kind == "next_index_id") {
+            if (tok.size() != 2 || !parse_u32(tok[1], n)) return fail("bad next_index_id", line_no);
+            cat.set_next_index_id(n);
         } else if (kind == "table") {
-            std::uint32_t id = 0;
-            if (tok.size() < 3 || !parse_u32(tok[1], id)) {
-                error = "bad table record (line " + std::to_string(line_no) + ")";
-                return std::nullopt;
-            }
+            if (tok.size() < 3 || !parse_u32(tok[1], n)) return fail("bad table record", line_no);
             flush_table();
             current = TableInfo{};
-            current.table_id = id;
+            current.table_id = n;
             current.name = std::string(rest_after(line, 2));
-            have_current = true;
+            have_table = true;
         } else if (kind == "col") {
-            std::uint32_t id = 0;
             DataType type = DataType::Unknown;
-            if (!have_current || tok.size() < 6 || !parse_u32(tok[1], id) ||
+            if (!have_table || tok.size() < 6 || !parse_u32(tok[1], n) ||
                 !token_to_type(tok[2], type) ||
                 (tok[3] != "null" && tok[3] != "notnull") ||
                 (tok[4] != "default" && tok[4] != "nodefault")) {
-                error = "bad col record (line " + std::to_string(line_no) + ")";
-                return std::nullopt;
+                return fail("bad col record", line_no);
             }
+            flush_constraint();  // cols never follow constraints, but stay safe
             ColumnInfo c;
-            c.column_id = id;
+            c.column_id = n;
             c.type = type;
             c.nullable = (tok[3] == "null");
             c.has_default = (tok[4] == "default");
             c.name = std::string(rest_after(line, 5));
             current.columns.push_back(std::move(c));
+        } else if (kind == "coldefault") {
+            if (!have_table || current.columns.empty()) return fail("orphan coldefault", line_no);
+            current.columns.back().default_expr = std::string(rest_after(line, 1));
+        } else if (kind == "constraint") {
+            Constraint::Kind ck = Constraint::Kind::Check;
+            if (!have_table || tok.size() != 2 || !token_to_constraint_kind(tok[1], ck)) {
+                return fail("bad constraint record", line_no);
+            }
+            flush_constraint();
+            constraint = Constraint{};
+            constraint.kind = ck;
+            have_constraint = true;
+        } else if (kind == "cname") {
+            if (!have_constraint) return fail("orphan cname", line_no);
+            constraint.name = std::string(rest_after(line, 1));
+        } else if (kind == "ccol") {
+            if (!have_constraint || tok.size() != 2 || !parse_u32(tok[1], n)) return fail("bad ccol", line_no);
+            constraint.columns.push_back(n);
+        } else if (kind == "creftable") {
+            if (!have_constraint) return fail("orphan creftable", line_no);
+            constraint.ref_table = std::string(rest_after(line, 1));
+        } else if (kind == "crefcol") {
+            if (!have_constraint || tok.size() != 2 || !parse_u32(tok[1], n)) return fail("bad crefcol", line_no);
+            constraint.ref_columns.push_back(n);
+        } else if (kind == "cexpr") {
+            if (!have_constraint) return fail("orphan cexpr", line_no);
+            constraint.expr = std::string(rest_after(line, 1));
+        } else if (kind == "index") {
+            if (tok.size() != 3 || !parse_u32(tok[1], n) ||
+                (tok[2] != "unique" && tok[2] != "plain")) {
+                return fail("bad index record", line_no);
+            }
+            flush_table();  // all tables precede indexes
+            flush_index();
+            index = IndexInfo{};
+            index.index_id = n;
+            index.unique = (tok[2] == "unique");
+            have_index = true;
+        } else if (kind == "iname") {
+            if (!have_index) return fail("orphan iname", line_no);
+            index.name = std::string(rest_after(line, 1));
+        } else if (kind == "itable") {
+            if (!have_index) return fail("orphan itable", line_no);
+            index.table = std::string(rest_after(line, 1));
+        } else if (kind == "icol") {
+            if (!have_index || tok.size() != 2 || !parse_u32(tok[1], n)) return fail("bad icol", line_no);
+            index.columns.push_back(n);
         } else {
-            error = "unknown record '" + std::string(kind) + "' (line " +
-                    std::to_string(line_no) + ")";
-            return std::nullopt;
+            return fail("unknown record '" + std::string(kind) + "'", line_no);
         }
 
-        if (nl == std::string::npos) break;
+        if (last) break;
     }
     flush_table();
+    flush_index();
 
     if (!header_seen || !have_version || !have_next_id) {
         error = "snapshot missing required header fields";
@@ -241,19 +366,27 @@ std::optional<InMemoryCatalog> deserialize_catalog(const std::string& text,
 
 bool save_catalog_snapshot(const InMemoryCatalog& catalog, const std::string& path,
                            std::string& error) {
-    // Names are emitted at end-of-line; a newline in a name would corrupt the
-    // format. Reject it rather than write an unparseable snapshot.
+    // Names/expressions are emitted at end-of-line; a newline in any of them
+    // would corrupt the format. Reject rather than write an unparseable snapshot.
+    auto bad = [&](const std::string& what, const std::string& v) {
+        error = what + " contains a newline: " + v;
+        return false;
+    };
     for (const TableInfo* t : catalog.tables()) {
-        if (!name_is_representable(t->name)) {
-            error = "table name contains a newline: " + t->name;
-            return false;
-        }
+        if (!representable(t->name)) return bad("table name", t->name);
         for (const ColumnInfo& c : t->columns) {
-            if (!name_is_representable(c.name)) {
-                error = "column name contains a newline: " + c.name;
-                return false;
-            }
+            if (!representable(c.name)) return bad("column name", c.name);
+            if (!representable(c.default_expr)) return bad("default expr", c.default_expr);
         }
+        for (const Constraint& k : t->constraints) {
+            if (!representable(k.name)) return bad("constraint name", k.name);
+            if (!representable(k.ref_table)) return bad("constraint ref table", k.ref_table);
+            if (!representable(k.expr)) return bad("check expr", k.expr);
+        }
+    }
+    for (const IndexInfo* idx : catalog.indexes()) {
+        if (!representable(idx->name)) return bad("index name", idx->name);
+        if (!representable(idx->table)) return bad("index table", idx->table);
     }
 
     const std::string data = serialize_catalog(catalog);
@@ -271,9 +404,8 @@ bool save_catalog_snapshot(const InMemoryCatalog& catalog, const std::string& pa
         error = "short write to " + tmp;
         return false;
     }
-    // Durability: flush userspace, then fsync the fd before the rename so the
-    // bytes are on disk. (A fully-correct implementation also fsyncs the parent
-    // directory so the rename itself is durable; deferred for the interim.)
+    // Durability: flush userspace, then fsync the fd before the rename. (A fully
+    // correct implementation also fsyncs the parent directory; deferred.)
     std::fflush(f);
     ::fsync(::fileno(f));
     std::fclose(f);

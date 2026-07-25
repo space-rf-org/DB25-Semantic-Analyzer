@@ -19,6 +19,7 @@ namespace {
 // parser on the statement node's semantic_flags.
 constexpr std::uint16_t kFlagIfExistsOrNotExists = 0x01;  // IF [NOT] EXISTS
 constexpr std::uint16_t kFlagUnique = 0x02;               // CREATE UNIQUE INDEX
+constexpr std::uint16_t kFlagCascade = 0x04;              // DROP ... CASCADE
 constexpr std::uint16_t kFlagDropTable = 0x10;            // DROP TABLE
 constexpr std::uint16_t kFlagDropIndex = 0x20;            // DROP INDEX
 
@@ -205,7 +206,8 @@ DdlResult execute_ddl(const ASTNode* stmt, CatalogManager& mgr) {
         if ((d->semantic_flags & kFlagDropIndex) != 0) {
             return mgr.drop_index(std::string(d->primary_text), if_exists);
         }
-        return mgr.drop_table(std::string(d->primary_text), if_exists);
+        const bool cascade = (d->semantic_flags & kFlagCascade) != 0;
+        return mgr.drop_table(std::string(d->primary_text), if_exists, cascade);
     }
 
     if (d->node_type == NodeType::CreateIndexStmt) {

@@ -17,6 +17,7 @@ add_library(db25semantic
     src/analyzer.cpp
     src/catalog_snapshot.cpp
     src/ddl.cpp
+    src/transaction.cpp
 )
 target_include_directories(db25semantic PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -43,4 +44,8 @@ if(BUILD_TESTS)
     add_executable(ddl_tests tests/test_ddl.cpp)
     target_link_libraries(ddl_tests PRIVATE db25semantic DB25::db25parser)
     add_test(NAME ddl_tests COMMAND ddl_tests)
+
+    add_executable(transaction_tests tests/test_transaction.cpp)
+    target_link_libraries(transaction_tests PRIVATE db25semantic DB25::db25parser)
+    add_test(NAME transaction_tests COMMAND transaction_tests)
 endif()

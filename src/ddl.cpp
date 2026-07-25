@@ -210,6 +210,30 @@ std::vector<std::string> collect_primary_key(const ASTNode* create_stmt) {
     return pk;
 }
 
+// Collect the UNIQUE constraints from a CREATE TABLE node. A column-level UNIQUE
+// is a single-column key on its own column; a table-level UNIQUE (a, b) is one
+// key over its Identifier children. A table may declare several, so each is
+// returned as its own column-name list.
+std::vector<std::vector<std::string>> collect_unique(const ASTNode* create_stmt) {
+    std::vector<std::vector<std::string>> out;
+    for (const ASTNode* c = create_stmt->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type == NodeType::UniqueConstraint) {
+            std::vector<std::string> key;
+            for (const ASTNode* id = c->first_child; id != nullptr; id = id->next_sibling) {
+                if (id->node_type == NodeType::Identifier) key.emplace_back(id->primary_text);
+            }
+            if (!key.empty()) out.push_back(std::move(key));
+        } else if (c->node_type == NodeType::ColumnDefinition) {
+            for (const ASTNode* k = c->first_child; k != nullptr; k = k->next_sibling) {
+                if (k->node_type == NodeType::UniqueConstraint) {
+                    out.push_back({std::string(c->primary_text)});  // column-level
+                }
+            }
+        }
+    }
+    return out;
+}
+
 // A CHECK predicate whose inferred type is one of these is accepted: Boolean is
 // the intended type; a wildcard (NULL / Unknown / Any) means the type could not
 // be pinned down (e.g. an unmodeled function) and is left to run time rather
@@ -619,7 +643,7 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
         columns.push_back(build_column_info(c));
     }
     return mgr.create_table(name, std::move(columns), collect_foreign_keys(d),
-                            collect_checks(d), collect_primary_key(d));
+                            collect_checks(d), collect_primary_key(d), collect_unique(d));
 }
 
 }  // namespace db25::semantic

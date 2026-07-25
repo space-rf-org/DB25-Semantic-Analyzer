@@ -714,6 +714,67 @@ void test_primary_key_constraint() {
     std::remove(path.c_str());
 }
 
+// UNIQUE is persisted as a first-class constraint (column-level and
+// table-level), a table may have several, its columns are NOT forced NOT NULL,
+// it survives a reload, and it is removed when one of its columns is dropped.
+void test_unique_constraint() {
+    auto uniques = [](const TableInfo& t) {
+        std::vector<const Constraint*> out;
+        for (const Constraint& c : t.constraints) {
+            if (c.kind == Constraint::Kind::Unique) out.push_back(&c);
+        }
+        return out;
+    };
+
+    const std::string path = scratch_path("ddl_unique.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    // Column-level UNIQUE: a single-column constraint; the column stays nullable.
+    CHECK(run(p, mgr, "CREATE TABLE t (email TEXT UNIQUE, a INTEGER)").ok);
+    {
+        const TableInfo* t = mgr.catalog().find_table("t");
+        const auto us = uniques(*t);
+        const ColumnInfo* email = t->find_column("email");
+        CHECK(us.size() == 1 && us[0]->columns.size() == 1 &&
+              us[0]->columns[0] == email->column_id);
+        CHECK(email->nullable);  // UNIQUE does not imply NOT NULL
+    }
+
+    // Multiple UNIQUEs, including a composite table-level one.
+    CHECK(run(p, mgr,
+        "CREATE TABLE t2 (a INTEGER UNIQUE, b INTEGER, c INTEGER, UNIQUE (b, c))").ok);
+    {
+        const TableInfo* t = mgr.catalog().find_table("t2");
+        const auto us = uniques(*t);
+        CHECK(us.size() == 2);
+        bool has_single = false, has_pair = false;
+        for (const Constraint* u : us) {
+            if (u->columns.size() == 1) has_single = true;
+            if (u->columns.size() == 2) has_pair = true;
+        }
+        CHECK(has_single && has_pair);
+    }
+
+    // Dropping a column of a UNIQUE removes that constraint.
+    CHECK(run(p, mgr, "ALTER TABLE t2 DROP COLUMN b").ok);
+    {
+        const auto us = uniques(*mgr.catalog().find_table("t2"));
+        // The composite UNIQUE (b, c) is gone; the single-column UNIQUE (a) stays.
+        CHECK(us.size() == 1 && us[0]->columns.size() == 1);
+    }
+
+    // Durable across reload.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        CHECK(uniques(*mgr2.catalog().find_table("t")).size() == 1);
+    }
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -738,6 +799,7 @@ int main() {
     test_alter_column_default();
     test_alter_column_not_null();
     test_primary_key_constraint();
+    test_unique_constraint();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

@@ -31,7 +31,7 @@ void check(bool cond, const char* expr, const char* file, int line) {
 
 #define CHECK(cond) check((cond), #cond, __FILE__, __LINE__)
 
-const ast::ASTNode* parse(parser::Parser& p, const std::string& sql) {
+ast::ASTNode* parse(parser::Parser& p, const std::string& sql) {
     auto r = p.parse(sql);
     return r.has_value() ? r.value() : nullptr;
 }
@@ -43,7 +43,7 @@ std::string scratch_path(const char* name) {
 }
 
 DdlResult run(parser::Parser& p, CatalogManager& mgr, const std::string& sql) {
-    const ast::ASTNode* ast = parse(p, sql);
+    ast::ASTNode* ast = parse(p, sql);
     if (ast == nullptr) return DdlResult{false, "parse failed", mgr.schema_version()};
     return execute_ddl(ast, mgr);
 }
@@ -103,7 +103,7 @@ void test_statement_validation_layer() {
 
     // Two PRIMARY KEYs -> layer-1 failure.
     std::vector<std::string> errs;
-    const ast::ASTNode* two_pk =
+    ast::ASTNode* two_pk =
         parse(p, "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY)");
     CHECK(two_pk != nullptr);
     if (two_pk) CHECK(!validate_ddl(two_pk, errs));
@@ -420,12 +420,55 @@ void test_check_default_persistence() {
     std::remove(path.c_str());
 }
 
+// Layer-1 type checking (third validation pass): a CHECK predicate must be
+// Boolean; a DEFAULT value must be assignment-compatible with its column type.
+void test_check_default_typecheck() {
+    parser::Parser p;
+    std::vector<std::string> e;
+
+    // --- CHECK must be Boolean ---
+    // A comparison is Boolean: accepted.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (age INTEGER CHECK (age >= 0))"), e));
+    // A bare Boolean column is Boolean: accepted.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (active BOOLEAN CHECK (active))"), e));
+    // A bare Integer column is not Boolean: rejected.
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "CREATE TABLE t (age INTEGER CHECK (age))"), e));
+    // A table-level arithmetic CHECK is numeric, not Boolean: rejected.
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a + b))"), e));
+
+    // --- DEFAULT must be assignment-compatible with the column ---
+    // Same category: accepted.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (a INTEGER DEFAULT 0)"), e));
+    // now() is a Timestamp; storing it into a TIMESTAMP is fine.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (ts TIMESTAMP DEFAULT now())"), e));
+    // A NULL default unifies with anything: accepted.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (a INTEGER DEFAULT NULL)"), e));
+    // Numeric<->string is a soft assignment conversion (as for an INSERT value):
+    // accepted, mirroring the analyzer's coercion model.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (a INTEGER DEFAULT '5')"), e));
+    // A Timestamp default into an INTEGER column crosses categories: rejected.
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "CREATE TABLE t (a INTEGER DEFAULT now())"), e));
+    // An Integer default into a BOOLEAN column crosses categories: rejected.
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "CREATE TABLE t (a BOOLEAN DEFAULT 0)"), e));
+}
+
 }  // namespace
 
 int main() {
     test_create_table_end_to_end();
     test_check_default_validation();
     test_check_default_persistence();
+    test_check_default_typecheck();
     test_statement_validation_layer();
     test_catalog_integrity_layer();
     test_drop_table();

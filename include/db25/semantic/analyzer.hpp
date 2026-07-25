@@ -73,6 +73,20 @@ public:
     [[nodiscard]] const std::vector<ResolvedColumn>* projection_of(
         const ASTNode* query) const;
 
+    // Infer the type of a standalone scalar expression against a caller-built
+    // scope, reusing the same type engine as query analysis. Intended for
+    // well-formedness checks that live outside a query block (e.g. a DDL CHECK
+    // predicate or a DEFAULT value type-checked against the table's own columns).
+    // Records types onto the nodes and any diagnostics into this analyzer.
+    [[nodiscard]] DataType infer_scalar(ASTNode* expr, Scope& scope);
+
+    // Whether a value of type `value` may be stored into a target of type
+    // `target` under the assignment coercion rules (identical types, a wildcard
+    // NULL/Unknown, numeric promotion, string collapse, or the soft numeric<->
+    // string conversion). Pure and stateless; emits no diagnostics. Used to
+    // type-check a DDL DEFAULT against its column, mirroring INSERT assignment.
+    [[nodiscard]] static bool assignment_compatible(DataType target, DataType value);
+
 private:
     // Analyze a statement that yields a row set: a SELECT block or a set
     // operation (UNION/INTERSECT/EXCEPT). Returns the projected columns.

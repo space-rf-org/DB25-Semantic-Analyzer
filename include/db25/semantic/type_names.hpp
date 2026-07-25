@@ -53,4 +53,30 @@ using ast::DataType;
     return DataType::Unknown;
 }
 
+// A short, human-readable name for a DataType, for diagnostics. Not a SQL type
+// token (see catalog_snapshot's type_to_token for the persisted spelling).
+[[nodiscard]] inline std::string_view data_type_name(DataType t) {
+    switch (t) {
+        case DataType::TinyInt:   return "TINYINT";
+        case DataType::SmallInt:  return "SMALLINT";
+        case DataType::Integer:   return "INTEGER";
+        case DataType::BigInt:    return "BIGINT";
+        case DataType::Decimal:   return "DECIMAL";
+        case DataType::Real:      return "REAL";
+        case DataType::Double:    return "DOUBLE";
+        case DataType::Boolean:   return "BOOLEAN";
+        case DataType::Char:      return "CHAR";
+        case DataType::VarChar:   return "VARCHAR";
+        case DataType::Text:      return "TEXT";
+        case DataType::Date:      return "DATE";
+        case DataType::Time:      return "TIME";
+        case DataType::Timestamp: return "TIMESTAMP";
+        case DataType::Interval:  return "INTERVAL";
+        case DataType::Blob:      return "BLOB";
+        case DataType::Null:      return "NULL";
+        case DataType::Any:       return "ANY";
+        default:                  return "UNKNOWN";
+    }
+}
+
 }  // namespace db25::semantic

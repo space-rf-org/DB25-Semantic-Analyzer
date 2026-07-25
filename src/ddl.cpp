@@ -50,6 +50,21 @@ struct ColFlags {
     bool has_default = false;
 };
 
+// Collect every column reference in an expression subtree (a bare column name
+// is a ColumnRef or, depending on parse context, an Identifier). ColumnRef /
+// Identifier nodes are treated as leaves; a function call keeps its name in
+// primary_text (not a child), so its arguments are still visited.
+void collect_column_refs(const ASTNode* n, std::vector<std::string>& out) {
+    if (n == nullptr) return;
+    if (n->node_type == NodeType::ColumnRef || n->node_type == NodeType::Identifier) {
+        out.emplace_back(n->primary_text);
+        return;
+    }
+    for (const ASTNode* c = n->first_child; c != nullptr; c = c->next_sibling) {
+        collect_column_refs(c, out);
+    }
+}
+
 // Collect referenced column names from a node's Identifier children.
 void collect_ref_columns(const ASTNode* n, std::vector<std::string>& out) {
     for (const ASTNode* c = n->first_child; c != nullptr; c = c->next_sibling) {
@@ -183,6 +198,50 @@ bool validate_ddl(const ASTNode* stmt, std::vector<std::string>& errors) {
     }
     if (primary_keys > 1) {
         errors.emplace_back("CREATE TABLE: multiple PRIMARY KEY definitions");
+    }
+
+    // Second pass, now that every column name is known: validate DEFAULT and
+    // CHECK expressions by reference. A DEFAULT must not reference any column;
+    // a CHECK may reference only this table's own columns.
+    auto is_pending = [&](const std::string& col) {
+        for (const std::string& s : seen) {
+            if (s == col) return true;
+        }
+        return false;
+    };
+    auto check_refs = [&](const ASTNode* expr_owner, const std::string& what) {
+        std::vector<std::string> refs;
+        collect_column_refs(expr_owner, refs);
+        for (const std::string& r : refs) {
+            if (!is_pending(r)) {
+                errors.emplace_back(what + ": unknown column '" + r + "'");
+            }
+        }
+    };
+    for (const ASTNode* c = d->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type == NodeType::ColumnDefinition) {
+            const std::string col(c->primary_text);
+            for (const ASTNode* k = c->first_child; k != nullptr; k = k->next_sibling) {
+                if (k->node_type == NodeType::DefaultClause) {
+                    // A DEFAULT may use functions/constants (now(), 0, 'x') but
+                    // must not reference a column of this table. A bareword that
+                    // does not name a column is assumed to be a function or a
+                    // special constant and is left alone.
+                    std::vector<std::string> refs;
+                    collect_column_refs(k, refs);
+                    for (const std::string& r : refs) {
+                        if (is_pending(r)) {
+                            errors.emplace_back("column '" + col +
+                                "': DEFAULT must not reference column '" + r + "'");
+                        }
+                    }
+                } else if (k->node_type == NodeType::CheckConstraint) {
+                    check_refs(k, "CHECK on column '" + col + "'");
+                }
+            }
+        } else if (c->node_type == NodeType::CheckConstraint) {
+            check_refs(c, "table CHECK");
+        }
     }
 
     return errors.empty();

@@ -33,6 +33,8 @@ constexpr std::uint16_t kFlagDropIndex = 0x20;            // DROP INDEX
 // default behavior.
 constexpr std::uint16_t kAlterActionCascade = 0x01;      // DROP COLUMN ... CASCADE
 constexpr std::uint16_t kAlterActionDropDefault = 0x04;  // ALTER COLUMN DROP DEFAULT
+constexpr std::uint16_t kAlterActionSetNotNull = 0x08;   // ALTER COLUMN SET NOT NULL
+constexpr std::uint16_t kAlterActionDropNotNull = 0x10;  // ALTER COLUMN DROP NOT NULL
 
 // Locate the single DDL statement in a (possibly wrapping) parse tree. Returns
 // a mutable node: layer-1 type checking annotates the AST with inferred types.
@@ -342,10 +344,12 @@ void validate_alter_table(ASTNode* alter, std::vector<std::string>& errors) {
         }
         const ASTNode* def = first_child_of_type(action, NodeType::DefaultClause);
         const bool drop_default = (action->semantic_flags & kAlterActionDropDefault) != 0;
-        if (def == nullptr && !drop_default) {
+        const bool set_not_null = (action->semantic_flags & kAlterActionSetNotNull) != 0;
+        const bool drop_not_null = (action->semantic_flags & kAlterActionDropNotNull) != 0;
+        if (def == nullptr && !drop_default && !set_not_null && !drop_not_null) {
             errors.emplace_back("ALTER TABLE ALTER COLUMN '" +
                                 std::string(name->primary_text) +
-                                "': only SET DEFAULT and DROP DEFAULT are supported");
+                                "': only SET/DROP DEFAULT and SET/DROP NOT NULL are supported");
         }
         // The DEFAULT value is type-checked against the column's existing type in
         // execute_ddl (that needs the catalog); here we only require its presence.
@@ -539,6 +543,12 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
         if (action->primary_text == "ALTER") {
             const ASTNode* name = first_child_of_type(action, NodeType::Identifier);
             const std::string col(name->primary_text);
+            if ((action->semantic_flags & kAlterActionSetNotNull) != 0) {
+                return mgr.set_column_nullable(table, col, /*nullable=*/false);
+            }
+            if ((action->semantic_flags & kAlterActionDropNotNull) != 0) {
+                return mgr.set_column_nullable(table, col, /*nullable=*/true);
+            }
             if ((action->semantic_flags & kAlterActionDropDefault) != 0) {
                 return mgr.drop_column_default(table, col);
             }

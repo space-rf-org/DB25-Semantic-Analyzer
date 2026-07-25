@@ -151,6 +151,74 @@ void test_drop_table() {
     std::remove(path.c_str());
 }
 
+void test_create_index_end_to_end() {
+    const std::string path = scratch_path("ddl_index.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    CHECK(run(p, mgr, "CREATE TABLE users (id INTEGER, name VARCHAR)").ok);  // v1
+    const DdlResult r = run(p, mgr, "CREATE UNIQUE INDEX uq_name ON users (name)");
+    CHECK(r.ok);
+    CHECK(r.schema_version == 2);
+    const IndexInfo* idx = mgr.catalog().find_index("uq_name");
+    CHECK(idx != nullptr);
+    if (idx != nullptr) {
+        CHECK(idx->table == "users");
+        CHECK(idx->unique);
+        CHECK(idx->columns.size() == 1);
+        // Resolved to the name column's id.
+        const TableInfo* t = mgr.catalog().find_table("users");
+        CHECK(t != nullptr && idx->columns[0] == t->find_column("name")->column_id);
+    }
+    // Durable across restart.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        CHECK(mgr2.catalog().find_index("uq_name") != nullptr);
+        CHECK(mgr2.schema_version() == 2);
+    }
+    std::remove(path.c_str());
+}
+
+void test_create_index_integrity() {
+    const std::string path = scratch_path("ddl_index_integ.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+    CHECK(run(p, mgr, "CREATE TABLE users (id INTEGER)").ok);       // v1
+    CHECK(run(p, mgr, "CREATE INDEX i1 ON users (id)").ok);          // v2
+
+    // Missing target table -> layer-2 failure.
+    CHECK(!run(p, mgr, "CREATE INDEX i2 ON nosuch (id)").ok);
+    // Unknown column -> layer-2 failure.
+    CHECK(!run(p, mgr, "CREATE INDEX i3 ON users (nope)").ok);
+    // Duplicate index name -> layer-2 failure; IF NOT EXISTS is a no-op.
+    CHECK(!run(p, mgr, "CREATE INDEX i1 ON users (id)").ok);
+    CHECK(run(p, mgr, "CREATE INDEX IF NOT EXISTS i1 ON users (id)").ok);
+    CHECK(mgr.schema_version() == 2);  // none of the above bumped the version
+    std::remove(path.c_str());
+}
+
+void test_drop_index() {
+    const std::string path = scratch_path("ddl_dropidx.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+    CHECK(run(p, mgr, "CREATE TABLE users (id INTEGER)").ok);   // v1
+    CHECK(run(p, mgr, "CREATE INDEX i1 ON users (id)").ok);      // v2
+    const DdlResult d = run(p, mgr, "DROP INDEX i1");
+    CHECK(d.ok);
+    CHECK(d.schema_version == 3);
+    CHECK(mgr.catalog().find_index("i1") == nullptr);
+    CHECK(!run(p, mgr, "DROP INDEX i1").ok);                     // missing -> error
+    CHECK(run(p, mgr, "DROP INDEX IF EXISTS i1").ok);            // no-op success
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -158,6 +226,9 @@ int main() {
     test_statement_validation_layer();
     test_catalog_integrity_layer();
     test_drop_table();
+    test_create_index_end_to_end();
+    test_create_index_integrity();
+    test_drop_index();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

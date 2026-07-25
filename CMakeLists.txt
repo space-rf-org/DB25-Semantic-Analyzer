@@ -34,4 +34,8 @@ if(BUILD_TESTS)
     add_executable(catalog_snapshot_tests tests/test_catalog_snapshot.cpp)
     target_link_libraries(catalog_snapshot_tests PRIVATE db25semantic DB25::db25parser)
     add_test(NAME catalog_snapshot_tests COMMAND catalog_snapshot_tests)
+
+    add_executable(catalog_manager_tests tests/test_catalog_manager.cpp)
+    target_link_libraries(catalog_manager_tests PRIVATE db25semantic DB25::db25parser)
+    add_test(NAME catalog_manager_tests COMMAND catalog_manager_tests)
 endif()

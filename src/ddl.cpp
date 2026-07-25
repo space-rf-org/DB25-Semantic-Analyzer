@@ -31,7 +31,8 @@ constexpr std::uint16_t kFlagDropIndex = 0x20;            // DROP INDEX
 // AlterTableAction node. When unset the drop is RESTRICT (the default); the
 // parser's separate RESTRICT bit (0x02) needs no handling since it is the
 // default behavior.
-constexpr std::uint16_t kAlterActionCascade = 0x01;   // DROP COLUMN ... CASCADE
+constexpr std::uint16_t kAlterActionCascade = 0x01;      // DROP COLUMN ... CASCADE
+constexpr std::uint16_t kAlterActionDropDefault = 0x04;  // ALTER COLUMN DROP DEFAULT
 
 // Locate the single DDL statement in a (possibly wrapping) parse tree. Returns
 // a mutable node: layer-1 type checking annotates the AST with inferred types.
@@ -330,9 +331,33 @@ void validate_alter_table(ASTNode* alter, std::vector<std::string>& errors) {
         if (name == nullptr || name->primary_text.empty()) {
             errors.emplace_back("ALTER TABLE DROP COLUMN: missing column name");
         }
+    } else if (verb == "ALTER") {
+        // ALTER COLUMN <c> SET DEFAULT <expr> | DROP DEFAULT. Only the DEFAULT
+        // alterations are supported; SET/DROP of other properties (TYPE, NOT
+        // NULL, RENAME) are refused rather than silently ignored.
+        const ASTNode* name = first_child_of_type(action, NodeType::Identifier);
+        if (name == nullptr || name->primary_text.empty()) {
+            errors.emplace_back("ALTER TABLE ALTER COLUMN: missing column name");
+            return;
+        }
+        const ASTNode* def = first_child_of_type(action, NodeType::DefaultClause);
+        const bool drop_default = (action->semantic_flags & kAlterActionDropDefault) != 0;
+        if (def == nullptr && !drop_default) {
+            errors.emplace_back("ALTER TABLE ALTER COLUMN '" +
+                                std::string(name->primary_text) +
+                                "': only SET DEFAULT and DROP DEFAULT are supported");
+        }
+        // The DEFAULT value is type-checked against the column's existing type in
+        // execute_ddl (that needs the catalog); here we only require its presence.
+        if (def != nullptr && def->first_child == nullptr) {
+            errors.emplace_back("ALTER TABLE ALTER COLUMN '" +
+                                std::string(name->primary_text) +
+                                "': SET DEFAULT is missing an expression");
+        }
     } else {
         errors.emplace_back(
-            "ALTER TABLE: only ADD COLUMN and DROP COLUMN are supported");
+            "ALTER TABLE: only ADD COLUMN, DROP COLUMN and ALTER COLUMN "
+            "SET/DROP DEFAULT are supported");
     }
 }
 
@@ -510,6 +535,34 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
         if (action->primary_text == "ADD") {
             const ASTNode* col = first_child_of_type(action, NodeType::ColumnDefinition);
             return mgr.add_column(table, build_column_info(col));
+        }
+        if (action->primary_text == "ALTER") {
+            const ASTNode* name = first_child_of_type(action, NodeType::Identifier);
+            const std::string col(name->primary_text);
+            if ((action->semantic_flags & kAlterActionDropDefault) != 0) {
+                return mgr.drop_column_default(table, col);
+            }
+            // SET DEFAULT: type-check the new value against the column's EXISTING
+            // type (in the catalog, so this cannot be a pure layer-1 check). The
+            // default may not reference columns, so an empty scope is correct.
+            const ASTNode* def = first_child_of_type(action, NodeType::DefaultClause);
+            const TableInfo* t = mgr.catalog().find_table(table);
+            const ColumnInfo* ci = (t != nullptr) ? t->find_column(col) : nullptr;
+            if (ci != nullptr && def->first_child != nullptr) {
+                Scope scope;
+                InMemoryCatalog empty;
+                Analyzer analyzer(empty);
+                const DataType vt = analyzer.infer_scalar(def->first_child, scope);
+                if (!Analyzer::assignment_compatible(ci->type, vt)) {
+                    return DdlResult{false,
+                        "ALTER TABLE " + table + " ALTER COLUMN '" + col +
+                        "': DEFAULT value of type " + std::string(data_type_name(vt)) +
+                        " is not compatible with column type " +
+                        std::string(data_type_name(ci->type)),
+                        mgr.schema_version()};
+                }
+            }
+            return mgr.set_column_default(table, col, std::string(def->primary_text));
         }
         // DROP COLUMN. Neither flag set => RESTRICT (the default).
         const ASTNode* name = first_child_of_type(action, NodeType::Identifier);

@@ -567,6 +567,56 @@ void test_alter_validation() {
     CHECK(validate_ddl(parse(p, "ALTER TABLE t ADD COLUMN a INTEGER NOT NULL DEFAULT 0"), e));
 }
 
+// ALTER TABLE ALTER COLUMN SET / DROP DEFAULT: sets, replaces, type-checks, and
+// clears a column's default; durable across reload.
+void test_alter_column_default() {
+    const std::string path = scratch_path("ddl_alter_coldef.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    CHECK(run(p, mgr, "CREATE TABLE t (a INTEGER, ts TIMESTAMP)").ok);
+
+    // SET DEFAULT on a column that had none: text is captured and persisted.
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN a SET DEFAULT 7").ok);
+    {
+        const ColumnInfo* a = mgr.catalog().find_table("t")->find_column("a");
+        CHECK(a != nullptr && a->has_default && a->default_expr == "7");
+    }
+    // Replace it.
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN a SET DEFAULT 9").ok);
+    CHECK(mgr.catalog().find_table("t")->find_column("a")->default_expr == "9");
+
+    // A type-incompatible default is rejected (Timestamp value into INTEGER).
+    CHECK(!run(p, mgr, "ALTER TABLE t ALTER COLUMN a SET DEFAULT now()").ok);
+    CHECK(mgr.catalog().find_table("t")->find_column("a")->default_expr == "9");  // unchanged
+    // A compatible default on the TIMESTAMP column is accepted.
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN ts SET DEFAULT now()").ok);
+    CHECK(mgr.catalog().find_table("t")->find_column("ts")->default_expr == "now()");
+
+    // DROP DEFAULT clears it; dropping again is a no-op success.
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN a DROP DEFAULT").ok);
+    {
+        const ColumnInfo* a = mgr.catalog().find_table("t")->find_column("a");
+        CHECK(a != nullptr && !a->has_default && a->default_expr.empty());
+    }
+    CHECK(run(p, mgr, "ALTER TABLE t ALTER COLUMN a DROP DEFAULT").ok);  // no-op
+
+    // Missing table / column are rejected.
+    CHECK(!run(p, mgr, "ALTER TABLE nope ALTER COLUMN a SET DEFAULT 1").ok);
+    CHECK(!run(p, mgr, "ALTER TABLE t ALTER COLUMN ghost DROP DEFAULT").ok);
+
+    // Durable across reload.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        const ColumnInfo* ts = mgr2.catalog().find_table("t")->find_column("ts");
+        CHECK(ts != nullptr && ts->has_default && ts->default_expr == "now()");
+    }
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -588,6 +638,7 @@ int main() {
     test_alter_add_column();
     test_alter_drop_column();
     test_alter_validation();
+    test_alter_column_default();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

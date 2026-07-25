@@ -332,6 +332,64 @@ public:
         return commit(std::move(next));
     }
 
+    // ALTER TABLE ALTER COLUMN SET DEFAULT. Sets (or replaces) the column's
+    // default expression text. The table and column must exist. Type-checking
+    // the expression against the column type is done by the caller (the analyzer,
+    // which owns the type engine) before this commit.
+    [[nodiscard]] DdlResult set_column_default(const std::string& table,
+                                               const std::string& col,
+                                               const std::string& expr_text) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) {
+            return fail("ALTER TABLE " + table + ": no such table");
+        }
+        if (t->find_column(col) == nullptr) {
+            return fail("ALTER TABLE " + table + ": no such column '" + col + "'");
+        }
+        InMemoryCatalog next = catalog_;  // copy
+        TableInfo copy = *next.find_table(table);
+        for (ColumnInfo& c : copy.columns) {
+            if (c.name == col) {
+                c.has_default = true;
+                c.default_expr = expr_text;
+                break;
+            }
+        }
+        next.restore_table(std::move(copy));
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
+    // ALTER TABLE ALTER COLUMN DROP DEFAULT. Clears the column's default. The
+    // table and column must exist; dropping a default when there is none is a
+    // no-op success (PostgreSQL does not error), and does not bump the version.
+    [[nodiscard]] DdlResult drop_column_default(const std::string& table,
+                                                const std::string& col) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) {
+            return fail("ALTER TABLE " + table + ": no such table");
+        }
+        const ColumnInfo* c = t->find_column(col);
+        if (c == nullptr) {
+            return fail("ALTER TABLE " + table + ": no such column '" + col + "'");
+        }
+        if (!c->has_default) {
+            return DdlResult{true, {}, catalog_.schema_version()};  // no-op
+        }
+        InMemoryCatalog next = catalog_;  // copy
+        TableInfo copy = *next.find_table(table);
+        for (ColumnInfo& cc : copy.columns) {
+            if (cc.name == col) {
+                cc.has_default = false;
+                cc.default_expr.clear();
+                break;
+            }
+        }
+        next.restore_table(std::move(copy));
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
 private:
     DdlResult fail(std::string msg) const {
         return DdlResult{false, std::move(msg), catalog_.schema_version()};

@@ -1763,6 +1763,49 @@ void test_insert_not_null_violation() {
     CHECK(count_code(a, DiagnosticCode::InsertArityMismatch) == 0);
 }
 
+void test_insert_explicit_null_into_not_null() {
+    std::printf("test_insert_explicit_null_into_not_null\n");
+    auto cat = make_catalog();  // id INTEGER NOT NULL
+    parser::Parser p;
+    // An explicit NULL into a NOT NULL column is a violation even though the
+    // column IS listed (covered) - the default does not apply to an explicit value.
+    auto res = p.parse("INSERT INTO users (id, name) VALUES (NULL, 'a')");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NotNullViolation) == 1);
+
+    // A NULL into a nullable column is fine.
+    auto ok = p.parse("INSERT INTO users (id, name) VALUES (1, NULL)");
+    CHECK(ok.has_value());
+    if (!ok) return;
+    Analyzer a2(cat);
+    a2.analyze(ok.value());
+    CHECK(count_code(a2, DiagnosticCode::NotNullViolation) == 0);
+}
+
+void test_update_explicit_null_into_not_null() {
+    std::printf("test_update_explicit_null_into_not_null\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // SET a NOT NULL column to an explicit NULL -> violation.
+    auto res = p.parse("UPDATE users SET id = NULL");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NotNullViolation) == 1);
+
+    // SET a nullable column to NULL is fine.
+    auto ok = p.parse("UPDATE users SET name = NULL");
+    CHECK(ok.has_value());
+    if (!ok) return;
+    Analyzer a2(cat);
+    a2.analyze(ok.value());
+    CHECK(count_code(a2, DiagnosticCode::NotNullViolation) == 0);
+}
+
 void test_insert_not_null_with_default_ok() {
     std::printf("test_insert_not_null_with_default_ok\n");
     // id is NOT NULL but has a default, so omitting it is fine.
@@ -2846,9 +2889,11 @@ int main() {
     test_insert_distinct_columns_not_flagged();
     test_insert_not_null_violation();
     test_insert_not_null_with_default_ok();
+    test_insert_explicit_null_into_not_null();
 
     // DML: UPDATE
     test_update_clean();
+    test_update_explicit_null_into_not_null();
     test_update_unknown_column();
     test_update_type_diagnostic();
     test_update_where();

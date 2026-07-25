@@ -18,6 +18,8 @@
 #include "db25/semantic/catalog.hpp"
 #include "db25/semantic/catalog_snapshot.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <utility>
@@ -231,6 +233,101 @@ public:
         }
         InMemoryCatalog next = catalog_;  // copy
         next.remove_index(name);
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
+    // ALTER TABLE ADD COLUMN. The table must exist and the column name must be
+    // new; the column is appended with a fresh column_id (ids are never reused,
+    // so existing constraints/indexes that key on other columns stay valid).
+    [[nodiscard]] DdlResult add_column(const std::string& table, ColumnInfo column) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) {
+            return fail("ALTER TABLE " + table + ": no such table");
+        }
+        if (t->find_column(column.name) != nullptr) {
+            return fail("ALTER TABLE " + table + ": column '" + column.name +
+                        "' already exists");
+        }
+        InMemoryCatalog next = catalog_;  // copy
+        TableInfo copy = *next.find_table(table);
+        std::uint32_t max_id = 0;
+        for (const ColumnInfo& c : copy.columns) {
+            max_id = std::max(max_id, c.column_id);
+        }
+        column.column_id = max_id + 1;
+        copy.columns.push_back(std::move(column));
+        next.restore_table(std::move(copy));
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
+    // ALTER TABLE DROP COLUMN. Follows PostgreSQL: the column's OWN indexes and
+    // table constraints that involve it are dropped automatically; an EXTERNAL
+    // foreign key in another table that references the column requires CASCADE
+    // (RESTRICT, the default, refuses). A table's last remaining column cannot be
+    // dropped. With `if_exists`, dropping a missing column is a no-op success.
+    [[nodiscard]] DdlResult drop_column(const std::string& table, const std::string& col,
+                                        bool if_exists = false, bool cascade = false) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) {
+            return fail("ALTER TABLE " + table + ": no such table");
+        }
+        const ColumnInfo* target = t->find_column(col);
+        if (target == nullptr) {
+            if (if_exists) {
+                return DdlResult{true, {}, catalog_.schema_version()};
+            }
+            return fail("ALTER TABLE " + table + ": no such column '" + col + "'");
+        }
+        if (t->columns.size() == 1) {
+            return fail("ALTER TABLE " + table + ": cannot drop the only column '" + col +
+                        "'");
+        }
+        const std::uint32_t cid = target->column_id;
+
+        // External dependents: a foreign key in another table referencing this
+        // column. RESTRICT refuses; CASCADE drops those foreign keys below.
+        if (!cascade) {
+            for (const TableInfo* other : catalog_.tables()) {
+                if (other->name == table) continue;
+                for (const Constraint& c : other->constraints) {
+                    if (c.kind != Constraint::Kind::ForeignKey || c.ref_table != table) {
+                        continue;
+                    }
+                    if (std::find(c.ref_columns.begin(), c.ref_columns.end(), cid) !=
+                        c.ref_columns.end()) {
+                        return fail("cannot drop column '" + col + "' of '" + table +
+                                    "': foreign key in '" + other->name +
+                                    "' references it (use CASCADE)");
+                    }
+                }
+            }
+        }
+
+        InMemoryCatalog next = catalog_;  // copy
+        if (cascade) {
+            next.drop_foreign_keys_referencing_column(table, cid);  // external FKs
+        }
+        next.drop_indexes_on_column(table, cid);  // the column's own indexes
+
+        // Remove the column and any of this table's own constraints that involve
+        // it (a composite PK / UNIQUE / FK-source / CHECK loses meaning when one
+        // of its columns is gone, so it is dropped whole).
+        TableInfo copy = *next.find_table(table);
+        auto& cs = copy.constraints;
+        cs.erase(std::remove_if(cs.begin(), cs.end(),
+                     [cid](const Constraint& c) {
+                         return std::find(c.columns.begin(), c.columns.end(), cid) !=
+                                c.columns.end();
+                     }),
+                 cs.end());
+        auto& cols = copy.columns;
+        cols.erase(std::remove_if(cols.begin(), cols.end(),
+                       [&col](const ColumnInfo& c) { return c.name == col; }),
+                   cols.end());
+        next.restore_table(std::move(copy));
+
         next.set_schema_version(catalog_.schema_version() + 1);
         return commit(std::move(next));
     }

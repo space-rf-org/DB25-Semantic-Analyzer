@@ -201,6 +201,47 @@ public:
         return removed;
     }
 
+    // Remove every secondary index on `table` that includes column `cid`. Used
+    // by ALTER TABLE DROP COLUMN: a column's own indexes go with it.
+    std::size_t drop_indexes_on_column(std::string_view table, std::uint32_t cid) {
+        std::size_t removed = 0;
+        for (auto it = indexes_.begin(); it != indexes_.end();) {
+            const auto& cols = it->second.columns;
+            if (it->second.table == table &&
+                std::find(cols.begin(), cols.end(), cid) != cols.end()) {
+                it = indexes_.erase(it);
+                ++removed;
+            } else {
+                ++it;
+            }
+        }
+        return removed;
+    }
+
+    // Remove every foreign key in any OTHER table that references column `cid` of
+    // `ref_table`. Used by ALTER TABLE DROP COLUMN CASCADE (an external reference
+    // to the dropped column). A composite FK any of whose referenced columns is
+    // the dropped column is removed whole, since it can no longer be satisfied.
+    std::size_t drop_foreign_keys_referencing_column(std::string_view ref_table,
+                                                     std::uint32_t cid) {
+        std::size_t removed = 0;
+        for (auto& [_, t] : tables_) {
+            if (t.name == ref_table) continue;
+            auto& cs = t.constraints;
+            const std::size_t before = cs.size();
+            cs.erase(std::remove_if(cs.begin(), cs.end(),
+                         [&](const Constraint& c) {
+                             return c.kind == Constraint::Kind::ForeignKey &&
+                                    c.ref_table == ref_table &&
+                                    std::find(c.ref_columns.begin(), c.ref_columns.end(),
+                                              cid) != c.ref_columns.end();
+                         }),
+                     cs.end());
+            removed += before - cs.size();
+        }
+        return removed;
+    }
+
     // Every index, ordered by index_id for a deterministic enumeration.
     [[nodiscard]] std::vector<const IndexInfo*> indexes() const {
         std::vector<const IndexInfo*> out;

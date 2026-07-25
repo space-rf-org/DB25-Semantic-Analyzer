@@ -27,12 +27,19 @@ constexpr std::uint16_t kFlagCascade = 0x04;              // DROP ... CASCADE
 constexpr std::uint16_t kFlagDropTable = 0x10;            // DROP TABLE
 constexpr std::uint16_t kFlagDropIndex = 0x20;            // DROP INDEX
 
+// ALTER TABLE DROP COLUMN CASCADE flag, set by the parser on the
+// AlterTableAction node. When unset the drop is RESTRICT (the default); the
+// parser's separate RESTRICT bit (0x02) needs no handling since it is the
+// default behavior.
+constexpr std::uint16_t kAlterActionCascade = 0x01;   // DROP COLUMN ... CASCADE
+
 // Locate the single DDL statement in a (possibly wrapping) parse tree. Returns
 // a mutable node: layer-1 type checking annotates the AST with inferred types.
 ASTNode* find_ddl(ASTNode* n) {
     if (n == nullptr) return nullptr;
     if (n->node_type == NodeType::CreateTableStmt ||
         n->node_type == NodeType::CreateIndexStmt ||
+        n->node_type == NodeType::AlterTableStmt ||
         n->node_type == NodeType::DropStmt) {
         return n;
     }
@@ -132,6 +139,23 @@ ColFlags column_flags(const ASTNode* coldef) {
         }
     }
     return f;
+}
+
+// Build the catalog ColumnInfo for a ColumnDefinition node: name, resolved type,
+// nullability (PRIMARY KEY implies NOT NULL), and any DEFAULT text. The
+// column_id is left 0 here; the catalog assigns it at commit. Shared by CREATE
+// TABLE and ALTER TABLE ADD COLUMN.
+ColumnInfo build_column_info(const ASTNode* coldef) {
+    ColumnInfo ci;
+    ci.name = std::string(coldef->primary_text);
+    const ASTNode* type_node = first_child_of_type(coldef, NodeType::DataTypeNode);
+    ci.type = (type_node != nullptr) ? data_type_from_name(type_node->primary_text)
+                                     : DataType::Unknown;
+    ColFlags f = column_flags(coldef);
+    ci.nullable = !(f.not_null || f.primary_key);
+    ci.has_default = f.has_default;
+    ci.default_expr = std::move(f.default_expr);
+    return ci;
 }
 
 // Extract every CHECK constraint (column-level and table-level) from a CREATE
@@ -234,6 +258,84 @@ void typecheck_create_table(ASTNode* create, std::vector<std::string>& errors) {
     }
 }
 
+// The single AlterTableAction child of an ALTER TABLE statement (the parser
+// emits exactly one), or nullptr if absent.
+const ASTNode* alter_action(const ASTNode* alter) {
+    return first_child_of_type(alter, NodeType::AlterTableAction);
+}
+
+// Layer-1 well-formedness for ALTER TABLE. Only ADD COLUMN and DROP COLUMN are
+// supported; each must name a target, an added column's type must resolve, and
+// a column-level constraint other than NOT NULL / DEFAULT on an added column is
+// rejected explicitly (rather than silently dropped) - those arrive via ALTER
+// in a later change. An added column's DEFAULT is type-checked against the
+// column's own declared type (a DEFAULT may not reference other columns).
+void validate_alter_table(ASTNode* alter, std::vector<std::string>& errors) {
+    if (alter->primary_text.empty()) {
+        errors.emplace_back("ALTER TABLE: missing table name");
+    }
+    const ASTNode* action = alter_action(alter);
+    if (action == nullptr) {
+        errors.emplace_back("ALTER TABLE: missing action");
+        return;
+    }
+    const std::string_view verb = action->primary_text;
+    if (verb == "ADD") {
+        const ASTNode* col = first_child_of_type(action, NodeType::ColumnDefinition);
+        if (col == nullptr || col->primary_text.empty()) {
+            errors.emplace_back("ALTER TABLE ADD COLUMN: missing column definition");
+            return;
+        }
+        const ASTNode* type_node = first_child_of_type(col, NodeType::DataTypeNode);
+        if (type_node == nullptr ||
+            data_type_from_name(type_node->primary_text) == DataType::Unknown) {
+            errors.emplace_back("ALTER TABLE ADD COLUMN '" + std::string(col->primary_text) +
+                                "': unknown or missing type");
+        }
+        // Only NOT NULL / DEFAULT are supported inline; anything else (PRIMARY
+        // KEY, UNIQUE, CHECK, REFERENCES) is refused rather than silently lost.
+        for (const ASTNode* k = col->first_child; k != nullptr; k = k->next_sibling) {
+            const bool ok = k->node_type == NodeType::DataTypeNode ||
+                            k->node_type == NodeType::DefaultClause ||
+                            (k->node_type == NodeType::ColumnConstraint &&
+                             k->primary_text == "NOT_NULL");
+            if (!ok) {
+                errors.emplace_back("ALTER TABLE ADD COLUMN '" +
+                                    std::string(col->primary_text) +
+                                    "': only NOT NULL and DEFAULT are supported here");
+                break;
+            }
+        }
+        // Type-check the DEFAULT against the added column's own type. The value
+        // may not reference table columns, so an empty scope is correct.
+        if (errors.empty()) {
+            const ASTNode* def = first_child_of_type(col, NodeType::DefaultClause);
+            if (def != nullptr && def->first_child != nullptr) {
+                const DataType col_type = data_type_from_name(type_node->primary_text);
+                Scope scope;
+                InMemoryCatalog empty;
+                Analyzer analyzer(empty);
+                const DataType t = analyzer.infer_scalar(def->first_child, scope);
+                if (!Analyzer::assignment_compatible(col_type, t)) {
+                    errors.emplace_back("ALTER TABLE ADD COLUMN '" +
+                        std::string(col->primary_text) + "': DEFAULT value of type " +
+                        std::string(data_type_name(t)) +
+                        " is not compatible with column type " +
+                        std::string(data_type_name(col_type)));
+                }
+            }
+        }
+    } else if (verb == "DROP") {
+        const ASTNode* name = first_child_of_type(action, NodeType::Identifier);
+        if (name == nullptr || name->primary_text.empty()) {
+            errors.emplace_back("ALTER TABLE DROP COLUMN: missing column name");
+        }
+    } else {
+        errors.emplace_back(
+            "ALTER TABLE: only ADD COLUMN and DROP COLUMN are supported");
+    }
+}
+
 }  // namespace
 
 bool validate_ddl(ASTNode* stmt, std::vector<std::string>& errors) {
@@ -263,6 +365,11 @@ bool validate_ddl(ASTNode* stmt, std::vector<std::string>& errors) {
             if (c->node_type == NodeType::Identifier) ++cols;
         }
         if (cols == 0) errors.emplace_back("CREATE INDEX: no columns");
+        return errors.empty();
+    }
+
+    if (d->node_type == NodeType::AlterTableStmt) {
+        validate_alter_table(d, errors);
         return errors.empty();
     }
 
@@ -397,6 +504,20 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
                                 cols, unique, if_not_exists);
     }
 
+    if (d->node_type == NodeType::AlterTableStmt) {
+        const std::string table(d->primary_text);
+        const ASTNode* action = alter_action(d);  // validated non-null above
+        if (action->primary_text == "ADD") {
+            const ASTNode* col = first_child_of_type(action, NodeType::ColumnDefinition);
+            return mgr.add_column(table, build_column_info(col));
+        }
+        // DROP COLUMN. Neither flag set => RESTRICT (the default).
+        const ASTNode* name = first_child_of_type(action, NodeType::Identifier);
+        const bool cascade = (action->semantic_flags & kAlterActionCascade) != 0;
+        return mgr.drop_column(table, std::string(name->primary_text),
+                               /*if_exists=*/false, cascade);
+    }
+
     // CREATE TABLE.
     const std::string name(d->primary_text);
     const bool if_not_exists = (d->semantic_flags & kFlagIfExistsOrNotExists) != 0;
@@ -407,16 +528,7 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
     std::vector<ColumnInfo> columns;
     for (const ASTNode* c = d->first_child; c != nullptr; c = c->next_sibling) {
         if (c->node_type != NodeType::ColumnDefinition) continue;
-        ColumnInfo ci;
-        ci.name = std::string(c->primary_text);
-        const ASTNode* type_node = first_child_of_type(c, NodeType::DataTypeNode);
-        ci.type = (type_node != nullptr) ? data_type_from_name(type_node->primary_text)
-                                         : DataType::Unknown;
-        ColFlags f = column_flags(c);
-        ci.nullable = !(f.not_null || f.primary_key);  // PRIMARY KEY implies NOT NULL
-        ci.has_default = f.has_default;
-        ci.default_expr = std::move(f.default_expr);
-        columns.push_back(std::move(ci));
+        columns.push_back(build_column_info(c));
     }
     return mgr.create_table(name, std::move(columns), collect_foreign_keys(d),
                             collect_checks(d));

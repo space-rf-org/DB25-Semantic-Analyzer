@@ -88,6 +88,26 @@ void collect_ref_columns(const ASTNode* n, std::vector<std::string>& out) {
     }
 }
 
+// Build a by-name foreign-key spec from a table-level ForeignKeyConstraint node:
+// its Identifier children are the local columns; a ReferencesClause child names
+// the referenced table and columns.
+CatalogManager::ForeignKeySpec fk_spec_from_node(const ASTNode* fk_node) {
+    CatalogManager::ForeignKeySpec fk;
+    const ASTNode* ref = nullptr;
+    for (const ASTNode* ch = fk_node->first_child; ch != nullptr; ch = ch->next_sibling) {
+        if (ch->node_type == NodeType::ReferencesClause) {
+            ref = ch;
+        } else if (ch->node_type == NodeType::Identifier) {
+            fk.columns.emplace_back(ch->primary_text);
+        }
+    }
+    if (ref != nullptr) {
+        fk.ref_table = std::string(ref->primary_text);
+        collect_ref_columns(ref, fk.ref_columns);
+    }
+    return fk;
+}
+
 // Extract every foreign key (column-level and table-level) from a CREATE TABLE
 // node into by-name specs the catalog manager resolves at commit.
 std::vector<CatalogManager::ForeignKeySpec> collect_foreign_keys(const ASTNode* create_stmt) {
@@ -105,22 +125,7 @@ std::vector<CatalogManager::ForeignKeySpec> collect_foreign_keys(const ASTNode* 
                 out.push_back(std::move(fk));
             }
         } else if (c->node_type == NodeType::ForeignKeyConstraint) {
-            // Table-level FK: local columns are the Identifier children; the
-            // ReferencesClause child carries the referenced table + columns.
-            CatalogManager::ForeignKeySpec fk;
-            const ASTNode* ref = nullptr;
-            for (const ASTNode* ch = c->first_child; ch != nullptr; ch = ch->next_sibling) {
-                if (ch->node_type == NodeType::ReferencesClause) {
-                    ref = ch;
-                } else if (ch->node_type == NodeType::Identifier) {
-                    fk.columns.emplace_back(ch->primary_text);
-                }
-            }
-            if (ref != nullptr) {
-                fk.ref_table = std::string(ref->primary_text);
-                collect_ref_columns(ref, fk.ref_columns);
-            }
-            out.push_back(std::move(fk));
+            out.push_back(fk_spec_from_node(c));  // table-level FK
         }
     }
     return out;
@@ -334,7 +339,23 @@ void validate_alter_table(ASTNode* alter, std::vector<std::string>& errors) {
     const std::string_view verb = action->primary_text;
     if (verb == "ADD") {
         const ASTNode* col = first_child_of_type(action, NodeType::ColumnDefinition);
-        if (col == nullptr || col->primary_text.empty()) {
+        if (col == nullptr) {
+            // ADD <table-level constraint>. Structure only here; column existence
+            // (and, for CHECK, the expression's type) is catalog-dependent and is
+            // validated in execute_ddl.
+            const ASTNode* k = action->first_child;
+            const bool is_constraint =
+                k != nullptr && (k->node_type == NodeType::PrimaryKeyConstraint ||
+                                 k->node_type == NodeType::UniqueConstraint ||
+                                 k->node_type == NodeType::CheckConstraint ||
+                                 k->node_type == NodeType::ForeignKeyConstraint);
+            if (!is_constraint) {
+                errors.emplace_back("ALTER TABLE ADD: expected a column definition or a "
+                                    "table constraint");
+            }
+            return;
+        }
+        if (col->primary_text.empty()) {
             errors.emplace_back("ALTER TABLE ADD COLUMN: missing column definition");
             return;
         }
@@ -587,7 +608,74 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
         const ASTNode* action = alter_action(d);  // validated non-null above
         if (action->primary_text == "ADD") {
             const ASTNode* col = first_child_of_type(action, NodeType::ColumnDefinition);
-            return mgr.add_column(table, build_column_info(col));
+            if (col != nullptr) {
+                return mgr.add_column(table, build_column_info(col));
+            }
+            // ADD <table-level constraint>: dispatch on the constraint node kind,
+            // reusing the same by-name collection as CREATE TABLE.
+            const ASTNode* k = action->first_child;
+            switch (k->node_type) {
+                case NodeType::PrimaryKeyConstraint: {
+                    std::vector<std::string> cols;
+                    for (const ASTNode* id = k->first_child; id != nullptr;
+                         id = id->next_sibling) {
+                        if (id->node_type == NodeType::Identifier) {
+                            cols.emplace_back(id->primary_text);
+                        }
+                    }
+                    return mgr.add_primary_key(table, cols);
+                }
+                case NodeType::UniqueConstraint: {
+                    std::vector<std::string> cols;
+                    for (const ASTNode* id = k->first_child; id != nullptr;
+                         id = id->next_sibling) {
+                        if (id->node_type == NodeType::Identifier) {
+                            cols.emplace_back(id->primary_text);
+                        }
+                    }
+                    return mgr.add_unique(table, cols);
+                }
+                case NodeType::CheckConstraint: {
+                    // Type-check the predicate against the existing table's columns
+                    // (Boolean, references resolvable) before committing it.
+                    const TableInfo* t = mgr.catalog().find_table(table);
+                    if (t == nullptr) {
+                        return DdlResult{false, "ALTER TABLE " + table + ": no such table",
+                                         mgr.schema_version()};
+                    }
+                    std::vector<std::string> refs;
+                    collect_column_refs(k, refs);
+                    Scope scope;
+                    RelationBinding rel;
+                    rel.name = table;
+                    for (const ColumnInfo& ci : t->columns) {
+                        ResolvedColumn rc;
+                        rc.name = ci.name;
+                        rc.type = ci.type;
+                        rc.column_id = ci.column_id;
+                        rel.columns.push_back(std::move(rc));
+                    }
+                    scope.add_relation(std::move(rel));
+                    InMemoryCatalog empty;
+                    Analyzer analyzer(empty);
+                    if (k->first_child != nullptr) {
+                        const DataType bt = analyzer.infer_scalar(k->first_child, scope);
+                        if (!(bt == DataType::Boolean || bt == DataType::Null ||
+                              bt == DataType::Unknown || bt == DataType::Any)) {
+                            return DdlResult{false,
+                                "ALTER TABLE " + table + " ADD CHECK: expression must be "
+                                "Boolean, not " + std::string(data_type_name(bt)),
+                                mgr.schema_version()};
+                        }
+                    }
+                    return mgr.add_check(table, std::string(k->primary_text), refs);
+                }
+                case NodeType::ForeignKeyConstraint:
+                    return mgr.add_foreign_key(table, fk_spec_from_node(k));
+                default:
+                    return DdlResult{false, "ALTER TABLE ADD: unsupported constraint",
+                                     mgr.schema_version()};
+            }
         }
         if (action->primary_text == "ALTER") {
             const ASTNode* name = first_child_of_type(action, NodeType::Identifier);

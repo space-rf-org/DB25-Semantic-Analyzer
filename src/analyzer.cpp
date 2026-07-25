@@ -753,6 +753,24 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
         return;  // without a resolved table there is nothing to check against
     }
 
+    // INSERT ... DEFAULT VALUES (a DefaultClause marker child): every column
+    // takes its default. A NOT NULL column with no default would be inserted as
+    // NULL, so flag it - the same rule as an omitted column, but here it applies
+    // to the whole row and there is no value list to check.
+    if (ASTNode* dv = find_child(insert_stmt, NodeType::DefaultClause);
+        dv != nullptr && dv->primary_text == "DEFAULT VALUES") {
+        for (const ColumnInfo& col : table->columns) {
+            if (!col.nullable && !col.has_default) {
+                add_diagnostic(DiagnosticCode::NotNullViolation,
+                               "NOT NULL column '" + col.name +
+                                   "' has no default in INSERT ... DEFAULT VALUES into '" +
+                                   std::string{table_name} + "'",
+                               table_ref != nullptr ? table_ref : insert_stmt);
+            }
+        }
+        return;
+    }
+
     // Target column list: an explicit ColumnList child, else the table's columns
     // in declaration order. `covered` tracks which table columns receive a value
     // (for the NOT NULL check).

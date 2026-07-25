@@ -1806,6 +1806,38 @@ void test_update_explicit_null_into_not_null() {
     CHECK(count_code(a2, DiagnosticCode::NotNullViolation) == 0);
 }
 
+void test_insert_default_values() {
+    std::printf("test_insert_default_values\n");
+    auto cat = make_catalog();  // id INTEGER NOT NULL (no default), name TEXT nullable
+    parser::Parser p;
+    // DEFAULT VALUES fills every column from its default; id is NOT NULL with no
+    // default, so it would be inserted as NULL -> a violation.
+    auto res = p.parse("INSERT INTO users DEFAULT VALUES");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NotNullViolation) == 1);
+}
+
+void test_insert_default_values_all_defaulted_ok() {
+    std::printf("test_insert_default_values_all_defaulted_ok\n");
+    // Every column is nullable or has a default: DEFAULT VALUES is clean.
+    InMemoryCatalog cat;
+    cat.add_table("t", {
+        ColumnInfo{"id", DataType::Integer, /*nullable=*/false, /*has_default=*/true},
+        ColumnInfo{"name", DataType::Text, /*nullable=*/true},
+    });
+    parser::Parser p;
+    auto res = p.parse("INSERT INTO t DEFAULT VALUES");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NotNullViolation) == 0);
+    CHECK(!a.has_errors());
+}
+
 void test_insert_not_null_with_default_ok() {
     std::printf("test_insert_not_null_with_default_ok\n");
     // id is NOT NULL but has a default, so omitting it is fine.
@@ -2890,6 +2922,8 @@ int main() {
     test_insert_not_null_violation();
     test_insert_not_null_with_default_ok();
     test_insert_explicit_null_into_not_null();
+    test_insert_default_values();
+    test_insert_default_values_all_defaulted_ok();
 
     // DML: UPDATE
     test_update_clean();

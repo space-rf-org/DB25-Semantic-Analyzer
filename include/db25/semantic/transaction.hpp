@@ -15,18 +15,23 @@
 //
 // Semantics follow PostgreSQL, the well-understood reference: a nested BEGIN and
 // a COMMIT/ROLLBACK with no open transaction are WARNINGS (the statement is a
-// no-op), not errors, so a script does not abort on them.
+// no-op), not errors, so a script does not abort on them. Savepoint misuse (a
+// SAVEPOINT / RELEASE / ROLLBACK TO outside a block, or naming a savepoint that
+// does not exist) is a genuine ERROR, matching PostgreSQL.
 
 #pragma once
 
 #include "db25/ast/ast_node.hpp"
 
+#include <cstddef>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace db25::semantic {
 
-// A session's transaction state. Savepoints (a stack within Active) are a
-// separate, later change; this first slice models the top-level block only.
+// A session's transaction state. Savepoints form a stack within Active (see
+// TransactionManager); this enum tracks only whether a block is open.
 enum class TxnState : std::uint8_t {
     Idle,    // no transaction block open (autocommit)
     Active,  // inside an explicit BEGIN ... block
@@ -52,19 +57,32 @@ public:
     [[nodiscard]] TxnState state() const noexcept { return state_; }
     [[nodiscard]] bool in_transaction() const noexcept { return state_ == TxnState::Active; }
 
+    // Number of live savepoints in the current transaction (0 when Idle).
+    [[nodiscard]] std::size_t savepoint_depth() const noexcept { return savepoints_.size(); }
+
+    // Whether a savepoint of this name is currently live. Duplicate names are
+    // permitted (PostgreSQL): the most recent one shadows the older, and RELEASE
+    // / ROLLBACK TO act on the most recent match.
+    [[nodiscard]] bool has_savepoint(std::string_view name) const noexcept;
+
     // Validate and apply a transaction-control statement, advancing the session
     // state and returning the outcome. Accepts the statement node itself or any
     // ancestor that wraps exactly one transaction-control statement. A node that
     // is not a transaction-control statement is an Error (the state is unchanged).
     //
-    // Handled: BEGIN / START TRANSACTION, COMMIT, ROLLBACK. A ROLLBACK TO
-    // SAVEPOINT (a ROLLBACK carrying a savepoint name) is reported as an Error
-    // rather than silently performing a full rollback - savepoints are a later
-    // change. SAVEPOINT / RELEASE are likewise not yet routed here.
+    // Handled: BEGIN / START TRANSACTION, COMMIT, ROLLBACK [TO SAVEPOINT name],
+    // SAVEPOINT name, RELEASE [SAVEPOINT] name. A COMMIT or a full ROLLBACK ends
+    // the block and discards every savepoint. Per PostgreSQL, RELEASE and
+    // ROLLBACK TO also discard the savepoints established AFTER the named one;
+    // ROLLBACK TO keeps the named savepoint (you can roll back to it again),
+    // while RELEASE removes it too.
     [[nodiscard]] TxnResult apply(const ast::ASTNode* stmt);
 
 private:
     TxnState state_ = TxnState::Idle;
+    // Live savepoints in establishment order (bottom .. top). Duplicate names
+    // are allowed; lookups scan from the top so the most recent match wins.
+    std::vector<std::string> savepoints_;
 };
 
 }  // namespace db25::semantic

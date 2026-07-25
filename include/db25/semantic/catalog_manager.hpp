@@ -81,6 +81,20 @@ public:
         std::vector<std::string> columns;   // local column names referenced
     };
 
+    // A UNIQUE constraint expressed by NAME plus its local columns (resolved to
+    // column_ids at commit). A table may declare several.
+    struct UniqueSpec {
+        std::string name;                   // "" if unnamed
+        std::vector<std::string> columns;   // local column names
+    };
+
+    // A PRIMARY KEY expressed by NAME plus its local columns (at most one per
+    // table). An empty `columns` means no primary key.
+    struct PrimaryKeySpec {
+        std::string name;                   // "" if unnamed
+        std::vector<std::string> columns;   // local column names
+    };
+
     // CREATE TABLE. Fails if a table of that name already exists. Any foreign
     // keys are validated and resolved to column_ids here (the serialized commit
     // point), where cross-object references are sound: the referenced table and
@@ -89,8 +103,8 @@ public:
                                          std::vector<ColumnInfo> columns,
                                          std::vector<ForeignKeySpec> foreign_keys = {},
                                          std::vector<CheckSpec> checks = {},
-                                         std::vector<std::string> primary_key = {},
-                                         std::vector<std::vector<std::string>> unique = {}) {
+                                         PrimaryKeySpec primary_key = {},
+                                         std::vector<UniqueSpec> unique = {}) {
         if (catalog_.find_table(name) != nullptr) {
             return fail("table already exists: " + name);
         }
@@ -100,10 +114,11 @@ public:
         // PRIMARY KEY (column-level or table-level) becomes a first-class
         // constraint over its columns, which are additionally forced NOT NULL
         // (a primary key column can never be null).
-        if (!primary_key.empty()) {
+        if (!primary_key.columns.empty()) {
             Constraint c;
             c.kind = Constraint::Kind::PrimaryKey;
-            for (const std::string& col : primary_key) {
+            c.name = primary_key.name;
+            for (const std::string& col : primary_key.columns) {
                 ColumnInfo* ci = nullptr;
                 for (ColumnInfo& cc : self.columns) {
                     if (cc.name == col) { ci = &cc; break; }
@@ -120,10 +135,11 @@ public:
         // Each UNIQUE (column-level or table-level) becomes its own first-class
         // constraint. Unlike a primary key, a table may have several and its
         // columns are NOT forced NOT NULL (a UNIQUE column may still be null).
-        for (const std::vector<std::string>& key : unique) {
+        for (const UniqueSpec& key : unique) {
             Constraint c;
             c.kind = Constraint::Kind::Unique;
-            for (const std::string& col : key) {
+            c.name = key.name;
+            for (const std::string& col : key.columns) {
                 const ColumnInfo* ci = self.find_column(col);
                 if (ci == nullptr) {
                     return fail("UNIQUE on '" + name + "': no column '" + col + "'");
@@ -457,7 +473,8 @@ public:
     // ADD PRIMARY KEY. Refused if the table already has one; the key's columns
     // are forced NOT NULL, matching CREATE TABLE.
     [[nodiscard]] DdlResult add_primary_key(const std::string& table,
-                                            const std::vector<std::string>& columns) {
+                                            const std::vector<std::string>& columns,
+                                            const std::string& cname = {}) {
         const TableInfo* t = catalog_.find_table(table);
         if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
         for (const Constraint& c : t->constraints) {
@@ -465,10 +482,12 @@ public:
                 return fail("ALTER TABLE " + table + ": a primary key already exists");
             }
         }
+        if (auto err = ensure_unique_constraint_name(*t, cname)) return fail(*err);
         InMemoryCatalog next = catalog_;
         TableInfo copy = *next.find_table(table);
         Constraint c;
         c.kind = Constraint::Kind::PrimaryKey;
+        c.name = cname;
         for (const std::string& col : columns) {
             ColumnInfo* ci = nullptr;
             for (ColumnInfo& cc : copy.columns) {
@@ -489,11 +508,14 @@ public:
 
     // ADD UNIQUE. A table may have several; columns are not forced NOT NULL.
     [[nodiscard]] DdlResult add_unique(const std::string& table,
-                                       const std::vector<std::string>& columns) {
+                                       const std::vector<std::string>& columns,
+                                       const std::string& cname = {}) {
         const TableInfo* t = catalog_.find_table(table);
         if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
+        if (auto err = ensure_unique_constraint_name(*t, cname)) return fail(*err);
         Constraint c;
         c.kind = Constraint::Kind::Unique;
+        c.name = cname;
         for (const std::string& col : columns) {
             const ColumnInfo* ci = t->find_column(col);
             if (ci == nullptr) {
@@ -513,11 +535,14 @@ public:
     // ADD CHECK. `ref_columns` are the columns the predicate references (already
     // validated to exist by the caller); the verbatim expression text is stored.
     [[nodiscard]] DdlResult add_check(const std::string& table, const std::string& expr,
-                                      const std::vector<std::string>& ref_columns) {
+                                      const std::vector<std::string>& ref_columns,
+                                      const std::string& cname = {}) {
         const TableInfo* t = catalog_.find_table(table);
         if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
+        if (auto err = ensure_unique_constraint_name(*t, cname)) return fail(*err);
         Constraint c;
         c.kind = Constraint::Kind::Check;
+        c.name = cname;
         c.expr = expr;
         for (const std::string& col : ref_columns) {
             const ColumnInfo* ci = t->find_column(col);
@@ -539,6 +564,7 @@ public:
                                             const ForeignKeySpec& fk) {
         const TableInfo* t = catalog_.find_table(table);
         if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
+        if (auto err = ensure_unique_constraint_name(*t, fk.name)) return fail(*err);
         InMemoryCatalog next = catalog_;
         TableInfo copy = *next.find_table(table);
         Constraint c;
@@ -551,7 +577,88 @@ public:
         return commit(std::move(next));
     }
 
+    // ALTER TABLE DROP CONSTRAINT <name>. Removes the uniquely-named constraint.
+    // Dropping a PRIMARY KEY / UNIQUE that another table's foreign key depends on
+    // is refused under RESTRICT (the default); CASCADE detaches those foreign
+    // keys. Dropping a primary key also relaxes its columns back to nullable.
+    [[nodiscard]] DdlResult drop_constraint(const std::string& table,
+                                            const std::string& cname, bool cascade = false) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
+        if (cname.empty()) {
+            return fail("ALTER TABLE " + table + " DROP CONSTRAINT: missing name");
+        }
+        const Constraint* target = nullptr;
+        for (const Constraint& c : t->constraints) {
+            if (c.name == cname) { target = &c; break; }
+        }
+        if (target == nullptr) {
+            return fail("ALTER TABLE " + table + ": no constraint named '" + cname + "'");
+        }
+
+        // A PK / UNIQUE the constraint provides may be referenced by a foreign key
+        // in another table. Those referrers key on this table's columns; if the
+        // dropped constraint covered any of them, RESTRICT refuses / CASCADE detaches.
+        const bool provides_key = target->kind == Constraint::Kind::PrimaryKey ||
+                                  target->kind == Constraint::Kind::Unique;
+        InMemoryCatalog next = catalog_;
+        if (provides_key) {
+            for (const std::uint32_t cid : target->columns) {
+                for (const TableInfo* other : catalog_.tables()) {
+                    if (other->name == table) continue;
+                    for (const Constraint& fk : other->constraints) {
+                        if (fk.kind != Constraint::Kind::ForeignKey || fk.ref_table != table) {
+                            continue;
+                        }
+                        if (std::find(fk.ref_columns.begin(), fk.ref_columns.end(), cid) ==
+                            fk.ref_columns.end()) {
+                            continue;
+                        }
+                        if (!cascade) {
+                            return fail("cannot drop constraint '" + cname + "' on '" +
+                                        table + "': foreign key in '" + other->name +
+                                        "' depends on it (use CASCADE)");
+                        }
+                        next.drop_foreign_keys_referencing_column(table, cid);
+                    }
+                }
+            }
+        }
+
+        TableInfo copy = *next.find_table(table);
+        const bool was_pk = target->kind == Constraint::Kind::PrimaryKey;
+        std::vector<std::uint32_t> pk_cols = target->columns;
+        auto& cs = copy.constraints;
+        cs.erase(std::remove_if(cs.begin(), cs.end(),
+                     [&cname](const Constraint& c) { return c.name == cname; }),
+                 cs.end());
+        // A dropped primary key no longer forces its columns NOT NULL.
+        if (was_pk) {
+            for (ColumnInfo& col : copy.columns) {
+                if (std::find(pk_cols.begin(), pk_cols.end(), col.column_id) != pk_cols.end()) {
+                    col.nullable = true;
+                }
+            }
+        }
+        next.restore_table(std::move(copy));
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
 private:
+    // Reject a constraint whose (non-empty) name is already used on `t`. An empty
+    // name is unnamed and always allowed.
+    static std::optional<std::string> ensure_unique_constraint_name(const TableInfo& t,
+                                                                    const std::string& cname) {
+        if (cname.empty()) return std::nullopt;
+        for (const Constraint& c : t.constraints) {
+            if (c.name == cname) {
+                return "constraint name '" + cname + "' already exists on '" + t.name + "'";
+            }
+        }
+        return std::nullopt;
+    }
+
     // Resolve a by-name foreign key against `cat` (which already contains the
     // owning table `self`) into an id-based Constraint. Returns an error message
     // on failure, std::nullopt on success (with `out` filled). Shared by

@@ -840,6 +840,73 @@ void test_alter_add_constraint() {
     std::remove(path.c_str());
 }
 
+// Named constraints are persisted with their names (CREATE and ALTER ADD), and
+// ALTER TABLE DROP CONSTRAINT <name> removes them, with RESTRICT/CASCADE for a
+// dropped key another table's FK depends on.
+void test_named_and_drop_constraint() {
+    auto by_name = [](const TableInfo& t, const std::string& n) -> const Constraint* {
+        for (const Constraint& c : t.constraints) if (c.name == n) return &c;
+        return nullptr;
+    };
+
+    const std::string path = scratch_path("ddl_drop_constraint.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    // Names captured from CREATE TABLE and from ALTER ADD.
+    CHECK(run(p, mgr,
+        "CREATE TABLE t (a INTEGER, b INTEGER, CONSTRAINT uq_a UNIQUE (a), "
+        "CONSTRAINT ck_b CHECK (b >= 0))").ok);
+    CHECK(run(p, mgr, "ALTER TABLE t ADD CONSTRAINT pk_t PRIMARY KEY (a)").ok);
+    {
+        const TableInfo* t = mgr.catalog().find_table("t");
+        CHECK(by_name(*t, "uq_a") != nullptr);
+        CHECK(by_name(*t, "ck_b") != nullptr);
+        CHECK(by_name(*t, "pk_t") != nullptr && !t->find_column("a")->nullable);
+    }
+    // A duplicate constraint name is refused.
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD CONSTRAINT uq_a UNIQUE (b)").ok);
+
+    // DROP CONSTRAINT by name.
+    CHECK(run(p, mgr, "ALTER TABLE t DROP CONSTRAINT ck_b").ok);
+    CHECK(by_name(*mgr.catalog().find_table("t"), "ck_b") == nullptr);
+    // Dropping the primary key relaxes its column back to nullable.
+    CHECK(run(p, mgr, "ALTER TABLE t DROP CONSTRAINT pk_t").ok);
+    CHECK(mgr.catalog().find_table("t")->find_column("a")->nullable);
+    // Dropping an unknown constraint is an error.
+    CHECK(!run(p, mgr, "ALTER TABLE t DROP CONSTRAINT nope").ok);
+
+    // RESTRICT vs CASCADE when a foreign key depends on a UNIQUE being dropped.
+    CHECK(run(p, mgr, "CREATE TABLE parent (pid INTEGER, note TEXT, "
+                      "CONSTRAINT uq_pid UNIQUE (pid))").ok);
+    CHECK(run(p, mgr,
+        "CREATE TABLE child (cid INTEGER, pid INTEGER REFERENCES parent (pid))").ok);
+    // parent.pid is referenced by child's FK: RESTRICT refuses.
+    CHECK(!run(p, mgr, "ALTER TABLE parent DROP CONSTRAINT uq_pid").ok);
+    CHECK(by_name(*mgr.catalog().find_table("parent"), "uq_pid") != nullptr);
+    // CASCADE detaches the referencing FK, then drops the UNIQUE.
+    CHECK(run(p, mgr, "ALTER TABLE parent DROP CONSTRAINT uq_pid CASCADE").ok);
+    CHECK(by_name(*mgr.catalog().find_table("parent"), "uq_pid") == nullptr);
+    {
+        const TableInfo* child = mgr.catalog().find_table("child");
+        bool has_fk = false;
+        for (const Constraint& c : child->constraints) {
+            if (c.kind == Constraint::Kind::ForeignKey) has_fk = true;
+        }
+        CHECK(!has_fk);
+    }
+
+    // Durable: the surviving named constraint (uq_a) reloads with its name.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        CHECK(by_name(*mgr2.catalog().find_table("t"), "uq_a") != nullptr);
+    }
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -866,6 +933,7 @@ int main() {
     test_primary_key_constraint();
     test_unique_constraint();
     test_alter_add_constraint();
+    test_named_and_drop_constraint();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

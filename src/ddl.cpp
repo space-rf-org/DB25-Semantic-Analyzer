@@ -35,6 +35,7 @@ constexpr std::uint16_t kAlterActionCascade = 0x01;      // DROP COLUMN ... CASC
 constexpr std::uint16_t kAlterActionDropDefault = 0x04;  // ALTER COLUMN DROP DEFAULT
 constexpr std::uint16_t kAlterActionSetNotNull = 0x08;   // ALTER COLUMN SET NOT NULL
 constexpr std::uint16_t kAlterActionDropNotNull = 0x10;  // ALTER COLUMN DROP NOT NULL
+constexpr std::uint16_t kAlterActionDropConstraint = 0x20;  // DROP CONSTRAINT <name>
 
 // Locate the single DDL statement in a (possibly wrapping) parse tree. Returns
 // a mutable node: layer-1 type checking annotates the AST with inferred types.
@@ -93,6 +94,7 @@ void collect_ref_columns(const ASTNode* n, std::vector<std::string>& out) {
 // the referenced table and columns.
 CatalogManager::ForeignKeySpec fk_spec_from_node(const ASTNode* fk_node) {
     CatalogManager::ForeignKeySpec fk;
+    fk.name = std::string(fk_node->schema_name);  // "" when unnamed
     const ASTNode* ref = nullptr;
     for (const ASTNode* ch = fk_node->first_child; ch != nullptr; ch = ch->next_sibling) {
         if (ch->node_type == NodeType::ReferencesClause) {
@@ -174,6 +176,7 @@ std::vector<CatalogManager::CheckSpec> collect_checks(const ASTNode* create_stmt
     std::vector<CatalogManager::CheckSpec> out;
     auto emit = [&](const ASTNode* check) {
         CatalogManager::CheckSpec spec;
+        spec.name = std::string(check->schema_name);  // "" when unnamed
         spec.expr = std::string(check->primary_text);
         collect_column_refs(check, spec.columns);
         out.push_back(std::move(spec));
@@ -194,20 +197,21 @@ std::vector<CatalogManager::CheckSpec> collect_checks(const ASTNode* create_stmt
 // PRIMARY KEY names its own column; a table-level PRIMARY KEY (a, b) names its
 // Identifier children. At most one primary key is well-formed (validate_ddl
 // enforces this), so the two sources are mutually exclusive in practice.
-std::vector<std::string> collect_primary_key(const ASTNode* create_stmt) {
-    std::vector<std::string> pk;
+CatalogManager::PrimaryKeySpec collect_primary_key(const ASTNode* create_stmt) {
+    CatalogManager::PrimaryKeySpec pk;
     for (const ASTNode* c = create_stmt->first_child; c != nullptr; c = c->next_sibling) {
         if (c->node_type == NodeType::PrimaryKeyConstraint) {
             // Table-level PRIMARY KEY (col, ...).
+            pk.name = std::string(c->schema_name);  // "" when unnamed
             for (const ASTNode* id = c->first_child; id != nullptr; id = id->next_sibling) {
                 if (id->node_type == NodeType::Identifier) {
-                    pk.emplace_back(id->primary_text);
+                    pk.columns.emplace_back(id->primary_text);
                 }
             }
         } else if (c->node_type == NodeType::ColumnDefinition) {
             for (const ASTNode* k = c->first_child; k != nullptr; k = k->next_sibling) {
                 if (k->node_type == NodeType::PrimaryKeyConstraint) {
-                    pk.emplace_back(c->primary_text);  // column-level: this column
+                    pk.columns.emplace_back(c->primary_text);  // column-level: this column
                 }
             }
         }
@@ -219,19 +223,22 @@ std::vector<std::string> collect_primary_key(const ASTNode* create_stmt) {
 // is a single-column key on its own column; a table-level UNIQUE (a, b) is one
 // key over its Identifier children. A table may declare several, so each is
 // returned as its own column-name list.
-std::vector<std::vector<std::string>> collect_unique(const ASTNode* create_stmt) {
-    std::vector<std::vector<std::string>> out;
+std::vector<CatalogManager::UniqueSpec> collect_unique(const ASTNode* create_stmt) {
+    std::vector<CatalogManager::UniqueSpec> out;
     for (const ASTNode* c = create_stmt->first_child; c != nullptr; c = c->next_sibling) {
         if (c->node_type == NodeType::UniqueConstraint) {
-            std::vector<std::string> key;
+            CatalogManager::UniqueSpec key;
+            key.name = std::string(c->schema_name);  // "" when unnamed
             for (const ASTNode* id = c->first_child; id != nullptr; id = id->next_sibling) {
-                if (id->node_type == NodeType::Identifier) key.emplace_back(id->primary_text);
+                if (id->node_type == NodeType::Identifier) key.columns.emplace_back(id->primary_text);
             }
-            if (!key.empty()) out.push_back(std::move(key));
+            if (!key.columns.empty()) out.push_back(std::move(key));
         } else if (c->node_type == NodeType::ColumnDefinition) {
             for (const ASTNode* k = c->first_child; k != nullptr; k = k->next_sibling) {
                 if (k->node_type == NodeType::UniqueConstraint) {
-                    out.push_back({std::string(c->primary_text)});  // column-level
+                    CatalogManager::UniqueSpec key;
+                    key.columns.emplace_back(c->primary_text);  // column-level
+                    out.push_back(std::move(key));
                 }
             }
         }
@@ -400,8 +407,12 @@ void validate_alter_table(ASTNode* alter, std::vector<std::string>& errors) {
         }
     } else if (verb == "DROP") {
         const ASTNode* name = first_child_of_type(action, NodeType::Identifier);
+        const bool drop_constraint =
+            (action->semantic_flags & kAlterActionDropConstraint) != 0;
         if (name == nullptr || name->primary_text.empty()) {
-            errors.emplace_back("ALTER TABLE DROP COLUMN: missing column name");
+            errors.emplace_back(drop_constraint
+                                    ? "ALTER TABLE DROP CONSTRAINT: missing constraint name"
+                                    : "ALTER TABLE DROP COLUMN: missing column name");
         }
     } else if (verb == "ALTER") {
         // ALTER COLUMN <c> SET DEFAULT <expr> | DROP DEFAULT. Only the DEFAULT
@@ -623,7 +634,7 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
                             cols.emplace_back(id->primary_text);
                         }
                     }
-                    return mgr.add_primary_key(table, cols);
+                    return mgr.add_primary_key(table, cols, std::string(k->schema_name));
                 }
                 case NodeType::UniqueConstraint: {
                     std::vector<std::string> cols;
@@ -633,7 +644,7 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
                             cols.emplace_back(id->primary_text);
                         }
                     }
-                    return mgr.add_unique(table, cols);
+                    return mgr.add_unique(table, cols, std::string(k->schema_name));
                 }
                 case NodeType::CheckConstraint: {
                     // Type-check the predicate against the existing table's columns
@@ -668,7 +679,8 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
                                 mgr.schema_version()};
                         }
                     }
-                    return mgr.add_check(table, std::string(k->primary_text), refs);
+                    return mgr.add_check(table, std::string(k->primary_text), refs,
+                                         std::string(k->schema_name));
                 }
                 case NodeType::ForeignKeyConstraint:
                     return mgr.add_foreign_key(table, fk_spec_from_node(k));
@@ -711,9 +723,13 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
             }
             return mgr.set_column_default(table, col, std::string(def->primary_text));
         }
-        // DROP COLUMN. Neither flag set => RESTRICT (the default).
+        // DROP COLUMN / DROP CONSTRAINT. Neither CASCADE/RESTRICT flag set =>
+        // RESTRICT (the default).
         const ASTNode* name = first_child_of_type(action, NodeType::Identifier);
         const bool cascade = (action->semantic_flags & kAlterActionCascade) != 0;
+        if ((action->semantic_flags & kAlterActionDropConstraint) != 0) {
+            return mgr.drop_constraint(table, std::string(name->primary_text), cascade);
+        }
         return mgr.drop_column(table, std::string(name->primary_text),
                                /*if_exists=*/false, cascade);
     }

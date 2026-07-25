@@ -219,6 +219,87 @@ void test_drop_index() {
     std::remove(path.c_str());
 }
 
+const Constraint* first_fk(const TableInfo* t) {
+    if (t == nullptr) return nullptr;
+    for (const Constraint& c : t->constraints) {
+        if (c.kind == Constraint::Kind::ForeignKey) return &c;
+    }
+    return nullptr;
+}
+
+void test_foreign_key_column_and_table_level() {
+    const std::string path = scratch_path("ddl_fk.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    CHECK(run(p, mgr, "CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR)").ok);  // v1
+
+    // Column-level FK.
+    CHECK(run(p, mgr, "CREATE TABLE orders (uid INTEGER REFERENCES users (id))").ok);   // v2
+    const TableInfo* orders = mgr.catalog().find_table("orders");
+    const Constraint* fk = first_fk(orders);
+    CHECK(fk != nullptr);
+    if (fk != nullptr && orders != nullptr) {
+        CHECK(fk->ref_table == "users");
+        CHECK(fk->columns.size() == 1 &&
+              fk->columns[0] == orders->find_column("uid")->column_id);
+        const TableInfo* users = mgr.catalog().find_table("users");
+        CHECK(fk->ref_columns.size() == 1 &&
+              fk->ref_columns[0] == users->find_column("id")->column_id);
+    }
+
+    // Table-level FK.
+    CHECK(run(p, mgr,
+        "CREATE TABLE carts (uid INTEGER, FOREIGN KEY (uid) REFERENCES users (id))").ok);  // v3
+    CHECK(first_fk(mgr.catalog().find_table("carts")) != nullptr);
+
+    // Durable across restart.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        CHECK(first_fk(mgr2.catalog().find_table("orders")) != nullptr);
+        CHECK(first_fk(mgr2.catalog().find_table("carts")) != nullptr);
+    }
+    std::remove(path.c_str());
+}
+
+void test_foreign_key_integrity() {
+    const std::string path = scratch_path("ddl_fk_integ.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+    CHECK(run(p, mgr, "CREATE TABLE users (id INTEGER)").ok);  // v1
+
+    // Referenced table does not exist -> rejected at commit, catalog untouched.
+    CHECK(!run(p, mgr, "CREATE TABLE a (uid INTEGER REFERENCES nosuch (id))").ok);
+    CHECK(mgr.catalog().find_table("a") == nullptr);
+    CHECK(mgr.schema_version() == 1);
+
+    // Referenced column does not exist -> rejected.
+    CHECK(!run(p, mgr, "CREATE TABLE b (uid INTEGER REFERENCES users (nope))").ok);
+    CHECK(mgr.catalog().find_table("b") == nullptr);
+    std::remove(path.c_str());
+}
+
+void test_self_referencing_foreign_key() {
+    const std::string path = scratch_path("ddl_fk_self.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+    // A self-referencing FK resolves because the FK is checked against the new
+    // catalog, which already includes the table being created.
+    const DdlResult r = run(p, mgr,
+        "CREATE TABLE emp (id INTEGER PRIMARY KEY, mgr INTEGER REFERENCES emp (id))");
+    CHECK(r.ok);
+    const Constraint* fk = first_fk(mgr.catalog().find_table("emp"));
+    CHECK(fk != nullptr && fk->ref_table == "emp");
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -229,6 +310,9 @@ int main() {
     test_create_index_end_to_end();
     test_create_index_integrity();
     test_drop_index();
+    test_foreign_key_column_and_table_level();
+    test_foreign_key_integrity();
+    test_self_referencing_foreign_key();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

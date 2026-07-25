@@ -4,6 +4,7 @@
 
 #include "db25/ast/node_types.hpp"
 #include "db25/semantic/ast_helpers.hpp"
+#include "db25/semantic/check_eval.hpp"
 
 #include <algorithm>
 #include <array>
@@ -740,6 +741,64 @@ void Analyzer::check_not_null_literal(const ColumnInfo* col, ASTNode* value) {
     }
 }
 
+namespace {
+[[nodiscard]] bool is_literal_node(const ASTNode* n) {
+    if (n == nullptr) return false;
+    switch (n->node_type) {
+        case NodeType::IntegerLiteral:
+        case NodeType::FloatLiteral:
+        case NodeType::StringLiteral:
+        case NodeType::BooleanLiteral:
+        case NodeType::NullLiteral:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] const ColumnInfo* column_by_id(const TableInfo& t, std::uint32_t id) {
+    for (const ColumnInfo& c : t.columns) {
+        if (c.column_id == id) return &c;
+    }
+    return nullptr;
+}
+}  // namespace
+
+void Analyzer::check_row_against_checks(const TableInfo& table,
+                                        const std::vector<const ColumnInfo*>& target_cols,
+                                        const std::vector<ASTNode*>& vals, const ASTNode* at) {
+    // Bind each column that receives a literal in this row to its literal node.
+    CheckBindings binds;
+    const std::size_t n = std::min(target_cols.size(), vals.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        if (target_cols[i] != nullptr && is_literal_node(vals[i])) {
+            binds.emplace(target_cols[i]->name, vals[i]);
+        }
+    }
+
+    for (const Constraint& c : table.constraints) {
+        if (c.kind != Constraint::Kind::Check || c.expr.empty()) continue;
+        // Only decide a CHECK whose every referenced column is bound to a literal;
+        // otherwise the outcome is not certain and we stay silent.
+        bool all_bound = true;
+        for (const std::uint32_t cid : c.columns) {
+            const ColumnInfo* col = column_by_id(table, cid);
+            if (col == nullptr || binds.find(col->name) == binds.end()) {
+                all_bound = false;
+                break;
+            }
+        }
+        if (!all_bound) continue;
+        if (evaluate_check(c.expr, binds) == CheckResult::False) {
+            const std::string named = c.name.empty() ? std::string{} : " '" + c.name + "'";
+            add_diagnostic(DiagnosticCode::CheckViolation,
+                           "row violates CHECK constraint" + named + " (" + c.expr + ") on '" +
+                               table.name + "'",
+                           at);
+        }
+    }
+}
+
 void Analyzer::analyze_insert(ASTNode* insert_stmt) {
     // Target table (always the first TableRef child).
     ASTNode* table_ref = find_child(insert_stmt, NodeType::TableRef);
@@ -846,6 +905,7 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
                     check_not_null_literal(target_cols[i], vals[i]);
                 }
             }
+            check_row_against_checks(*table, target_cols, vals, row);
         }
     } else {
         // INSERT ... SELECT: analyze the source query and check its projection.

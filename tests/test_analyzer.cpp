@@ -1763,6 +1763,48 @@ void test_insert_not_null_violation() {
     CHECK(count_code(a, DiagnosticCode::InsertArityMismatch) == 0);
 }
 
+void test_insert_check_violation() {
+    std::printf("test_insert_check_violation\n");
+    // Build a catalog with CHECK constraints directly (as execute_ddl would).
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("t", {
+        ColumnInfo{"age", DataType::Integer, /*nullable=*/true},     // column_id 1
+        ColumnInfo{"score", DataType::Integer, /*nullable=*/true},   // column_id 2
+        ColumnInfo{"grade", DataType::Text, /*nullable=*/true},      // column_id 3
+    });
+    Constraint c1; c1.kind = Constraint::Kind::Check; c1.expr = "age >= 0"; c1.columns = {1};
+    Constraint c2; c2.kind = Constraint::Kind::Check;
+    c2.expr = "score >= 0 AND score <= 100"; c2.columns = {2};
+    t.constraints.push_back(c1);
+    t.constraints.push_back(c2);
+
+    parser::Parser p;
+    auto viol = [&](const char* sql) {
+        auto r = p.parse(sql);
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::CheckViolation);
+    };
+
+    // Definite violations: a constant value that fails the predicate.
+    CHECK(viol("INSERT INTO t (age) VALUES (-5)") == 1);
+    CHECK(viol("INSERT INTO t (score) VALUES (150)") == 1);       // > 100
+    CHECK(viol("INSERT INTO t (score) VALUES (-1)") == 1);        // < 0
+    // Satisfying values: no violation.
+    CHECK(viol("INSERT INTO t (age) VALUES (5)") == 0);
+    CHECK(viol("INSERT INTO t (score) VALUES (50)") == 0);
+    CHECK(viol("INSERT INTO t (age, score) VALUES (0, 100)") == 0);  // boundaries
+    // NULL makes the predicate UNKNOWN (not FALSE): no violation reported.
+    CHECK(viol("INSERT INTO t (age) VALUES (NULL)") == 0);
+    // A non-literal value can't be folded: stay silent (no false positive).
+    CHECK(viol("INSERT INTO t (age) VALUES (some_func(1))") == 0);
+    // A CHECK whose column is omitted (uses default) is not decided.
+    CHECK(viol("INSERT INTO t (grade) VALUES ('A')") == 0);
+    // Multiple rows: only the violating row is flagged.
+    CHECK(viol("INSERT INTO t (age) VALUES (1), (-2), (3)") == 1);
+}
+
 void test_insert_explicit_null_into_not_null() {
     std::printf("test_insert_explicit_null_into_not_null\n");
     auto cat = make_catalog();  // id INTEGER NOT NULL
@@ -2924,6 +2966,7 @@ int main() {
     test_insert_explicit_null_into_not_null();
     test_insert_default_values();
     test_insert_default_values_all_defaulted_ok();
+    test_insert_check_violation();
 
     // DML: UPDATE
     test_update_clean();

@@ -66,6 +66,10 @@ enum class DiagnosticCode : std::uint16_t {
     // chain of many thousands of operators, which the parser does not bound).
     // Analysis of the over-deep subtree is abandoned to avoid a stack overflow.
     ExpressionTooComplex,
+    // An INSERT row of all-constant values makes a table CHECK constraint
+    // evaluate to FALSE (a definite violation). Only reported when every column
+    // the predicate references is given a literal, so the result is certain.
+    CheckViolation,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

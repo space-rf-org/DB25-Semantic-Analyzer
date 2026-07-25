@@ -775,6 +775,71 @@ void test_unique_constraint() {
     std::remove(path.c_str());
 }
 
+// ALTER TABLE ADD <constraint>: PK / UNIQUE / CHECK / FK are added to an
+// existing table, resolved and validated at commit like a CREATE TABLE
+// constraint, and are durable.
+void test_alter_add_constraint() {
+    auto count_kind = [](const TableInfo& t, Constraint::Kind k) {
+        int n = 0;
+        for (const Constraint& c : t.constraints) if (c.kind == k) ++n;
+        return n;
+    };
+
+    const std::string path = scratch_path("ddl_add_constraint.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    CHECK(run(p, mgr, "CREATE TABLE t (id INTEGER, email TEXT, age INTEGER)").ok);
+
+    // ADD PRIMARY KEY: constraint added, its column forced NOT NULL.
+    CHECK(run(p, mgr, "ALTER TABLE t ADD PRIMARY KEY (id)").ok);
+    {
+        const TableInfo* t = mgr.catalog().find_table("t");
+        CHECK(count_kind(*t, Constraint::Kind::PrimaryKey) == 1);
+        CHECK(!t->find_column("id")->nullable);
+    }
+    // A second PRIMARY KEY is refused.
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD PRIMARY KEY (email)").ok);
+
+    // ADD UNIQUE / CHECK.
+    CHECK(run(p, mgr, "ALTER TABLE t ADD UNIQUE (email)").ok);
+    CHECK(run(p, mgr, "ALTER TABLE t ADD CHECK (age >= 0)").ok);
+    {
+        const TableInfo* t = mgr.catalog().find_table("t");
+        CHECK(count_kind(*t, Constraint::Kind::Unique) == 1);
+        CHECK(count_kind(*t, Constraint::Kind::Check) == 1);
+    }
+    // A non-Boolean CHECK is rejected; an unknown column in a CHECK is rejected.
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD CHECK (age)").ok);
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD CHECK (ghost > 0)").ok);
+    // A UNIQUE over an unknown column is rejected.
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD UNIQUE (ghost)").ok);
+
+    // ADD FOREIGN KEY resolves the referenced table/columns.
+    CHECK(run(p, mgr, "CREATE TABLE parent (pid INTEGER PRIMARY KEY, note TEXT)").ok);
+    CHECK(run(p, mgr,
+        "ALTER TABLE t ADD FOREIGN KEY (id) REFERENCES parent (pid)").ok);
+    CHECK(count_kind(*mgr.catalog().find_table("t"), Constraint::Kind::ForeignKey) == 1);
+    // A foreign key to a missing table is refused.
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD FOREIGN KEY (id) REFERENCES nope (x)").ok);
+    // Adding a constraint to a missing table is refused.
+    CHECK(!run(p, mgr, "ALTER TABLE nope ADD UNIQUE (a)").ok);
+
+    // Durable: all added constraints survive a reload.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        const TableInfo* t = mgr2.catalog().find_table("t");
+        CHECK(count_kind(*t, Constraint::Kind::PrimaryKey) == 1);
+        CHECK(count_kind(*t, Constraint::Kind::Unique) == 1);
+        CHECK(count_kind(*t, Constraint::Kind::Check) == 1);
+        CHECK(count_kind(*t, Constraint::Kind::ForeignKey) == 1);
+    }
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -800,6 +865,7 @@ int main() {
     test_alter_column_not_null();
     test_primary_key_constraint();
     test_unique_constraint();
+    test_alter_add_constraint();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

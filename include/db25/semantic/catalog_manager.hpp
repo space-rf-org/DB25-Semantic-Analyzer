@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -135,35 +136,9 @@ public:
         }
 
         for (const ForeignKeySpec& fk : foreign_keys) {
-            const std::string where = "FK on '" + name + "'";
-            if (fk.columns.empty() || fk.ref_columns.empty()) {
-                return fail(where + ": foreign key needs explicit local and referenced columns");
-            }
-            if (fk.columns.size() != fk.ref_columns.size()) {
-                return fail(where + ": " + std::to_string(fk.columns.size()) +
-                            " local columns but " + std::to_string(fk.ref_columns.size()) +
-                            " referenced columns");
-            }
             Constraint c;
-            c.kind = Constraint::Kind::ForeignKey;
-            c.name = fk.name;
-            c.ref_table = fk.ref_table;
-            for (const std::string& col : fk.columns) {
-                const ColumnInfo* ci = self.find_column(col);
-                if (ci == nullptr) return fail(where + ": no local column '" + col + "'");
-                c.columns.push_back(ci->column_id);
-            }
-            const TableInfo* rt = next.find_table(fk.ref_table);
-            if (rt == nullptr) {
-                return fail(where + ": referenced table '" + fk.ref_table + "' does not exist");
-            }
-            for (const std::string& col : fk.ref_columns) {
-                const ColumnInfo* ci = rt->find_column(col);
-                if (ci == nullptr) {
-                    return fail(where + ": referenced table '" + fk.ref_table +
-                                "' has no column '" + col + "'");
-                }
-                c.ref_columns.push_back(ci->column_id);
+            if (auto err = build_fk_constraint(next, self, fk, "FK on '" + name + "'", c)) {
+                return fail(*err);
             }
             self.constraints.push_back(std::move(c));
         }
@@ -474,7 +449,146 @@ public:
         return commit(std::move(next));
     }
 
+    // ---- ALTER TABLE ADD <table-level constraint> ----
+    // Each adds a constraint to an existing table, resolving its columns against
+    // the live table at the serialized commit - the same integrity rules as
+    // CREATE TABLE, applied after the fact.
+
+    // ADD PRIMARY KEY. Refused if the table already has one; the key's columns
+    // are forced NOT NULL, matching CREATE TABLE.
+    [[nodiscard]] DdlResult add_primary_key(const std::string& table,
+                                            const std::vector<std::string>& columns) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
+        for (const Constraint& c : t->constraints) {
+            if (c.kind == Constraint::Kind::PrimaryKey) {
+                return fail("ALTER TABLE " + table + ": a primary key already exists");
+            }
+        }
+        InMemoryCatalog next = catalog_;
+        TableInfo copy = *next.find_table(table);
+        Constraint c;
+        c.kind = Constraint::Kind::PrimaryKey;
+        for (const std::string& col : columns) {
+            ColumnInfo* ci = nullptr;
+            for (ColumnInfo& cc : copy.columns) {
+                if (cc.name == col) { ci = &cc; break; }
+            }
+            if (ci == nullptr) {
+                return fail("ADD PRIMARY KEY on '" + table + "': no column '" + col + "'");
+            }
+            c.columns.push_back(ci->column_id);
+            ci->nullable = false;
+        }
+        if (c.columns.empty()) return fail("ADD PRIMARY KEY on '" + table + "': no columns");
+        copy.constraints.push_back(std::move(c));
+        next.restore_table(std::move(copy));
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
+    // ADD UNIQUE. A table may have several; columns are not forced NOT NULL.
+    [[nodiscard]] DdlResult add_unique(const std::string& table,
+                                       const std::vector<std::string>& columns) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
+        Constraint c;
+        c.kind = Constraint::Kind::Unique;
+        for (const std::string& col : columns) {
+            const ColumnInfo* ci = t->find_column(col);
+            if (ci == nullptr) {
+                return fail("ADD UNIQUE on '" + table + "': no column '" + col + "'");
+            }
+            c.columns.push_back(ci->column_id);
+        }
+        if (c.columns.empty()) return fail("ADD UNIQUE on '" + table + "': no columns");
+        InMemoryCatalog next = catalog_;
+        TableInfo copy = *next.find_table(table);
+        copy.constraints.push_back(std::move(c));
+        next.restore_table(std::move(copy));
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
+    // ADD CHECK. `ref_columns` are the columns the predicate references (already
+    // validated to exist by the caller); the verbatim expression text is stored.
+    [[nodiscard]] DdlResult add_check(const std::string& table, const std::string& expr,
+                                      const std::vector<std::string>& ref_columns) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
+        Constraint c;
+        c.kind = Constraint::Kind::Check;
+        c.expr = expr;
+        for (const std::string& col : ref_columns) {
+            const ColumnInfo* ci = t->find_column(col);
+            if (ci == nullptr) {
+                return fail("ADD CHECK on '" + table + "': no column '" + col + "'");
+            }
+            c.columns.push_back(ci->column_id);
+        }
+        InMemoryCatalog next = catalog_;
+        TableInfo copy = *next.find_table(table);
+        copy.constraints.push_back(std::move(c));
+        next.restore_table(std::move(copy));
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
+    // ADD FOREIGN KEY, resolved exactly like a CREATE TABLE foreign key.
+    [[nodiscard]] DdlResult add_foreign_key(const std::string& table,
+                                            const ForeignKeySpec& fk) {
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) return fail("ALTER TABLE " + table + ": no such table");
+        InMemoryCatalog next = catalog_;
+        TableInfo copy = *next.find_table(table);
+        Constraint c;
+        if (auto err = build_fk_constraint(next, copy, fk, "ADD FK on '" + table + "'", c)) {
+            return fail(*err);
+        }
+        copy.constraints.push_back(std::move(c));
+        next.restore_table(std::move(copy));
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
 private:
+    // Resolve a by-name foreign key against `cat` (which already contains the
+    // owning table `self`) into an id-based Constraint. Returns an error message
+    // on failure, std::nullopt on success (with `out` filled). Shared by
+    // create_table and add_foreign_key so the two agree exactly.
+    static std::optional<std::string> build_fk_constraint(
+            const InMemoryCatalog& cat, const TableInfo& self, const ForeignKeySpec& fk,
+            const std::string& where, Constraint& out) {
+        if (fk.columns.empty() || fk.ref_columns.empty()) {
+            return where + ": foreign key needs explicit local and referenced columns";
+        }
+        if (fk.columns.size() != fk.ref_columns.size()) {
+            return where + ": " + std::to_string(fk.columns.size()) + " local columns but " +
+                   std::to_string(fk.ref_columns.size()) + " referenced columns";
+        }
+        out.kind = Constraint::Kind::ForeignKey;
+        out.name = fk.name;
+        out.ref_table = fk.ref_table;
+        for (const std::string& col : fk.columns) {
+            const ColumnInfo* ci = self.find_column(col);
+            if (ci == nullptr) return where + ": no local column '" + col + "'";
+            out.columns.push_back(ci->column_id);
+        }
+        const TableInfo* rt = cat.find_table(fk.ref_table);
+        if (rt == nullptr) {
+            return where + ": referenced table '" + fk.ref_table + "' does not exist";
+        }
+        for (const std::string& col : fk.ref_columns) {
+            const ColumnInfo* ci = rt->find_column(col);
+            if (ci == nullptr) {
+                return where + ": referenced table '" + fk.ref_table + "' has no column '" +
+                       col + "'";
+            }
+            out.ref_columns.push_back(ci->column_id);
+        }
+        return std::nullopt;
+    }
+
     DdlResult fail(std::string msg) const {
         return DdlResult{false, std::move(msg), catalog_.schema_version()};
     }

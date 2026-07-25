@@ -16,6 +16,7 @@ find_package(DB25Parser REQUIRED)
 add_library(db25semantic
     src/analyzer.cpp
     src/catalog_snapshot.cpp
+    src/check_eval.cpp
     src/ddl.cpp
     src/transaction.cpp
 )

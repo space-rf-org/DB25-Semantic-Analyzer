@@ -111,6 +111,13 @@ private:
     // warning); anything else is a TypeMismatch error. `at` locates the value.
     void check_assignment(DataType target, DataType value, const ASTNode* at);
 
+    // Flag an explicit NULL literal written into a NOT NULL column (an INSERT
+    // value or an UPDATE SET value). A column DEFAULT does not apply here - an
+    // explicit value overrides it - so a literal NULL is a definite NOT NULL
+    // violation. No-op for a nullable column, a null `col`/`value`, or a value
+    // that is not a NULL literal.
+    void check_not_null_literal(const ColumnInfo* col, ASTNode* value);
+
     // Validate a LIMIT / OFFSET clause: any operand that is a literal must be a
     // non-negative integer (negative or non-integer literal -> InvalidLimit).
     // Non-literal operands are skipped.

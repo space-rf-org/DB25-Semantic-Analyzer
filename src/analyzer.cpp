@@ -732,6 +732,14 @@ void Analyzer::check_assignment(DataType target, DataType value, const ASTNode* 
     }
 }
 
+void Analyzer::check_not_null_literal(const ColumnInfo* col, ASTNode* value) {
+    if (col != nullptr && value != nullptr && !col->nullable &&
+        value->node_type == NodeType::NullLiteral) {
+        add_diagnostic(DiagnosticCode::NotNullViolation,
+                       "cannot assign NULL to NOT NULL column '" + col->name + "'", value);
+    }
+}
+
 void Analyzer::analyze_insert(ASTNode* insert_stmt) {
     // Target table (always the first TableRef child).
     ASTNode* table_ref = find_child(insert_stmt, NodeType::TableRef);
@@ -817,6 +825,7 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
                 const DataType vt = infer_expr(vals[i], scope);
                 if (target_cols[i] != nullptr) {
                     check_assignment(target_cols[i]->type, vt, vals[i]);
+                    check_not_null_literal(target_cols[i], vals[i]);
                 }
             }
         }
@@ -895,6 +904,7 @@ void Analyzer::analyze_update(ASTNode* update_stmt) {
             const DataType vt = infer_expr(value, scope);
             if (info != nullptr && value != nullptr) {
                 check_assignment(info->type, vt, value);
+                check_not_null_literal(info, value);
             }
         }
     }

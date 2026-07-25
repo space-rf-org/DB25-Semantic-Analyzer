@@ -654,6 +654,66 @@ void test_alter_column_not_null() {
     std::remove(path.c_str());
 }
 
+// PRIMARY KEY is persisted as a first-class constraint (column-level and
+// table-level), its columns are forced NOT NULL, it survives a reload, and it
+// interacts correctly with DROP NOT NULL and DROP COLUMN.
+void test_primary_key_constraint() {
+    auto pk_of = [](const TableInfo& t) -> const Constraint* {
+        for (const Constraint& c : t.constraints) {
+            if (c.kind == Constraint::Kind::PrimaryKey) return &c;
+        }
+        return nullptr;
+    };
+
+    const std::string path = scratch_path("ddl_pk.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    // Column-level PRIMARY KEY: a constraint over the one column, forced NOT NULL.
+    CHECK(run(p, mgr, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)").ok);
+    {
+        const TableInfo* t = mgr.catalog().find_table("t");
+        const Constraint* pk = pk_of(*t);
+        const ColumnInfo* id = t->find_column("id");
+        CHECK(pk != nullptr && pk->columns.size() == 1 && id != nullptr &&
+              pk->columns[0] == id->column_id);
+        CHECK(!id->nullable);
+        // DROP NOT NULL on a PK column is refused; the column stays NOT NULL.
+        CHECK(!run(p, mgr, "ALTER TABLE t ALTER COLUMN id DROP NOT NULL").ok);
+        CHECK(!mgr.catalog().find_table("t")->find_column("id")->nullable);
+    }
+
+    // Table-level PRIMARY KEY (a, b): both columns forced NOT NULL.
+    CHECK(run(p, mgr, "CREATE TABLE t2 (a INTEGER, b INTEGER, PRIMARY KEY (a, b))").ok);
+    {
+        const TableInfo* t = mgr.catalog().find_table("t2");
+        const Constraint* pk = pk_of(*t);
+        CHECK(pk != nullptr && pk->columns.size() == 2);
+        CHECK(!t->find_column("a")->nullable && !t->find_column("b")->nullable);
+    }
+
+    // Two PRIMARY KEY definitions (column + table) are rejected.
+    CHECK(!run(p, mgr, "CREATE TABLE t3 (a INTEGER PRIMARY KEY, PRIMARY KEY (a))").ok);
+    CHECK(mgr.catalog().find_table("t3") == nullptr);
+
+    // Dropping a PK column removes the PK constraint (own constraint cleanup).
+    CHECK(run(p, mgr, "ALTER TABLE t2 DROP COLUMN b").ok);
+    CHECK(pk_of(*mgr.catalog().find_table("t2")) == nullptr);
+
+    // Durable: the column-level PK on t survives a reload.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        const TableInfo* t = mgr2.catalog().find_table("t");
+        const Constraint* pk = pk_of(*t);
+        CHECK(pk != nullptr && pk->columns.size() == 1);
+        CHECK(!t->find_column("id")->nullable);
+    }
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -677,6 +737,7 @@ int main() {
     test_alter_validation();
     test_alter_column_default();
     test_alter_column_not_null();
+    test_primary_key_constraint();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

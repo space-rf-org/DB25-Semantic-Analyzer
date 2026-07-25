@@ -185,6 +185,31 @@ std::vector<CatalogManager::CheckSpec> collect_checks(const ASTNode* create_stmt
     return out;
 }
 
+// Collect the PRIMARY KEY column names from a CREATE TABLE node. A column-level
+// PRIMARY KEY names its own column; a table-level PRIMARY KEY (a, b) names its
+// Identifier children. At most one primary key is well-formed (validate_ddl
+// enforces this), so the two sources are mutually exclusive in practice.
+std::vector<std::string> collect_primary_key(const ASTNode* create_stmt) {
+    std::vector<std::string> pk;
+    for (const ASTNode* c = create_stmt->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type == NodeType::PrimaryKeyConstraint) {
+            // Table-level PRIMARY KEY (col, ...).
+            for (const ASTNode* id = c->first_child; id != nullptr; id = id->next_sibling) {
+                if (id->node_type == NodeType::Identifier) {
+                    pk.emplace_back(id->primary_text);
+                }
+            }
+        } else if (c->node_type == NodeType::ColumnDefinition) {
+            for (const ASTNode* k = c->first_child; k != nullptr; k = k->next_sibling) {
+                if (k->node_type == NodeType::PrimaryKeyConstraint) {
+                    pk.emplace_back(c->primary_text);  // column-level: this column
+                }
+            }
+        }
+    }
+    return pk;
+}
+
 // A CHECK predicate whose inferred type is one of these is accepted: Boolean is
 // the intended type; a wildcard (NULL / Unknown / Any) means the type could not
 // be pinned down (e.g. an unmodeled function) and is left to run time rather
@@ -594,7 +619,7 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
         columns.push_back(build_column_info(c));
     }
     return mgr.create_table(name, std::move(columns), collect_foreign_keys(d),
-                            collect_checks(d));
+                            collect_checks(d), collect_primary_key(d));
 }
 
 }  // namespace db25::semantic

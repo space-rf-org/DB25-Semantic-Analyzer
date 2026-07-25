@@ -87,12 +87,33 @@ public:
     [[nodiscard]] DdlResult create_table(const std::string& name,
                                          std::vector<ColumnInfo> columns,
                                          std::vector<ForeignKeySpec> foreign_keys = {},
-                                         std::vector<CheckSpec> checks = {}) {
+                                         std::vector<CheckSpec> checks = {},
+                                         std::vector<std::string> primary_key = {}) {
         if (catalog_.find_table(name) != nullptr) {
             return fail("table already exists: " + name);
         }
         InMemoryCatalog next = catalog_;  // copy; catalog is small
         TableInfo& self = next.add_table(name, std::move(columns));
+
+        // PRIMARY KEY (column-level or table-level) becomes a first-class
+        // constraint over its columns, which are additionally forced NOT NULL
+        // (a primary key column can never be null).
+        if (!primary_key.empty()) {
+            Constraint c;
+            c.kind = Constraint::Kind::PrimaryKey;
+            for (const std::string& col : primary_key) {
+                ColumnInfo* ci = nullptr;
+                for (ColumnInfo& cc : self.columns) {
+                    if (cc.name == col) { ci = &cc; break; }
+                }
+                if (ci == nullptr) {
+                    return fail("PRIMARY KEY on '" + name + "': no column '" + col + "'");
+                }
+                c.columns.push_back(ci->column_id);
+                ci->nullable = false;
+            }
+            self.constraints.push_back(std::move(c));
+        }
 
         for (const ForeignKeySpec& fk : foreign_keys) {
             const std::string where = "FK on '" + name + "'";
@@ -365,10 +386,9 @@ public:
     // table and column must exist. A change that is already in effect is a no-op
     // success and does not bump the version.
     //
-    // NOTE: PostgreSQL refuses DROP NOT NULL on a primary-key column. The catalog
-    // does not yet model PRIMARY KEY as a constraint (a PK column is only recorded
-    // as nullable=false), so that guard cannot be enforced here and is deferred to
-    // when PRIMARY KEY becomes a first-class constraint.
+    // PostgreSQL refuses DROP NOT NULL on a primary-key column (a PK column can
+    // never be null); such a request is rejected here now that PRIMARY KEY is a
+    // first-class constraint.
     [[nodiscard]] DdlResult set_column_nullable(const std::string& table,
                                                 const std::string& col, bool nullable) {
         const TableInfo* t = catalog_.find_table(table);
@@ -378,6 +398,16 @@ public:
         const ColumnInfo* c = t->find_column(col);
         if (c == nullptr) {
             return fail("ALTER TABLE " + table + ": no such column '" + col + "'");
+        }
+        if (nullable) {
+            for (const Constraint& k : t->constraints) {
+                if (k.kind == Constraint::Kind::PrimaryKey &&
+                    std::find(k.columns.begin(), k.columns.end(), c->column_id) !=
+                        k.columns.end()) {
+                    return fail("ALTER TABLE " + table + ": column '" + col +
+                                "' is in the primary key; cannot drop NOT NULL");
+                }
+            }
         }
         if (c->nullable == nullable) {
             return DdlResult{true, {}, catalog_.schema_version()};  // no-op

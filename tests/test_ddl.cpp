@@ -341,10 +341,37 @@ void test_drop_self_ref_and_index_cleanup() {
     std::remove(path.c_str());
 }
 
+void test_check_default_validation() {
+    parser::Parser p;
+    std::vector<std::string> e;
+
+    // CHECK may reference only this table's own columns.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (age INTEGER CHECK (age >= 18))"), e));
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "CREATE TABLE t (age INTEGER CHECK (height >= 18))"), e));
+
+    // Table-level CHECK over own columns is valid; an unknown column is not.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a < b))"), e));
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a < zzz))"), e));
+
+    // DEFAULT: a literal or a function/constant is fine; referencing another
+    // column of the same table is not.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (a INTEGER DEFAULT 0)"), e));
+    e.clear();
+    CHECK(validate_ddl(parse(p, "CREATE TABLE t (a TIMESTAMP DEFAULT now())"), e));
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "CREATE TABLE t (a INTEGER DEFAULT b, b INTEGER)"), e));
+}
+
 }  // namespace
 
 int main() {
     test_create_table_end_to_end();
+    test_check_default_validation();
     test_statement_validation_layer();
     test_catalog_integrity_layer();
     test_drop_table();

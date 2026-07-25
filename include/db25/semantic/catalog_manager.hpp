@@ -84,6 +84,57 @@ public:
         return commit(std::move(next));
     }
 
+    // CREATE INDEX. Catalog-integrity checks, all sound only at this serialized
+    // commit point: the index name must be unused, the target table must exist,
+    // and every named column must exist in it (resolved here to column_ids).
+    // With `if_not_exists`, an existing index of that name is a no-op success.
+    [[nodiscard]] DdlResult create_index(const std::string& name,
+                                         const std::string& table,
+                                         const std::vector<std::string>& columns,
+                                         bool unique, bool if_not_exists = false) {
+        if (catalog_.find_index(name) != nullptr) {
+            if (if_not_exists) {
+                return DdlResult{true, {}, catalog_.schema_version()};
+            }
+            return fail("index already exists: " + name);
+        }
+        const TableInfo* t = catalog_.find_table(table);
+        if (t == nullptr) {
+            return fail("CREATE INDEX " + name + ": no such table: " + table);
+        }
+        if (columns.empty()) {
+            return fail("CREATE INDEX " + name + ": no columns");
+        }
+        std::vector<std::uint32_t> column_ids;
+        column_ids.reserve(columns.size());
+        for (const std::string& col : columns) {
+            const ColumnInfo* c = t->find_column(col);
+            if (c == nullptr) {
+                return fail("CREATE INDEX " + name + ": table '" + table +
+                            "' has no column '" + col + "'");
+            }
+            column_ids.push_back(c->column_id);
+        }
+        InMemoryCatalog next = catalog_;  // copy
+        next.add_index(name, table, std::move(column_ids), unique);
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
+    // DROP INDEX. Mirrors DROP TABLE's if_exists semantics.
+    [[nodiscard]] DdlResult drop_index(const std::string& name, bool if_exists = false) {
+        if (catalog_.find_index(name) == nullptr) {
+            if (if_exists) {
+                return DdlResult{true, {}, catalog_.schema_version()};
+            }
+            return fail("no such index: " + name);
+        }
+        InMemoryCatalog next = catalog_;  // copy
+        next.remove_index(name);
+        next.set_schema_version(catalog_.schema_version() + 1);
+        return commit(std::move(next));
+    }
+
 private:
     DdlResult fail(std::string msg) const {
         return DdlResult{false, std::move(msg), catalog_.schema_version()};

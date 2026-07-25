@@ -17,13 +17,16 @@ namespace {
 
 // DROP object-type / IF-EXISTS / CREATE IF-NOT-EXISTS flags, as set by the
 // parser on the statement node's semantic_flags.
-constexpr std::uint16_t kFlagIfExistsOrNotExists = 0x01;
-constexpr std::uint16_t kFlagDropTable = 0x10;
+constexpr std::uint16_t kFlagIfExistsOrNotExists = 0x01;  // IF [NOT] EXISTS
+constexpr std::uint16_t kFlagUnique = 0x02;               // CREATE UNIQUE INDEX
+constexpr std::uint16_t kFlagDropTable = 0x10;            // DROP TABLE
+constexpr std::uint16_t kFlagDropIndex = 0x20;            // DROP INDEX
 
 // Locate the single DDL statement in a (possibly wrapping) parse tree.
 const ASTNode* find_ddl(const ASTNode* n) {
     if (n == nullptr) return nullptr;
     if (n->node_type == NodeType::CreateTableStmt ||
+        n->node_type == NodeType::CreateIndexStmt ||
         n->node_type == NodeType::DropStmt) {
         return n;
     }
@@ -70,12 +73,25 @@ bool validate_ddl(const ASTNode* stmt, std::vector<std::string>& errors) {
     }
 
     if (d->node_type == NodeType::DropStmt) {
-        if ((d->semantic_flags & kFlagDropTable) == 0) {
-            errors.emplace_back("only DROP TABLE is supported");
+        const bool is_table = (d->semantic_flags & kFlagDropTable) != 0;
+        const bool is_index = (d->semantic_flags & kFlagDropIndex) != 0;
+        if (!is_table && !is_index) {
+            errors.emplace_back("only DROP TABLE / DROP INDEX are supported");
         }
         if (d->primary_text.empty()) {
-            errors.emplace_back("DROP TABLE: missing table name");
+            errors.emplace_back("DROP: missing object name");
         }
+        return errors.empty();
+    }
+
+    if (d->node_type == NodeType::CreateIndexStmt) {
+        if (d->primary_text.empty()) errors.emplace_back("CREATE INDEX: missing index name");
+        if (d->schema_name.empty()) errors.emplace_back("CREATE INDEX: missing target table");
+        int cols = 0;
+        for (const ASTNode* c = d->first_child; c != nullptr; c = c->next_sibling) {
+            if (c->node_type == NodeType::Identifier) ++cols;
+        }
+        if (cols == 0) errors.emplace_back("CREATE INDEX: no columns");
         return errors.empty();
     }
 
@@ -141,7 +157,21 @@ DdlResult execute_ddl(const ASTNode* stmt, CatalogManager& mgr) {
 
     if (d->node_type == NodeType::DropStmt) {
         const bool if_exists = (d->semantic_flags & kFlagIfExistsOrNotExists) != 0;
+        if ((d->semantic_flags & kFlagDropIndex) != 0) {
+            return mgr.drop_index(std::string(d->primary_text), if_exists);
+        }
         return mgr.drop_table(std::string(d->primary_text), if_exists);
+    }
+
+    if (d->node_type == NodeType::CreateIndexStmt) {
+        std::vector<std::string> cols;
+        for (const ASTNode* c = d->first_child; c != nullptr; c = c->next_sibling) {
+            if (c->node_type == NodeType::Identifier) cols.emplace_back(c->primary_text);
+        }
+        const bool unique = (d->semantic_flags & kFlagUnique) != 0;
+        const bool if_not_exists = (d->semantic_flags & kFlagIfExistsOrNotExists) != 0;
+        return mgr.create_index(std::string(d->primary_text), std::string(d->schema_name),
+                                cols, unique, if_not_exists);
     }
 
     // CREATE TABLE.

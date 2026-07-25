@@ -49,6 +49,51 @@ struct ColFlags {
     bool has_default = false;
 };
 
+// Collect referenced column names from a node's Identifier children.
+void collect_ref_columns(const ASTNode* n, std::vector<std::string>& out) {
+    for (const ASTNode* c = n->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type == NodeType::Identifier) out.emplace_back(c->primary_text);
+    }
+}
+
+// Extract every foreign key (column-level and table-level) from a CREATE TABLE
+// node into by-name specs the catalog manager resolves at commit.
+std::vector<CatalogManager::ForeignKeySpec> collect_foreign_keys(const ASTNode* create_stmt) {
+    std::vector<CatalogManager::ForeignKeySpec> out;
+    for (const ASTNode* c = create_stmt->first_child; c != nullptr; c = c->next_sibling) {
+        if (c->node_type == NodeType::ColumnDefinition) {
+            // Column-level FK: `col T REFERENCES t (cols)`. Local column is this
+            // column; the FK node carries the referenced table + columns.
+            for (const ASTNode* k = c->first_child; k != nullptr; k = k->next_sibling) {
+                if (k->node_type != NodeType::ForeignKeyConstraint) continue;
+                CatalogManager::ForeignKeySpec fk;
+                fk.columns.emplace_back(c->primary_text);
+                fk.ref_table = std::string(k->primary_text);
+                collect_ref_columns(k, fk.ref_columns);
+                out.push_back(std::move(fk));
+            }
+        } else if (c->node_type == NodeType::ForeignKeyConstraint) {
+            // Table-level FK: local columns are the Identifier children; the
+            // ReferencesClause child carries the referenced table + columns.
+            CatalogManager::ForeignKeySpec fk;
+            const ASTNode* ref = nullptr;
+            for (const ASTNode* ch = c->first_child; ch != nullptr; ch = ch->next_sibling) {
+                if (ch->node_type == NodeType::ReferencesClause) {
+                    ref = ch;
+                } else if (ch->node_type == NodeType::Identifier) {
+                    fk.columns.emplace_back(ch->primary_text);
+                }
+            }
+            if (ref != nullptr) {
+                fk.ref_table = std::string(ref->primary_text);
+                collect_ref_columns(ref, fk.ref_columns);
+            }
+            out.push_back(std::move(fk));
+        }
+    }
+    return out;
+}
+
 ColFlags column_flags(const ASTNode* coldef) {
     ColFlags f;
     for (const ASTNode* c = coldef->first_child; c != nullptr; c = c->next_sibling) {
@@ -194,7 +239,7 @@ DdlResult execute_ddl(const ASTNode* stmt, CatalogManager& mgr) {
         ci.has_default = f.has_default;
         columns.push_back(std::move(ci));
     }
-    return mgr.create_table(name, std::move(columns));
+    return mgr.create_table(name, std::move(columns), collect_foreign_keys(d));
 }
 
 }  // namespace db25::semantic

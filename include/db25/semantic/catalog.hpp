@@ -8,6 +8,7 @@
 
 #include "db25/ast/node_types.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -82,9 +83,42 @@ public:
         return it == tables_.end() ? nullptr : &it->second;
     }
 
+    // Every table, ordered by table_id for a deterministic enumeration (the
+    // snapshot store relies on this so a saved catalog is byte-stable).
+    [[nodiscard]] std::vector<const TableInfo*> tables() const {
+        std::vector<const TableInfo*> out;
+        out.reserve(tables_.size());
+        for (const auto& [_, t] : tables_) {
+            out.push_back(&t);
+        }
+        std::sort(out.begin(), out.end(),
+                  [](const TableInfo* a, const TableInfo* b) {
+                      return a->table_id < b->table_id;
+                  });
+        return out;
+    }
+
+    // Monotonic schema version, bumped by the catalog manager on each committed
+    // DDL. Persisted in the snapshot so a reloaded catalog resumes at the same
+    // version (and the id allocator does not collide with existing tables).
+    [[nodiscard]] std::uint32_t schema_version() const noexcept { return schema_version_; }
+    void set_schema_version(std::uint32_t v) noexcept { schema_version_ = v; }
+    [[nodiscard]] std::uint32_t next_table_id() const noexcept { return next_table_id_; }
+    void set_next_table_id(std::uint32_t n) noexcept { next_table_id_ = n; }
+
+    // Insert a fully-formed table, preserving its table_id and column_ids. Used
+    // by the snapshot loader to reconstruct the exact catalog state; add_table()
+    // (which allocates fresh ids) is the path for new DDL. Replaces any existing
+    // table of the same name.
+    void restore_table(TableInfo info) {
+        const std::string key = info.name;
+        tables_.insert_or_assign(key, std::move(info));
+    }
+
 private:
     std::unordered_map<std::string, TableInfo> tables_;
     std::uint32_t next_table_id_ = 1;
+    std::uint32_t schema_version_ = 0;
 };
 
 }  // namespace db25::semantic

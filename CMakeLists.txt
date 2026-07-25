@@ -15,6 +15,7 @@ find_package(DB25Parser REQUIRED)
 
 add_library(db25semantic
     src/analyzer.cpp
+    src/catalog_snapshot.cpp
 )
 target_include_directories(db25semantic PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -29,4 +30,8 @@ if(BUILD_TESTS)
     add_executable(semantic_tests tests/test_analyzer.cpp)
     target_link_libraries(semantic_tests PRIVATE db25semantic DB25::db25parser)
     add_test(NAME semantic_tests COMMAND semantic_tests)
+
+    add_executable(catalog_snapshot_tests tests/test_catalog_snapshot.cpp)
+    target_link_libraries(catalog_snapshot_tests PRIVATE db25semantic DB25::db25parser)
+    add_test(NAME catalog_snapshot_tests COMMAND catalog_snapshot_tests)
 endif()

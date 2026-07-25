@@ -462,6 +462,111 @@ void test_check_default_typecheck() {
     CHECK(!validate_ddl(parse(p, "CREATE TABLE t (a BOOLEAN DEFAULT 0)"), e));
 }
 
+// ALTER TABLE ADD COLUMN: appends a column with a fresh id, persists a DEFAULT,
+// rejects a duplicate name and a bad type, and is durable across a reload.
+void test_alter_add_column() {
+    const std::string path = scratch_path("ddl_alter_add.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    CHECK(run(p, mgr, "CREATE TABLE t (id INTEGER PRIMARY KEY)").ok);
+    const DdlResult r = run(p, mgr, "ALTER TABLE t ADD COLUMN age INTEGER DEFAULT 0");
+    CHECK(r.ok);
+    const TableInfo* t = mgr.catalog().find_table("t");
+    CHECK(t != nullptr);
+    if (t != nullptr) {
+        CHECK(t->columns.size() == 2);
+        const ColumnInfo* age = t->find_column("age");
+        CHECK(age != nullptr && age->type == DataType::Integer);
+        CHECK(age != nullptr && age->has_default && age->default_expr == "0");
+        // Fresh, distinct column id (never reused).
+        const ColumnInfo* id = t->find_column("id");
+        CHECK(id != nullptr && age != nullptr && id->column_id != age->column_id);
+    }
+
+    // Duplicate column name and adding to a missing table both fail (no change).
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD COLUMN age TEXT").ok);
+    CHECK(!run(p, mgr, "ALTER TABLE nope ADD COLUMN x INTEGER").ok);
+    // Unknown type is a layer-1 rejection.
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD COLUMN bad NOTATYPE").ok);
+    // A DEFAULT incompatible with the new column's type is rejected.
+    CHECK(!run(p, mgr, "ALTER TABLE t ADD COLUMN b BOOLEAN DEFAULT 0").ok);
+
+    // Durable across reload.
+    {
+        std::string e;
+        CatalogManager mgr2(path, e);
+        const TableInfo* t2 = mgr2.catalog().find_table("t");
+        CHECK(t2 != nullptr && t2->find_column("age") != nullptr);
+    }
+    std::remove(path.c_str());
+}
+
+// ALTER TABLE DROP COLUMN: removes a column and its own index; refuses when the
+// only column or an external FK depends on it (RESTRICT) unless CASCADE.
+void test_alter_drop_column() {
+    const std::string path = scratch_path("ddl_alter_drop.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    CHECK(run(p, mgr, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").ok);
+    CHECK(run(p, mgr, "CREATE INDEX ix ON t (a)").ok);
+
+    // Dropping 'a' takes its index with it automatically.
+    CHECK(run(p, mgr, "ALTER TABLE t DROP COLUMN a").ok);
+    const TableInfo* t = mgr.catalog().find_table("t");
+    CHECK(t != nullptr && t->find_column("a") == nullptr);
+    CHECK(mgr.catalog().find_index("ix") == nullptr);
+
+    // Dropping a missing column fails; the last column cannot be dropped.
+    CHECK(!run(p, mgr, "ALTER TABLE t DROP COLUMN a").ok);
+    CHECK(run(p, mgr, "ALTER TABLE t DROP COLUMN b").ok);   // now (id) remains
+    CHECK(!run(p, mgr, "ALTER TABLE t DROP COLUMN id").ok);  // the only column
+
+    // External FK dependency: RESTRICT refuses, CASCADE drops the FK.
+    const std::string path3 = scratch_path("ddl_alter_drop3.db25cat");
+    std::remove(path3.c_str());
+    CatalogManager mgr3(path3, load_err);
+    CHECK(run(p, mgr3, "CREATE TABLE parent (pid INTEGER PRIMARY KEY, note TEXT)").ok);
+    CHECK(run(p, mgr3,
+        "CREATE TABLE child (cid INTEGER, pid INTEGER REFERENCES parent (pid))").ok);
+    // parent.pid is referenced by child's FK: RESTRICT refuses.
+    CHECK(!run(p, mgr3, "ALTER TABLE parent DROP COLUMN pid").ok);
+    CHECK(mgr3.catalog().find_table("parent")->find_column("pid") != nullptr);
+    // CASCADE drops the referencing FK, then the column.
+    CHECK(run(p, mgr3, "ALTER TABLE parent DROP COLUMN pid CASCADE").ok);
+    CHECK(mgr3.catalog().find_table("parent")->find_column("pid") == nullptr);
+    {
+        const TableInfo* child = mgr3.catalog().find_table("child");
+        bool has_fk = false;
+        for (const Constraint& c : child->constraints) {
+            if (c.kind == Constraint::Kind::ForeignKey) has_fk = true;
+        }
+        CHECK(!has_fk);
+    }
+    std::remove(path3.c_str());
+    std::remove(path.c_str());
+}
+
+// ALTER TABLE well-formedness: unsupported actions / inline constraints rejected.
+void test_alter_validation() {
+    parser::Parser p;
+    std::vector<std::string> e;
+    // A column-level CHECK on an added column is refused (not silently dropped).
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "ALTER TABLE t ADD COLUMN a INTEGER CHECK (a > 0)"), e));
+    // A column-level REFERENCES on an added column is likewise refused.
+    e.clear();
+    CHECK(!validate_ddl(parse(p, "ALTER TABLE t ADD COLUMN a INTEGER REFERENCES u (x)"), e));
+    // NOT NULL and DEFAULT together are fine.
+    e.clear();
+    CHECK(validate_ddl(parse(p, "ALTER TABLE t ADD COLUMN a INTEGER NOT NULL DEFAULT 0"), e));
+}
+
 }  // namespace
 
 int main() {
@@ -480,6 +585,9 @@ int main() {
     test_self_referencing_foreign_key();
     test_drop_restrict_and_cascade();
     test_drop_self_ref_and_index_cleanup();
+    test_alter_add_column();
+    test_alter_drop_column();
+    test_alter_validation();
 
     std::printf("ddl: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

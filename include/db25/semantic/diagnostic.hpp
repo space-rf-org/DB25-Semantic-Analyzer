@@ -71,6 +71,9 @@ enum class DiagnosticCode : std::uint16_t {
     // or an UPDATE whose SET assignments are. Only reported when every column the
     // predicate references folds to a constant, so the result is certain.
     CheckViolation,
+    // A derived table's column-alias list "(a, b, ...)" names more columns than
+    // the derived table produces.
+    ColumnAliasCountMismatch,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

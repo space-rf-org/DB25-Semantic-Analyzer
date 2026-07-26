@@ -154,6 +154,18 @@ private:
     void resolve_from(ASTNode* from_clause, Scope& scope);
     void resolve_from_item(ASTNode* item, Scope& scope);
 
+    // Columns of a VALUES list used as a derived table: one per value position in
+    // the first row, typed by inference (nullable, anonymous). A column-alias
+    // list supplies the names.
+    std::vector<ResolvedColumn> columns_from_values(ASTNode* values_stmt, Scope& scope);
+
+    // Rename a derived table's output columns from its "(a, b, ...)" column-alias
+    // list, positionally. More aliases than columns is a ColumnAliasCountMismatch;
+    // fewer is allowed (trailing columns keep their inferred names). `at` locates
+    // the diagnostic.
+    void apply_column_aliases(std::vector<ResolvedColumn>& cols, ASTNode* alias_list,
+                              ASTNode* at);
+
     // Resolve a JOIN's USING (col, ...) columns against the left relations
     // (indices [0, left_end)) and right relations ([left_end, right_end)).
     void resolve_using(ASTNode* using_clause, Scope& scope, std::size_t left_end,

@@ -1932,6 +1932,61 @@ void test_update_explicit_null_into_not_null() {
     CHECK(count_code(a2, DiagnosticCode::NotNullViolation) == 0);
 }
 
+void test_update_check_violation() {
+    std::printf("test_update_check_violation\n");
+    // An UPDATE SET assigning a constant that fails a CHECK is a definite
+    // violation. Unlike INSERT, unset columns keep their existing (unknown)
+    // values - no default substitution - so a CHECK over an unset column stays
+    // Unknown.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("t", {
+        ColumnInfo{"age", DataType::Integer, /*nullable=*/true},    // column_id 1
+        ColumnInfo{"score", DataType::Integer, /*nullable=*/true},  // column_id 2
+        ColumnInfo{"grade", DataType::Text, /*nullable=*/true},     // column_id 3
+        ColumnInfo{"lo", DataType::Integer, /*nullable=*/true},     // column_id 4
+        ColumnInfo{"hi", DataType::Integer, /*nullable=*/true},     // column_id 5
+    });
+    Constraint ca; ca.kind = Constraint::Kind::Check; ca.expr = "age >= 0"; ca.columns = {1};
+    Constraint cs; cs.kind = Constraint::Kind::Check;
+    cs.expr = "score >= 0 AND score <= 100"; cs.columns = {2};
+    Constraint cr; cr.kind = Constraint::Kind::Check;  // spans two columns
+    cr.expr = "lo <= hi"; cr.columns = {4, 5};
+    t.constraints.push_back(ca);
+    t.constraints.push_back(cs);
+    t.constraints.push_back(cr);
+
+    parser::Parser p;
+    auto viol = [&](const char* sql) {
+        auto r = p.parse(sql);
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::CheckViolation);
+    };
+
+    // Single-column CHECKs decided by the SET value.
+    CHECK(viol("UPDATE t SET age = -1") == 1);
+    CHECK(viol("UPDATE t SET age = 5") == 0);
+    CHECK(viol("UPDATE t SET score = 150") == 1);        // > 100
+    CHECK(viol("UPDATE t SET age = -1, score = 200") == 2);
+    CHECK(viol("UPDATE t SET age = 0, score = 100") == 0);  // boundaries
+    // A constant expression SET value is folded too.
+    CHECK(viol("UPDATE t SET age = 3 - 5") == 1);        // -2 -> violation
+    // NULL makes the predicate Unknown, not a violation.
+    CHECK(viol("UPDATE t SET age = NULL") == 0);
+    // A non-constant SET value can't be folded: stay silent (no false positive).
+    CHECK(viol("UPDATE t SET age = some_func(1)") == 0);
+    // grade is referenced by no CHECK.
+    CHECK(viol("UPDATE t SET grade = 'A'") == 0);
+    // A CHECK spanning two columns is only decided when both are SET: setting
+    // only lo leaves hi's existing value unknown -> Unknown -> no report.
+    CHECK(viol("UPDATE t SET lo = 10") == 0);
+    CHECK(viol("UPDATE t SET lo = 10, hi = 5") == 1);    // 10 <= 5 is false
+    CHECK(viol("UPDATE t SET lo = 3, hi = 9") == 0);     // 3 <= 9 is true
+    // A WHERE clause does not change the CHECK outcome.
+    CHECK(viol("UPDATE t SET age = -1 WHERE grade = 'A'") == 1);
+}
+
 void test_insert_default_values() {
     std::printf("test_insert_default_values\n");
     auto cat = make_catalog();  // id INTEGER NOT NULL (no default), name TEXT nullable
@@ -3057,6 +3112,7 @@ int main() {
     // DML: UPDATE
     test_update_clean();
     test_update_explicit_null_into_not_null();
+    test_update_check_violation();
     test_update_unknown_column();
     test_update_type_diagnostic();
     test_update_where();

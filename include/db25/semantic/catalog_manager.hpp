@@ -121,7 +121,7 @@ public:
             for (const std::string& col : primary_key.columns) {
                 ColumnInfo* ci = nullptr;
                 for (ColumnInfo& cc : self.columns) {
-                    if (cc.name == col) { ci = &cc; break; }
+                    if (iequals(cc.name, col)) { ci = &cc; break; }
                 }
                 if (ci == nullptr) {
                     return fail("PRIMARY KEY on '" + name + "': no column '" + col + "'");
@@ -199,9 +199,9 @@ public:
         }
         // Find dependents: foreign keys in OTHER tables referencing `name`.
         for (const TableInfo* t : catalog_.tables()) {
-            if (t->name == name) continue;  // self-reference is not a dependency
+            if (iequals(t->name, name)) continue;  // self-reference is not a dependency
             for (const Constraint& c : t->constraints) {
-                if (c.kind == Constraint::Kind::ForeignKey && c.ref_table == name && !cascade) {
+                if (c.kind == Constraint::Kind::ForeignKey && iequals(c.ref_table, name) && !cascade) {
                     return fail("cannot drop table '" + name + "': table '" + t->name +
                                 "' has a foreign key referencing it (use CASCADE)");
                 }
@@ -321,9 +321,9 @@ public:
         // column. RESTRICT refuses; CASCADE drops those foreign keys below.
         if (!cascade) {
             for (const TableInfo* other : catalog_.tables()) {
-                if (other->name == table) continue;
+                if (iequals(other->name, table)) continue;
                 for (const Constraint& c : other->constraints) {
-                    if (c.kind != Constraint::Kind::ForeignKey || c.ref_table != table) {
+                    if (c.kind != Constraint::Kind::ForeignKey || !iequals(c.ref_table, table)) {
                         continue;
                     }
                     if (std::find(c.ref_columns.begin(), c.ref_columns.end(), cid) !=
@@ -355,7 +355,7 @@ public:
                  cs.end());
         auto& cols = copy.columns;
         cols.erase(std::remove_if(cols.begin(), cols.end(),
-                       [&col](const ColumnInfo& c) { return c.name == col; }),
+                       [&col](const ColumnInfo& c) { return iequals(c.name, col); }),
                    cols.end());
         next.restore_table(std::move(copy));
 
@@ -380,7 +380,7 @@ public:
         InMemoryCatalog next = catalog_;  // copy
         TableInfo copy = *next.find_table(table);
         for (ColumnInfo& c : copy.columns) {
-            if (c.name == col) {
+            if (iequals(c.name, col)) {
                 c.has_default = true;
                 c.default_expr = expr_text;
                 break;
@@ -425,7 +425,7 @@ public:
         InMemoryCatalog next = catalog_;  // copy
         TableInfo copy = *next.find_table(table);
         for (ColumnInfo& cc : copy.columns) {
-            if (cc.name == col) {
+            if (iequals(cc.name, col)) {
                 cc.nullable = nullable;
                 break;
             }
@@ -454,7 +454,7 @@ public:
         InMemoryCatalog next = catalog_;  // copy
         TableInfo copy = *next.find_table(table);
         for (ColumnInfo& cc : copy.columns) {
-            if (cc.name == col) {
+            if (iequals(cc.name, col)) {
                 cc.has_default = false;
                 cc.default_expr.clear();
                 break;
@@ -491,7 +491,7 @@ public:
         for (const std::string& col : columns) {
             ColumnInfo* ci = nullptr;
             for (ColumnInfo& cc : copy.columns) {
-                if (cc.name == col) { ci = &cc; break; }
+                if (iequals(cc.name, col)) { ci = &cc; break; }
             }
             if (ci == nullptr) {
                 return fail("ADD PRIMARY KEY on '" + table + "': no column '" + col + "'");
@@ -590,7 +590,7 @@ public:
         }
         const Constraint* target = nullptr;
         for (const Constraint& c : t->constraints) {
-            if (c.name == cname) { target = &c; break; }
+            if (iequals(c.name, cname)) { target = &c; break; }
         }
         if (target == nullptr) {
             return fail("ALTER TABLE " + table + ": no constraint named '" + cname + "'");
@@ -605,9 +605,9 @@ public:
         if (provides_key) {
             for (const std::uint32_t cid : target->columns) {
                 for (const TableInfo* other : catalog_.tables()) {
-                    if (other->name == table) continue;
+                    if (iequals(other->name, table)) continue;
                     for (const Constraint& fk : other->constraints) {
-                        if (fk.kind != Constraint::Kind::ForeignKey || fk.ref_table != table) {
+                        if (fk.kind != Constraint::Kind::ForeignKey || !iequals(fk.ref_table, table)) {
                             continue;
                         }
                         if (std::find(fk.ref_columns.begin(), fk.ref_columns.end(), cid) ==
@@ -630,7 +630,7 @@ public:
         std::vector<std::uint32_t> pk_cols = target->columns;
         auto& cs = copy.constraints;
         cs.erase(std::remove_if(cs.begin(), cs.end(),
-                     [&cname](const Constraint& c) { return c.name == cname; }),
+                     [&cname](const Constraint& c) { return iequals(c.name, cname); }),
                  cs.end());
         // A dropped primary key no longer forces its columns NOT NULL.
         if (was_pk) {
@@ -652,7 +652,7 @@ private:
                                                                     const std::string& cname) {
         if (cname.empty()) return std::nullopt;
         for (const Constraint& c : t.constraints) {
-            if (c.name == cname) {
+            if (iequals(c.name, cname)) {
                 return "constraint name '" + cname + "' already exists on '" + t.name + "'";
             }
         }

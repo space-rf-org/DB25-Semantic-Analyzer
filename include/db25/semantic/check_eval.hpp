@@ -13,6 +13,7 @@
 #pragma once
 
 #include "db25/ast/ast_node.hpp"
+#include "db25/semantic/identifier.hpp"
 
 #include <string>
 #include <string_view>
@@ -22,7 +23,11 @@ namespace db25::semantic {
 
 // Each column the predicate may reference, bound to the literal AST node it
 // receives in the INSERT row. Columns not given a literal are simply absent.
-using CheckBindings = std::unordered_map<std::string, const ast::ASTNode*>;
+// Keyed case-insensitively (see identifier.hpp) so a CHECK that spells a column
+// in a different case than its definition - CHECK (SALARY >= 0) on column
+// `salary` - still resolves the binding.
+using CheckBindings =
+    std::unordered_map<std::string, const ast::ASTNode*, IdentifierHash, IdentifierEqual>;
 
 enum class CheckResult { True, False, Unknown };
 

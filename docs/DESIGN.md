@@ -198,6 +198,29 @@ scope in which the `WITH` appears and are found by `FROM` items via
 query block whose projected columns become the columns of the enclosing relation
 binding.
 
+## Identifier case
+
+DB25 resolves every SQL identifier — table, column, alias, CTE, index and
+constraint names — **case-insensitively over ASCII**. `SELECT ID FROM Users`
+resolves against `users(id, …)`, and `CREATE TABLE Foo` followed by a reference
+to `foo` addresses the same table. The rule lives in one place, `identifier.hpp`:
+`iequals` for the linear scans and the `IdentifierHash` / `IdentifierEqual` pair
+for the hash-based lookups (the catalog's table/index maps, a wide relation's
+name index, the CHECK-evaluator's bindings). Stored names keep their original
+spelling for display and for the byte-stable catalog snapshot; only the lookup
+folds case.
+
+This is a deliberate choice, and the only self-consistent one available at this
+layer. The tokenizer strips the surrounding quotes from a delimited identifier
+(`"Foo"`) and emits it as a plain identifier token, byte-for-byte
+indistinguishable from a bare `Foo`. Because the quoted/unquoted distinction
+never reaches the analyzer, DB25 cannot honor PostgreSQL's split rule — bare
+identifiers fold to lower case, quoted ones stay case-sensitive — so it folds
+*every* identifier instead, matching the common case of PostgreSQL and SQLite
+alike. The known limitation is therefore that a genuinely case-sensitive quoted
+identifier (`"Foo"` distinct from `"foo"`) is not supported; that would require
+the tokenizer to carry a delimited-identifier flag through to the AST.
+
 ## Projection, joins, and set operations
 
 Three capabilities built on the passes above:

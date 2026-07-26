@@ -6,6 +6,7 @@
 #include "db25/parser/parser.hpp"
 #include "db25/semantic/ast_helpers.hpp"
 #include "db25/semantic/check_eval.hpp"
+#include "db25/semantic/identifier.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1292,7 +1293,7 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             if (is_column_ref_node(item->node_type)) {
                 const std::string_view name = split_column_ref(item->primary_text).column;
                 for (const auto& col : output) {
-                    if (col.name == name) {
+                    if (iequals(col.name, name)) {
                         out_match = &col;
                         break;
                     }
@@ -1440,7 +1441,7 @@ void Analyzer::resolve_from(ASTNode* from_clause, Scope& scope) {
         }
         bool duplicate = false;
         for (const std::string_view prior : seen) {
-            if (prior == qualifier) {
+            if (iequals(prior, qualifier)) {
                 duplicate = true;
                 break;
             }
@@ -2336,7 +2337,7 @@ namespace {
     if (cid != 0 && k.column_id != 0) {
         return tid == k.table_id && cid == k.column_id;
     }
-    return ref->primary_text == k.text;
+    return iequals(ref->primary_text, k.text);  // identifiers compare case-insensitively
 }
 
 }  // namespace
@@ -2440,7 +2441,7 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                 if (qref.qualifier.empty()) {
                     bool is_output_ref = false;
                     for (const ResolvedColumn& col : output) {
-                        if (col.name == qref.column) { is_output_ref = true; break; }
+                        if (iequals(col.name, qref.column)) { is_output_ref = true; break; }
                     }
                     if (is_output_ref) {
                         continue;

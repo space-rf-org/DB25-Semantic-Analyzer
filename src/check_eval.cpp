@@ -90,7 +90,7 @@ private:
                 return V::null_();
             case NodeType::ColumnRef:
             case NodeType::Identifier: {
-                const auto it = binds_.find(std::string(n->primary_text));
+                const auto it = binds_.find(n->primary_text);  // transparent, case-insensitive
                 if (it == binds_.end()) return V::fail();
                 return eval(it->second);
             }

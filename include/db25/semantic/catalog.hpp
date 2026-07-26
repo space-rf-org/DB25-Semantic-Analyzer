@@ -7,6 +7,7 @@
 #pragma once
 
 #include "db25/ast/node_types.hpp"
+#include "db25/semantic/identifier.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -61,7 +62,7 @@ struct TableInfo {
 
     [[nodiscard]] const ColumnInfo* find_column(std::string_view col) const noexcept {
         for (const auto& c : columns) {
-            if (c.name == col) {
+            if (iequals(c.name, col)) {
                 return &c;
             }
         }
@@ -106,7 +107,7 @@ public:
     }
 
     [[nodiscard]] const TableInfo* find_table(std::string_view name) const override {
-        const auto it = tables_.find(std::string{name});
+        const auto it = tables_.find(name);  // IdentifierHash/Equal: case-insensitive
         return it == tables_.end() ? nullptr : &it->second;
     }
 
@@ -166,7 +167,7 @@ public:
     }
 
     [[nodiscard]] const IndexInfo* find_index(std::string_view name) const {
-        const auto it = indexes_.find(std::string{name});
+        const auto it = indexes_.find(name);  // IdentifierHash/Equal: case-insensitive
         return it == indexes_.end() ? nullptr : &it->second;
     }
 
@@ -180,7 +181,7 @@ public:
     std::size_t drop_indexes_on(std::string_view table) {
         std::size_t removed = 0;
         for (auto it = indexes_.begin(); it != indexes_.end();) {
-            if (it->second.table == table) { it = indexes_.erase(it); ++removed; }
+            if (iequals(it->second.table, table)) { it = indexes_.erase(it); ++removed; }
             else { ++it; }
         }
         return removed;
@@ -193,7 +194,7 @@ public:
             cs.erase(std::remove_if(cs.begin(), cs.end(),
                          [&](const Constraint& c) {
                              return c.kind == Constraint::Kind::ForeignKey &&
-                                    c.ref_table == ref_table;
+                                    iequals(c.ref_table, ref_table);
                          }),
                      cs.end());
             removed += before - cs.size();
@@ -207,7 +208,7 @@ public:
         std::size_t removed = 0;
         for (auto it = indexes_.begin(); it != indexes_.end();) {
             const auto& cols = it->second.columns;
-            if (it->second.table == table &&
+            if (iequals(it->second.table, table) &&
                 std::find(cols.begin(), cols.end(), cid) != cols.end()) {
                 it = indexes_.erase(it);
                 ++removed;
@@ -226,13 +227,13 @@ public:
                                                      std::uint32_t cid) {
         std::size_t removed = 0;
         for (auto& [_, t] : tables_) {
-            if (t.name == ref_table) continue;
+            if (iequals(t.name, ref_table)) continue;
             auto& cs = t.constraints;
             const std::size_t before = cs.size();
             cs.erase(std::remove_if(cs.begin(), cs.end(),
                          [&](const Constraint& c) {
                              return c.kind == Constraint::Kind::ForeignKey &&
-                                    c.ref_table == ref_table &&
+                                    iequals(c.ref_table, ref_table) &&
                                     std::find(c.ref_columns.begin(), c.ref_columns.end(),
                                               cid) != c.ref_columns.end();
                          }),
@@ -263,8 +264,12 @@ public:
     void set_next_index_id(std::uint32_t n) noexcept { next_index_id_ = n; }
 
 private:
-    std::unordered_map<std::string, TableInfo> tables_;
-    std::unordered_map<std::string, IndexInfo> indexes_;
+    // Keyed case-insensitively (see identifier.hpp): CREATE TABLE Foo and a later
+    // reference to foo address the same table. The stored TableInfo::name keeps
+    // the original spelling for display and for the byte-stable snapshot; only
+    // the lookup key folds case.
+    std::unordered_map<std::string, TableInfo, IdentifierHash, IdentifierEqual> tables_;
+    std::unordered_map<std::string, IndexInfo, IdentifierHash, IdentifierEqual> indexes_;
     std::uint32_t next_table_id_ = 1;
     std::uint32_t next_index_id_ = 1;
     std::uint32_t schema_version_ = 0;

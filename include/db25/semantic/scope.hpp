@@ -8,9 +8,9 @@
 #pragma once
 
 #include "db25/ast/node_types.hpp"
+#include "db25/semantic/identifier.hpp"
 
 #include <cstdint>
-#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -21,15 +21,6 @@ namespace db25::semantic {
 using ast::DataType;
 
 class Scope;
-
-// Transparent hash so a name->index map can be probed with a std::string_view
-// without materializing a std::string per lookup (paired with std::equal_to<>).
-struct TransparentStringHash {
-    using is_transparent = void;
-    [[nodiscard]] std::size_t operator()(std::string_view s) const noexcept {
-        return std::hash<std::string_view>{}(s);
-    }
-};
 
 // A column made visible by a relation binding, already resolved to a type.
 struct ResolvedColumn {
@@ -62,9 +53,10 @@ struct RelationBinding {
     // with NULLs. Set on the binding after the join is resolved.
     bool nullable_from_join = false;
 
-    // Does the qualifier `q` (from `q.col`) address this relation?
+    // Does the qualifier `q` (from `q.col`) address this relation? Identifiers
+    // compare case-insensitively (see identifier.hpp).
     [[nodiscard]] bool matches_qualifier(std::string_view q) const {
-        return alias.empty() ? (name == q) : (alias == q);
+        return alias.empty() ? iequals(name, q) : iequals(alias, q);
     }
 
     [[nodiscard]] const ResolvedColumn* find_column(std::string_view col) const {
@@ -86,7 +78,7 @@ struct RelationBinding {
             return it == name_index_.end() ? nullptr : &columns[it->second];
         }
         for (const auto& c : columns) {
-            if (c.name == col) {
+            if (iequals(c.name, col)) {
                 return &c;
             }
         }
@@ -99,10 +91,12 @@ private:
     static constexpr std::size_t kIndexThreshold = 16;
     // Lazily built name -> first-occurrence index over `columns`. `mutable` so the
     // const find_column can memoize it; owned string keys keep it copy/move-safe.
-    // The lazy build assumes single-threaded analysis (the analyzer never shares a
-    // Scope/binding across threads); it would need synchronization otherwise.
-    mutable std::unordered_map<std::string, std::uint32_t, TransparentStringHash,
-                               std::equal_to<>>
+    // Keyed case-insensitively (see identifier.hpp) so the O(1) wide-relation path
+    // matches the linear scan above; the transparent hash/equal also let a
+    // std::string_view probe the map without materializing a key. The lazy build
+    // assumes single-threaded analysis (the analyzer never shares a Scope/binding
+    // across threads); it would need synchronization otherwise.
+    mutable std::unordered_map<std::string, std::uint32_t, IdentifierHash, IdentifierEqual>
         name_index_;
 };
 
@@ -150,7 +144,7 @@ public:
                                std::string_view name) {
         for (std::size_t i = begin; i < end && i < relations_.size(); ++i) {
             for (auto& c : relations_[i].columns) {
-                if (c.name == name) {
+                if (iequals(c.name, name)) {
                     c.coalesced = true;
                 }
             }
@@ -178,7 +172,7 @@ public:
     [[nodiscard]] const NamedRelation* find_cte(std::string_view name) const {
         for (const Scope* s = this; s != nullptr; s = s->parent_) {
             for (const auto& c : s->ctes_) {
-                if (c.name == name) {
+                if (iequals(c.name, name)) {
                     return &c;
                 }
             }

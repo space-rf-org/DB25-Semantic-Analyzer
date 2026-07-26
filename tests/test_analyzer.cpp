@@ -7,6 +7,7 @@
 #include "db25/semantic/analyzer.hpp"
 #include "db25/semantic/ast_helpers.hpp"
 #include "db25/semantic/catalog.hpp"
+#include "db25/semantic/identifier.hpp"
 
 #include <cstdio>
 #include <optional>
@@ -280,6 +281,166 @@ void test_derived_table_column_aliases() {
             CHECK(count_code(a, DiagnosticCode::ColumnAliasCountMismatch) == 1);
         }
     }
+}
+
+// --- Case-insensitive identifier resolution (finding #20) ---------------
+//
+// DB25 resolves identifiers case-insensitively over ASCII: the tokenizer strips
+// the quotes from a delimited identifier and emits it as a plain identifier
+// token, so the analyzer cannot tell `"Foo"` from `Foo` and folds every
+// identifier's case at resolution time (see identifier.hpp). These tests pin
+// that a reference resolves regardless of the case it and its target were
+// written in, and - just as important - that folding does not paper over real
+// ambiguity or duplicate-relation errors.
+
+void test_iequals_helper() {
+    std::printf("test_iequals_helper\n");
+    CHECK(iequals("users", "USERS"));
+    CHECK(iequals("Order_Id", "order_id"));
+    CHECK(iequals("", ""));
+    CHECK(!iequals("user", "users"));       // length differs
+    CHECK(!iequals("naïve", "NAÏVE"));       // non-ASCII byte is not folded
+    CHECK(!iequals("col1", "col2"));
+    // Hash agrees with equality: folded-equal keys must hash the same, or a
+    // case-insensitive unordered_map would miss them.
+    IdentifierHash h;
+    CHECK(h("USERS") == h("users"));
+    CHECK(h("Order_Id") == h("order_id"));
+}
+
+void test_case_insensitive_table_and_column() {
+    std::printf("test_case_insensitive_table_and_column\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT), all lower
+    parser::Parser p;
+    // Table and columns referenced in a different case than the catalog stores.
+    auto res = p.parse("SELECT ID, Name FROM USERS");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* id = first_child(list);
+    ASTNode* name = id ? id->next_sibling : nullptr;
+    CHECK(id != nullptr && a.type_of(id) == DataType::Integer);
+    CHECK(name != nullptr && a.type_of(name) == DataType::Text);
+}
+
+void test_case_insensitive_qualifier_and_alias() {
+    std::printf("test_case_insensitive_qualifier_and_alias\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // Alias declared as `U`; the qualifier `u` addresses it case-insensitively.
+    auto res = p.parse("SELECT u.ID FROM users U");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* uid = first_child(list);
+    CHECK(uid != nullptr && a.type_of(uid) == DataType::Integer);
+}
+
+void test_case_insensitive_cte() {
+    std::printf("test_case_insensitive_cte\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // CTE defined as `Recent`, referenced as `RECENT`.
+    auto res = p.parse("WITH Recent AS (SELECT id FROM users) SELECT id FROM RECENT");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(a.diagnostics().empty());
+}
+
+void test_case_insensitive_mixed_case_catalog() {
+    std::printf("test_case_insensitive_mixed_case_catalog\n");
+    // The catalog stores mixed-case names; a lower-case query still resolves,
+    // and the stored spelling is preserved (only the lookup key folds).
+    InMemoryCatalog cat;
+    cat.add_table("Accounts", {
+        ColumnInfo{"AccountId", DataType::Integer, /*nullable=*/false},
+        ColumnInfo{"Balance", DataType::Double, /*nullable=*/true},
+    });
+    CHECK(cat.find_table("accounts") != nullptr);          // find_table folds case
+    CHECK(cat.find_table("ACCOUNTS") == cat.find_table("Accounts"));
+    const TableInfo* t = cat.find_table("accounts");
+    CHECK(t != nullptr && t->name == "Accounts");          // display spelling kept
+    CHECK(t != nullptr && t->find_column("accountid") != nullptr);  // find_column folds
+
+    parser::Parser p;
+    auto res = p.parse("SELECT accountid, balance FROM accounts");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* acc = first_child(list);
+    CHECK(acc != nullptr && a.type_of(acc) == DataType::Integer);
+}
+
+void test_case_insensitive_ambiguity_preserved() {
+    std::printf("test_case_insensitive_ambiguity_preserved\n");
+    // orders and sessions both have `user_id`; a bare reference - even in a
+    // different case - is still ambiguous. Folding must not hide the conflict.
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    auto res = p.parse(
+        "SELECT User_Id FROM orders o JOIN sessions s ON o.user_id = s.user_id");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AmbiguousColumn) == 1);
+}
+
+void test_case_insensitive_duplicate_relation() {
+    std::printf("test_case_insensitive_duplicate_relation\n");
+    // `users` and `USERS` name the same relation twice in FROM - a duplicate
+    // correlation name, which SQL rejects. The dedup check folds case too.
+    auto cat = make_catalog();
+    parser::Parser p;
+    auto res = p.parse("SELECT 1 FROM users, USERS");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::DuplicateRelation) == 1);
+}
+
+void test_case_insensitive_check_binding() {
+    std::printf("test_case_insensitive_check_binding\n");
+    // A CHECK that spells its column in a different case than the definition
+    // still binds the row value, so a definite violation is caught. Exercises
+    // the case-insensitive CheckBindings map.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("t", {
+        ColumnInfo{"Age", DataType::Integer, /*nullable=*/true},  // column_id 1
+    });
+    Constraint c; c.kind = Constraint::Kind::Check; c.expr = "AGE >= 0"; c.columns = {1};
+    t.constraints.push_back(c);
+
+    parser::Parser p;
+    auto viol = [&](const char* sql) {
+        auto r = p.parse(sql);
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::CheckViolation);
+    };
+    CHECK(viol("INSERT INTO t (age) VALUES (-5)") == 1);   // column ref folds to Age
+    CHECK(viol("INSERT INTO t (AGE) VALUES (5)") == 0);
 }
 
 void test_values_derived_table() {
@@ -3093,6 +3254,14 @@ int main() {
     test_alias_resolution();
     test_derived_table();
     test_derived_table_column_aliases();
+    test_iequals_helper();
+    test_case_insensitive_table_and_column();
+    test_case_insensitive_qualifier_and_alias();
+    test_case_insensitive_cte();
+    test_case_insensitive_mixed_case_catalog();
+    test_case_insensitive_ambiguity_preserved();
+    test_case_insensitive_duplicate_relation();
+    test_case_insensitive_check_binding();
     test_values_derived_table();
     test_where_type_inference();
     test_cte_resolution();

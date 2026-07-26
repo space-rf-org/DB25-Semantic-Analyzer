@@ -66,9 +66,10 @@ enum class DiagnosticCode : std::uint16_t {
     // chain of many thousands of operators, which the parser does not bound).
     // Analysis of the over-deep subtree is abandoned to avoid a stack overflow.
     ExpressionTooComplex,
-    // An INSERT row of all-constant values makes a table CHECK constraint
-    // evaluate to FALSE (a definite violation). Only reported when every column
-    // the predicate references is given a literal, so the result is certain.
+    // A DML row makes a table CHECK constraint evaluate to FALSE (a definite
+    // violation): an INSERT whose supplied and defaulted values are all constant,
+    // or an UPDATE whose SET assignments are. Only reported when every column the
+    // predicate references folds to a constant, so the result is certain.
     CheckViolation,
 };
 

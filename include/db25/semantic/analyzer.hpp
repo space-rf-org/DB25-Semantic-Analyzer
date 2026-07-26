@@ -118,13 +118,19 @@ private:
     // that is not a NULL literal.
     void check_not_null_literal(const ColumnInfo* col, ASTNode* value);
 
-    // For one INSERT VALUES row, evaluate each of the table's CHECK constraints
-    // over the row's constant literals and report a definite violation. A CHECK
-    // is only evaluated when every column it references is given a literal in the
-    // row, so the outcome is certain (see check_eval.hpp). `at` locates the row.
+    // Evaluate each of the table's CHECK constraints over one row's constant
+    // values and report a definite violation. `target_cols`/`vals` are the
+    // columns given a value and those value nodes (positionally aligned); a CHECK
+    // is only decided when every column it references is bound to a constant, so
+    // the outcome is certain (see check_eval.hpp). With `apply_defaults` (INSERT),
+    // a column the row omits is bound to its DEFAULT when that default is a
+    // constant, so a default-sourced violation is caught; UPDATE passes false
+    // because an unset column keeps its existing value, not its default. `at`
+    // locates the row for the diagnostic.
     void check_row_against_checks(const TableInfo& table,
                                   const std::vector<const ColumnInfo*>& target_cols,
-                                  const std::vector<ASTNode*>& vals, const ASTNode* at);
+                                  const std::vector<ASTNode*>& vals, const ASTNode* at,
+                                  bool apply_defaults);
 
     // Validate a LIMIT / OFFSET clause: any operand that is a literal must be a
     // non-negative integer (negative or non-integer literal -> InvalidLimit).

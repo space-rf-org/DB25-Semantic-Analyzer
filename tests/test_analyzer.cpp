@@ -1805,6 +1805,90 @@ void test_insert_check_violation() {
     CHECK(viol("INSERT INTO t (age) VALUES (1), (-2), (3)") == 1);
 }
 
+void test_insert_check_violation_from_default() {
+    std::printf("test_insert_check_violation_from_default\n");
+    // A column omitted from an INSERT takes its DEFAULT. When that default is a
+    // constant, it is folded into the CHECK evaluation, so a default-sourced
+    // violation is caught - not just violations from explicit values.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("t", {
+        // status defaults to 'banned', which violates the CHECK below.
+        ColumnInfo{"status", DataType::Text, /*nullable=*/true, /*has_default=*/true,
+                   /*column_id=*/1, /*default_expr=*/"'banned'"},
+        // qty defaults to -1, which violates qty >= 0.
+        ColumnInfo{"qty", DataType::Integer, /*nullable=*/true, /*has_default=*/true,
+                   /*column_id=*/2, /*default_expr=*/"-1"},
+        // note has no default; used to drive an INSERT that omits status/qty.
+        ColumnInfo{"note", DataType::Text, /*nullable=*/true, /*has_default=*/false,
+                   /*column_id=*/3, /*default_expr=*/""},
+        // ok_col defaults to 5, which satisfies its CHECK (ok_col < 100).
+        ColumnInfo{"ok_col", DataType::Integer, /*nullable=*/true, /*has_default=*/true,
+                   /*column_id=*/4, /*default_expr=*/"5"},
+        // ts defaults to a non-constant call: it must stay unfolded (no violation).
+        ColumnInfo{"ts", DataType::Integer, /*nullable=*/true, /*has_default=*/true,
+                   /*column_id=*/5, /*default_expr=*/"some_func(1)"},
+    });
+    Constraint cs; cs.kind = Constraint::Kind::Check;
+    cs.expr = "status <> 'banned'"; cs.columns = {1};
+    Constraint cq; cq.kind = Constraint::Kind::Check;
+    cq.expr = "qty >= 0"; cq.columns = {2};
+    Constraint co; co.kind = Constraint::Kind::Check;
+    co.expr = "ok_col < 100"; co.columns = {4};
+    Constraint ct; ct.kind = Constraint::Kind::Check;
+    ct.expr = "ts > 0"; ct.columns = {5};
+    t.constraints.push_back(cs);
+    t.constraints.push_back(cq);
+    t.constraints.push_back(co);
+    t.constraints.push_back(ct);
+
+    parser::Parser p;
+    auto viol = [&](const char* sql) {
+        auto r = p.parse(sql);
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::CheckViolation);
+    };
+
+    // Omitting status AND qty applies both bad defaults -> two violations.
+    CHECK(viol("INSERT INTO t (note) VALUES ('x')") == 2);
+    // Supplying a passing value overrides the bad default -> no status violation
+    // (qty still defaults to -1, so exactly one violation remains).
+    CHECK(viol("INSERT INTO t (status) VALUES ('active')") == 1);
+    // Supplying passing values for both bad-default columns -> clean.
+    CHECK(viol("INSERT INTO t (status, qty) VALUES ('active', 3)") == 0);
+    // A constant default that satisfies its CHECK is not a violation (ok_col=5),
+    // and a non-constant default (ts) stays unfolded -> only the two bad
+    // constant defaults are reported when everything is omitted.
+    CHECK(viol("INSERT INTO t (note) VALUES ('y')") == 2);
+    // Explicitly writing the offending value is still caught (regression guard);
+    // qty is given a passing value so only the explicit status violation fires.
+    CHECK(viol("INSERT INTO t (status, qty) VALUES ('banned', 3)") == 1);
+}
+
+void test_insert_check_violation_constant_fold() {
+    std::printf("test_insert_check_violation_constant_fold\n");
+    // A supplied value that is a constant expression (not a bare literal) is
+    // folded too, so e.g. an arithmetic constant is decided against the CHECK.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("t", {
+        ColumnInfo{"n", DataType::Integer, /*nullable=*/true},  // column_id 1
+    });
+    Constraint c; c.kind = Constraint::Kind::Check; c.expr = "n >= 0"; c.columns = {1};
+    t.constraints.push_back(c);
+
+    parser::Parser p;
+    auto viol = [&](const char* sql) {
+        auto r = p.parse(sql);
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::CheckViolation);
+    };
+    CHECK(viol("INSERT INTO t (n) VALUES (3 - 5)") == 1);   // folds to -2 -> violation
+    CHECK(viol("INSERT INTO t (n) VALUES (2 + 2)") == 0);   // folds to 4 -> ok
+}
+
 void test_insert_explicit_null_into_not_null() {
     std::printf("test_insert_explicit_null_into_not_null\n");
     auto cat = make_catalog();  // id INTEGER NOT NULL
@@ -2967,6 +3051,8 @@ int main() {
     test_insert_default_values();
     test_insert_default_values_all_defaulted_ok();
     test_insert_check_violation();
+    test_insert_check_violation_from_default();
+    test_insert_check_violation_constant_fold();
 
     // DML: UPDATE
     test_update_clean();

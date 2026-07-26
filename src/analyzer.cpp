@@ -275,15 +275,24 @@ struct Coercion {
         return {CoercionStatus::ImplicitCoercion, DataType::Boolean};
     }
     if (kind == CoercionKind::Assignment) {
-        // Assigning across the numeric/string boundary (e.g. a text literal into
-        // an integer column) is a permitted implicit conversion, flagged softly;
-        // the stored value takes the target column's type `a`.
+        // A string assigned to a temporal or boolean column (e.g.
+        // `INSERT INTO t(d) VALUES ('2020-01-01')`, DATE d) is a standard implicit
+        // conversion: PostgreSQL/SQLite parse the string to the column's type. DB25
+        // is PostgreSQL-canon, so accept it *silently* (no diagnostic) with the
+        // target column's type `a`.
+        if (cb == TypeCategory::String &&
+            (ca == TypeCategory::Temporal || ca == TypeCategory::Boolean)) {
+            return {CoercionStatus::Ok, a};
+        }
+        // Across the numeric/string boundary (e.g. a text literal into an integer
+        // column) is a permitted implicit conversion, flagged softly; the stored
+        // value takes the target column's type `a`.
         if ((ca == TypeCategory::Numeric && cb == TypeCategory::String) ||
             (ca == TypeCategory::String && cb == TypeCategory::Numeric)) {
             return {CoercionStatus::ImplicitCoercion, a};
         }
-        // Any other cross-category assignment (boolean/temporal vs numeric, …) is
-        // a hard type mismatch.
+        // Any other cross-category assignment (e.g. temporal vs numeric) is a hard
+        // type mismatch.
         return {CoercionStatus::Incompatible, DataType::Unknown};
     }
     return {CoercionStatus::Incompatible, DataType::Unknown};
@@ -327,17 +336,29 @@ struct TemporalArith {
     if (!a_temporal && !b_temporal) {
         return {TemporalArithStatus::NotTemporal, DataType::Unknown};
     }
-    // Only + and - carry temporal meaning; *, /, % over a temporal are invalid.
+    const bool a_interval = (a == DataType::Interval);
+    const bool b_interval = (b == DataType::Interval);
+    const bool a_numeric = category_of(a) == TypeCategory::Numeric;
+    const bool b_numeric = category_of(b) == TypeCategory::Numeric;
+
+    // Interval scaling by a number is valid and yields an interval:
+    //   `interval * n`, `n * interval`, `interval / n`. Only INTERVAL scales this
+    //   way - multiplying or dividing any other temporal (date/time/timestamp) by
+    //   a number is meaningless and stays Invalid below.
+    if (op == "*" && ((a_interval && b_numeric) || (a_numeric && b_interval))) {
+        return {TemporalArithStatus::Ok, DataType::Interval};
+    }
+    if (op == "/" && a_interval && b_numeric) {
+        return {TemporalArithStatus::Ok, DataType::Interval};
+    }
+
+    // Beyond interval scaling, only + and - carry temporal meaning; other
+    // operators over a temporal are invalid.
     const bool is_plus = (op == "+");
     const bool is_minus = (op == "-");
     if (!is_plus && !is_minus) {
         return {TemporalArithStatus::Invalid, DataType::Unknown};
     }
-
-    const bool a_interval = (a == DataType::Interval);
-    const bool b_interval = (b == DataType::Interval);
-    const bool a_numeric = category_of(a) == TypeCategory::Numeric;
-    const bool b_numeric = category_of(b) == TypeCategory::Numeric;
 
     // interval ± interval -> interval.
     if (a_interval && b_interval) {
@@ -2340,6 +2361,52 @@ namespace {
     return iequals(ref->primary_text, k.text);  // identifiers compare case-insensitively
 }
 
+// Structural equality of a SELECT/ORDER BY/HAVING expression `e` against a GROUP
+// BY key expression `k`: true when `e` "is" that key. Column-ref leaves compare
+// by resolved (table_id, column_id) identity, falling back to case-insensitive
+// text; function names compare case-insensitively (SQL identifiers); literals
+// and operators compare EXACTLY (a different literal is a different key - matching
+// them would wrongly exempt a non-grouped column); children must match in order
+// and arity. This lets a whole-expression grouping key such as
+// `GROUP BY date_trunc('month', ts)` or `GROUP BY a + b` cover the same
+// expression in the projection, not only single-column keys. Bounded by the
+// shared expression-depth limit.
+[[nodiscard]] bool group_expr_equal(const ASTNode* e, const ASTNode* k, int depth = 0) {
+    if (e == nullptr || k == nullptr) {
+        return e == k;
+    }
+    if (depth >= static_cast<int>(kMaxExprDepth)) {
+        return false;  // over-deep: refuse to claim equality rather than recurse unbounded
+    }
+    if (is_column_ref_node(e->node_type) && is_column_ref_node(k->node_type)) {
+        const std::uint32_t ec = e->context.analysis.column_id;
+        const std::uint32_t kc = k->context.analysis.column_id;
+        if (ec != 0 && kc != 0) {
+            return e->context.analysis.table_id == k->context.analysis.table_id && ec == kc;
+        }
+        return iequals(e->primary_text, k->primary_text);
+    }
+    if (e->node_type != k->node_type) {
+        return false;
+    }
+    const bool name_like = (e->node_type == NodeType::FunctionCall ||
+                            e->node_type == NodeType::FunctionExpr);
+    if (name_like ? !iequals(e->primary_text, k->primary_text)
+                  : e->primary_text != k->primary_text) {
+        return false;
+    }
+    const ASTNode* ec = first_child(e);
+    const ASTNode* kc = first_child(k);
+    while (ec != nullptr && kc != nullptr) {
+        if (!group_expr_equal(ec, kc, depth + 1)) {
+            return false;
+        }
+        ec = ec->next_sibling;
+        kc = kc->next_sibling;
+    }
+    return ec == nullptr && kc == nullptr;  // same arity
+}
+
 }  // namespace
 
 void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
@@ -2412,6 +2479,7 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
             k.table_id = identity->context.analysis.table_id;
             k.column_id = identity->context.analysis.column_id;
             k.text = identity->primary_text;
+            k.node = identity;
             keys.push_back(k);
         }
     }
@@ -2478,6 +2546,20 @@ void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& k
     if (expr->node_type == NodeType::Subquery ||
         expr->node_type == NodeType::SubqueryExpr) {
         return;
+    }
+
+    // If this whole expression is itself a grouping key, the query IS grouped on
+    // it: it is exempt and we stop descending (its inner columns are covered by
+    // the key). Covers expression keys - GROUP BY date_trunc('month', ts),
+    // GROUP BY a + b - not only single-column keys. Checked before the column /
+    // function descent so `SELECT date_trunc('month', ts) ... GROUP BY
+    // date_trunc('month', ts)` is not falsely flagged on its inner `ts`.
+    if (!grouping_exempt) {
+        for (const GroupKey& k : keys) {
+            if (k.node != nullptr && group_expr_equal(expr, k.node)) {
+                return;
+            }
+        }
     }
 
     if (expr->node_type == NodeType::FunctionCall ||

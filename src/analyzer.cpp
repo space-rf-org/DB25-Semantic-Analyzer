@@ -1020,6 +1020,10 @@ void Analyzer::analyze_update(ASTNode* update_stmt) {
     // SET assignments: each is a BinaryExpr whose primary_text is the target
     // column name and whose (first) child is the value expression.
     if (ASTNode* set_clause = find_child(update_stmt, NodeType::SetClause)) {
+        // The columns this UPDATE assigns and their value nodes, gathered so the
+        // table's CHECK constraints can be evaluated against the post-update row.
+        std::vector<const ColumnInfo*> set_cols;
+        std::vector<ASTNode*> set_vals;
         for (ASTNode* asgn = first_child(set_clause); asgn != nullptr;
              asgn = asgn->next_sibling) {
             const std::string_view col_name = split_column_ref(asgn->primary_text).column;
@@ -1036,7 +1040,19 @@ void Analyzer::analyze_update(ASTNode* update_stmt) {
             if (info != nullptr && value != nullptr) {
                 check_assignment(info->type, vt, value);
                 check_not_null_literal(info, value);
+                set_cols.push_back(info);
+                set_vals.push_back(value);
             }
+        }
+
+        // Evaluate CHECK constraints over the assigned columns. Defaults are NOT
+        // substituted for unset columns: an UPDATE leaves them at their existing
+        // values, which are unknown here, so a CHECK that references any unset
+        // column stays Unknown. Only a CHECK whose every column is SET to a
+        // constant is decided - e.g. UPDATE t SET age = -1 vs CHECK (age >= 0).
+        if (table != nullptr && !set_cols.empty()) {
+            check_row_against_checks(*table, set_cols, set_vals, set_clause,
+                                     /*apply_defaults=*/false);
         }
     }
 

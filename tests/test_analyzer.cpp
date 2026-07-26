@@ -3008,6 +3008,86 @@ ASTNode* analyze_temporal(Analyzer& a, parser::Parser& p,
     return find_descendant(holder->value(), NodeType::BinaryExpr);
 }
 
+// ---- Legal SQL the coercion / grouping rules used to over-reject (finding #24) ----
+
+// A string literal assigned to a temporal or boolean column is a standard
+// implicit conversion (PostgreSQL-canon); accept it SILENTLY (no diagnostic).
+// A non-string cross-category assignment (a number into a DATE) still errors.
+void test_assign_string_to_temporal_boolean() {
+    std::printf("test_assign_string_to_temporal_boolean\n");
+    InMemoryCatalog cat;
+    cat.add_table("ev", {
+        ColumnInfo{"d", DataType::Date, /*nullable=*/true},
+        ColumnInfo{"ts", DataType::Timestamp, /*nullable=*/true},
+        ColumnInfo{"flag", DataType::Boolean, /*nullable=*/true},
+    });
+    parser::Parser p;
+    auto clean = [&](const char* sql) {
+        auto r = p.parse(sql);
+        CHECK(r.has_value());
+        if (!r.has_value()) return;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        CHECK(!a.has_errors());
+        CHECK(a.diagnostics().empty());  // silent: not even an ImplicitCoercion warning
+    };
+    clean("INSERT INTO ev (d) VALUES ('2020-01-01')");
+    clean("INSERT INTO ev (ts) VALUES ('2020-01-01 10:00:00')");
+    clean("INSERT INTO ev (flag) VALUES ('true')");
+    clean("UPDATE ev SET d = '2020-01-01'");
+
+    // A number assigned to a DATE is still a hard type mismatch (not string).
+    auto r = p.parse("INSERT INTO ev (d) VALUES (5)");
+    CHECK(r.has_value());
+    if (r.has_value()) {
+        Analyzer a(cat);
+        a.analyze(r.value());
+        CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 1);
+    }
+}
+
+// INTERVAL scales by a number: `iv * 2`, `2 * iv`, `iv / 2` are all intervals.
+// Multiplying a non-interval temporal by a number stays invalid.
+void test_interval_scaling_typed() {
+    std::printf("test_interval_scaling_typed\n");
+    auto cat = make_catalog_temporal();  // events(d DATE, ..., iv INTERVAL NOT NULL, ...)
+    parser::Parser p;
+    std::optional<parser::ParseResult> h;
+    for (const char* sql : {"SELECT iv * 2 FROM events",
+                            "SELECT 2 * iv FROM events",
+                            "SELECT iv / 2 FROM events"}) {
+        Analyzer a(cat);
+        ASTNode* e = analyze_temporal(a, p, h, sql);
+        CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
+        CHECK(e != nullptr && a.type_of(e) == DataType::Interval);
+    }
+    {
+        Analyzer a(cat);
+        (void)analyze_temporal(a, p, h, "SELECT d * 2 FROM events");  // date * n is meaningless
+        CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 1);
+    }
+}
+
+// A whole-expression GROUP BY key covers the same expression in the projection,
+// so its inner column is not flagged non-grouped; function-name case is folded;
+// and an unrelated non-grouped column is still flagged (folding is not a wildcard).
+void test_groupby_expression_key() {
+    std::printf("test_groupby_expression_key\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto flags = [&](const char* sql) -> int {
+        auto r = p.parse(sql);
+        CHECK(r.has_value());
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::NonGroupedColumn);
+    };
+    CHECK(flags("SELECT salary + 1 FROM emp GROUP BY salary + 1") == 0);   // arithmetic key
+    CHECK(flags("SELECT UPPER(name) FROM emp GROUP BY upper(name)") == 0); // fn key, mixed case
+    CHECK(flags("SELECT salary + 1 FROM emp GROUP BY dept") == 1);         // salary not grouped
+}
+
 // EXTRACT(YEAR FROM ts): the leading YEAR is a date-part keyword, NOT a column.
 // It must not be reported as an unresolved column, and the call types as Double.
 void test_extract_datepart_not_column() {
@@ -3437,6 +3517,9 @@ int main() {
     test_temporal_timestamp_minus_timestamp();
     test_temporal_date_minus_date();
     test_temporal_nullable_operand();
+    test_interval_scaling_typed();
+    test_assign_string_to_temporal_boolean();
+    test_groupby_expression_key();
     test_temporal_invalid_date_plus_timestamp();
 
     // String concatenation (||)

@@ -36,7 +36,9 @@ using ast::DataType;
 struct GroupKey {
     std::uint32_t table_id = 0;
     std::uint32_t column_id = 0;
-    std::string_view text;  // primary_text of the grouping expression
+    std::string_view text;      // primary_text of the grouping expression
+    const ASTNode* node = nullptr;  // the key expression, for whole-expression matching
+                                    // (GROUP BY date_trunc(..) / a+b, not just a column)
 };
 
 class Analyzer {

@@ -228,6 +228,94 @@ void test_derived_table() {
     CHECK(tx != nullptr && a.type_of(tx) == DataType::Integer);
 }
 
+void test_derived_table_column_aliases() {
+    std::printf("test_derived_table_column_aliases\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT)
+    parser::Parser p;
+
+    // "(...) AS t(a, b)" renames the derived table's output columns positionally:
+    // a qualified reference to an ALIAS resolves, and its type flows from the
+    // underlying column.
+    {
+        auto res = p.parse("SELECT t.a, t.b FROM (SELECT id, name FROM users) AS t(a, b)");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(!a.has_errors());
+            ASTNode* list = find_child(res.value(), NodeType::SelectList);
+            ASTNode* ta = first_child(list);
+            CHECK(ta != nullptr && a.type_of(ta) == DataType::Integer);       // a <- id
+            CHECK(ta != nullptr && a.type_of(ta->next_sibling) == DataType::Text);  // b <- name
+        }
+    }
+    // A reference to the ORIGINAL inner name no longer resolves - the alias
+    // replaces it.
+    {
+        auto res = p.parse("SELECT t.id FROM (SELECT id FROM users) AS t(a)");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
+        }
+    }
+    // SELECT * over the aliased derived table expands to the alias names (clean).
+    {
+        auto res = p.parse("SELECT * FROM (SELECT id FROM users) AS t(only)");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(!a.has_errors());
+        }
+    }
+    // More aliases than the derived table has columns is an error.
+    {
+        auto res = p.parse("SELECT * FROM (SELECT id FROM users) AS t(a, b)");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ColumnAliasCountMismatch) == 1);
+        }
+    }
+}
+
+void test_values_derived_table() {
+    std::printf("test_values_derived_table\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+
+    // A VALUES list as a derived table: its columns are named by the alias list
+    // and typed from the first row, so qualified references resolve.
+    {
+        auto res = p.parse(
+            "SELECT v.id, v.label FROM (VALUES (1, 'eng'), (2, 'sales')) AS v(id, label) "
+            "WHERE v.id = 1");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(!a.has_errors());
+            ASTNode* list = find_child(res.value(), NodeType::SelectList);
+            ASTNode* vid = first_child(list);
+            CHECK(vid != nullptr && a.type_of(vid) == DataType::Integer);       // id <- 1
+            CHECK(vid != nullptr && a.type_of(vid->next_sibling) == DataType::Text);  // label <- 'eng'
+        }
+    }
+    // An unaliased column of a VALUES derived table has no name to resolve.
+    {
+        auto res = p.parse("SELECT v.nope FROM (VALUES (1)) AS v(x)");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
+        }
+    }
+}
+
 void test_where_type_inference() {
     std::printf("test_where_type_inference\n");
     auto cat = make_catalog();
@@ -3004,6 +3092,8 @@ int main() {
     test_unresolved_column();
     test_alias_resolution();
     test_derived_table();
+    test_derived_table_column_aliases();
+    test_values_derived_table();
     test_where_type_inference();
     test_cte_resolution();
     test_unresolved_table();

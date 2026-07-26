@@ -1456,6 +1456,45 @@ void Analyzer::resolve_from(ASTNode* from_clause, Scope& scope) {
     }
 }
 
+std::vector<ResolvedColumn> Analyzer::columns_from_values(ASTNode* values_stmt,
+                                                          Scope& scope) {
+    // ValuesStmt -> ValuesClause -> one row per child, each row a list of value
+    // expressions. The relation's columns are the first row's positions; their
+    // types are inferred from that row (VALUES columns are nullable). Names are
+    // empty here - a column-alias list supplies them.
+    std::vector<ResolvedColumn> cols;
+    ASTNode* clause = find_child(values_stmt, NodeType::ValuesClause);
+    ASTNode* first_row = clause != nullptr ? first_child(clause) : nullptr;
+    if (first_row == nullptr) {
+        return cols;
+    }
+    for (ASTNode* v = first_child(first_row); v != nullptr; v = v->next_sibling) {
+        const DataType t = infer_expr(v, scope);
+        cols.push_back(ResolvedColumn{std::string{}, t, /*nullable=*/true, 0, 0});
+    }
+    return cols;
+}
+
+void Analyzer::apply_column_aliases(std::vector<ResolvedColumn>& cols,
+                                    ASTNode* alias_list, ASTNode* at) {
+    std::vector<std::string_view> names;
+    for (ASTNode* id = first_child(alias_list); id != nullptr; id = id->next_sibling) {
+        names.push_back(id->primary_text);
+    }
+    // A derived table may not be given more column aliases than it has columns
+    // (fewer is allowed - the trailing columns keep their inferred names).
+    if (names.size() > cols.size()) {
+        add_diagnostic(DiagnosticCode::ColumnAliasCountMismatch,
+                       "derived table has " + std::to_string(cols.size()) +
+                           " columns but " + std::to_string(names.size()) +
+                           " column aliases were specified",
+                       at);
+    }
+    for (std::size_t i = 0; i < names.size() && i < cols.size(); ++i) {
+        cols[i].name = std::string{names[i]};
+    }
+}
+
 void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
     if (item == nullptr) {
         return;
@@ -1496,6 +1535,18 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
             binding.alias = std::string{alias};
             if (ASTNode* body = find_child(item, NodeType::SelectStmt)) {
                 binding.columns = analyze_query(body, &scope);
+            } else if (ASTNode* values = find_child(item, NodeType::ValuesStmt)) {
+                // A VALUES list used as a derived table: its columns are the
+                // per-position value types; they are anonymous until named by the
+                // column-alias list below.
+                binding.columns = columns_from_values(values, scope);
+            }
+            // Column-alias list "(a, b)" on the derived table renames its output
+            // columns positionally (the parser attaches it as a ColumnList child;
+            // the row lists of a VALUES body sit under ValuesStmt, so find_child -
+            // direct children only - never confuses them).
+            if (ASTNode* col_aliases = find_child(item, NodeType::ColumnList)) {
+                apply_column_aliases(binding.columns, col_aliases, item);
             }
             scope.add_relation(std::move(binding));
             return;

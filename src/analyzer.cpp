@@ -3,14 +3,17 @@
 #include "db25/semantic/analyzer.hpp"
 
 #include "db25/ast/node_types.hpp"
+#include "db25/parser/parser.hpp"
 #include "db25/semantic/ast_helpers.hpp"
 #include "db25/semantic/check_eval.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <deque>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace db25::semantic {
@@ -742,7 +745,14 @@ void Analyzer::check_not_null_literal(const ColumnInfo* col, ASTNode* value) {
 }
 
 namespace {
-[[nodiscard]] bool is_literal_node(const ASTNode* n) {
+// True when `n` is built purely from literals and constant operators, so the
+// CHECK evaluator can fold it to a certain value. Crucially this excludes
+// ColumnRef/Identifier and function calls: a value supplied in an INSERT row or
+// an UPDATE SET, or a column DEFAULT, is evaluated with no row in scope, so a
+// bare identifier there is not a constant we may fold (in UPDATE it would be the
+// column's OLD value, which we do not know). A unary minus of a literal
+// (`-5`) and constant arithmetic/comparison are constants and are folded.
+[[nodiscard]] bool is_constant_expr(const ASTNode* n) {
     if (n == nullptr) return false;
     switch (n->node_type) {
         case NodeType::IntegerLiteral:
@@ -751,8 +761,18 @@ namespace {
         case NodeType::BooleanLiteral:
         case NodeType::NullLiteral:
             return true;
+        case NodeType::UnaryExpr:
+        case NodeType::BinaryExpr:
+        case NodeType::BetweenExpr:
+        case NodeType::IsNullExpr: {
+            if (n->first_child == nullptr) return false;
+            for (const ASTNode* c = n->first_child; c != nullptr; c = c->next_sibling) {
+                if (!is_constant_expr(c)) return false;
+            }
+            return true;
+        }
         default:
-            return false;
+            return false;  // ColumnRef, Identifier, FunctionCall, subquery, ...
     }
 }
 
@@ -766,13 +786,46 @@ namespace {
 
 void Analyzer::check_row_against_checks(const TableInfo& table,
                                         const std::vector<const ColumnInfo*>& target_cols,
-                                        const std::vector<ASTNode*>& vals, const ASTNode* at) {
-    // Bind each column that receives a literal in this row to its literal node.
+                                        const std::vector<ASTNode*>& vals, const ASTNode* at,
+                                        bool apply_defaults) {
+    // Bind each column given a constant value in this row to its value node. Only
+    // constants are bound (see is_constant_expr): a value the evaluator cannot
+    // fold leaves the column unbound, so any CHECK referencing it stays Unknown.
     CheckBindings binds;
+    std::unordered_set<std::string> supplied;  // columns given an explicit value
     const std::size_t n = std::min(target_cols.size(), vals.size());
+    for (std::size_t i = 0; i < target_cols.size(); ++i) {
+        if (target_cols[i] != nullptr) supplied.insert(target_cols[i]->name);
+    }
     for (std::size_t i = 0; i < n; ++i) {
-        if (target_cols[i] != nullptr && is_literal_node(vals[i])) {
+        if (target_cols[i] != nullptr && is_constant_expr(vals[i])) {
             binds.emplace(target_cols[i]->name, vals[i]);
+        }
+    }
+
+    // For INSERT (apply_defaults), a column the row omits takes its DEFAULT. When
+    // that default is a constant, bind its folded value so a default-sourced
+    // violation is caught too - e.g. CHECK (status <> 'x') with DEFAULT 'x' and a
+    // row that omits status. The parsers own the default ASTs and must outlive
+    // the evaluate_check calls below (binds holds raw pointers into their arenas).
+    // A non-constant default (now(), nextval(...)) simply stays unbound.
+    std::deque<parser::Parser> default_parsers;
+    if (apply_defaults) {
+        for (const ColumnInfo& col : table.columns) {
+            if (supplied.count(col.name) != 0) continue;   // an explicit value wins
+            if (!col.has_default || col.default_expr.empty()) continue;
+            parser::Parser& dp = default_parsers.emplace_back();
+            auto parsed = dp.parse("SELECT " + col.default_expr);
+            if (!parsed.has_value()) continue;
+            ASTNode* list = nullptr;
+            for (ASTNode* ch = parsed.value()->first_child; ch != nullptr;
+                 ch = ch->next_sibling) {
+                if (ch->node_type == NodeType::SelectList) { list = ch; break; }
+            }
+            ASTNode* item = list != nullptr ? list->first_child : nullptr;
+            if (is_constant_expr(item)) {
+                binds.emplace(col.name, item);
+            }
         }
     }
 
@@ -905,7 +958,7 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
                     check_not_null_literal(target_cols[i], vals[i]);
                 }
             }
-            check_row_against_checks(*table, target_cols, vals, row);
+            check_row_against_checks(*table, target_cols, vals, row, /*apply_defaults=*/true);
         }
     } else {
         // INSERT ... SELECT: analyze the source query and check its projection.

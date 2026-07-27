@@ -7,6 +7,7 @@
 
 #include <charconv>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 namespace db25::semantic {
@@ -190,10 +191,24 @@ private:
             const bool ints = (lv.k == V::Int && rv.k == V::Int);
             if (op == "/") {
                 if (rv.as_d() == 0.0) return V::fail();     // undefined -> bail
+                // INT64_MIN / -1 overflows (quotient is not representable in
+                // int64) - computing it is signed-overflow UB, same hazard the
+                // + - * paths below guard with __builtin_*_overflow. The result
+                // can't be folded to a definite value, so bail (CHECK stays
+                // Unknown - never a false verdict).
+                if (ints && lv.i == (std::numeric_limits<long long>::min)() && rv.i == -1) {
+                    return V::fail();
+                }
                 return ints ? V::I(lv.i / rv.i) : V::D(lv.as_d() / rv.as_d());
             }
             if (op == "%") {
                 if (!ints || rv.i == 0) return V::fail();
+                // INT64_MIN % -1 is mathematically 0, but evaluating `lv.i % rv.i`
+                // computes the overflowing INT64_MIN / -1 internally, which is UB.
+                // Return the well-defined result directly.
+                if (lv.i == (std::numeric_limits<long long>::min)() && rv.i == -1) {
+                    return V::I(0);
+                }
                 return V::I(lv.i % rv.i);
             }
             // Two integer operands: compute + - * EXACTLY in int64. Going through

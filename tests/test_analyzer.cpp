@@ -1091,6 +1091,55 @@ void test_groupby_non_grouped_column() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
+void test_groupby_output_alias_key() {
+    std::printf("test_groupby_output_alias_key\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+
+    // A GROUP BY key may name a SELECT-list output alias (Postgres extension):
+    // the query groups by the aliased expression. These are all legal - no
+    // unresolved-column error and no non-grouped-column error.
+    auto clean = [&](const char* sql) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+        CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 0);
+    };
+    clean("SELECT id AS x FROM emp GROUP BY x");                 // single-column alias
+    clean("SELECT dept AS d, COUNT(*) FROM emp GROUP BY d");     // alias + aggregate
+    clean("SELECT salary + 1 AS s FROM emp GROUP BY s");         // compound-expression alias
+
+    // A non-grouped sibling is still flagged (the alias groups only its own
+    // expression), and the alias itself resolves (no unresolved error).
+    {
+        auto res = p.parse("SELECT id AS x, dept FROM emp GROUP BY x");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+            CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);  // dept
+        }
+    }
+
+    // Input-column precedence: `region` is both a base column and the alias for
+    // dept here. A GROUP BY name binds to the INPUT column first (Postgres), so
+    // the query groups by the base column region, leaving dept non-grouped.
+    {
+        auto res = p.parse("SELECT dept AS region, COUNT(*) FROM emp GROUP BY region");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+            CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);  // dept
+        }
+    }
+}
+
 void test_groupby_having_aggregate_clean() {
     std::printf("test_groupby_having_aggregate_clean\n");
     auto cat = make_catalog_emp();
@@ -3540,6 +3589,7 @@ int main() {
     // GROUP BY / HAVING legality & function typing
     test_groupby_clean_count_star();
     test_groupby_non_grouped_column();
+    test_groupby_output_alias_key();
     test_groupby_having_aggregate_clean();
     test_having_non_grouped_column();
     test_nested_aggregate();

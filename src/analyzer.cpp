@@ -1313,7 +1313,18 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     //    (emitting the usual unresolved diagnostics) before legality checking.
     ASTNode* group_by = find_child(select_stmt, NodeType::GroupByClause);
     if (group_by != nullptr) {
+        ASTNode* group_select_list = find_child(select_stmt, NodeType::SelectList);
         for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
+            // A GROUP BY key that names a SELECT-list output alias (and is not an
+            // input column) resolves against the projection, not the FROM scope -
+            // otherwise `SELECT id AS x FROM t GROUP BY x` falsely reports the
+            // alias as an unresolved column. Type/nullability flow from the
+            // aliased item (already inferred above).
+            if (ASTNode* item = group_key_alias_item(key, group_select_list, scope)) {
+                record_type(key, type_of(item));
+                record_nullability(key, null_of(item));
+                continue;
+            }
             infer_expr(key, scope);
         }
     }
@@ -2444,9 +2455,49 @@ namespace {
 
 }  // namespace
 
+ASTNode* Analyzer::group_key_alias_item(ASTNode* key, ASTNode* select_list,
+                                        Scope& scope) const {
+    if (key == nullptr || select_list == nullptr) {
+        return nullptr;
+    }
+    if (!is_column_ref_node(key->node_type)) {
+        return nullptr;
+    }
+    const QualifiedRef qref = split_column_ref(key->primary_text);
+    // A qualified `t.c` names a base column, never an output alias.
+    if (!qref.qualifier.empty()) {
+        return nullptr;
+    }
+    // Input column wins on ambiguity: only fall through to the alias when the
+    // FROM scope does not provide this name.
+    if (scope.resolve_bare(qref.column).found) {
+        return nullptr;
+    }
+    // Match the name against each projected item's output name (its alias, or
+    // the column name for a bare column ref).
+    for (ASTNode* item = first_child(select_list); item != nullptr;
+         item = item->next_sibling) {
+        if (item->node_type == NodeType::Star) {
+            continue;
+        }
+        std::string_view out_name;
+        const std::string_view a = alias_of(item);
+        if (!a.empty()) {
+            out_name = a;
+        } else if (item->node_type == NodeType::ColumnRef) {
+            out_name = split_column_ref(item->primary_text).column;
+        } else {
+            out_name = item->primary_text;
+        }
+        if (iequals(out_name, qref.column)) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
 void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
                                 const std::vector<ResolvedColumn>& output) {
-    (void)scope;  // resolution already happened; this pass is structural.
 
     // An aggregate in the WHERE clause is illegal regardless of grouping:
     // aggregates are computed after the WHERE filter has selected rows, so they
@@ -2509,6 +2560,14 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                         }
                     }
                 }
+            } else if (ASTNode* alias_item =
+                           group_key_alias_item(key, select_list, scope)) {
+                // GROUP BY <output-alias>: the query groups by the aliased SELECT
+                // item's expression, so take that item's identity. A SELECT / ORDER
+                // BY / HAVING reference to the same expression then matches this key
+                // (single column or a compound expression alike), and the aliased
+                // item itself is not flagged as non-grouped.
+                identity = alias_item;
             }
             GroupKey k;
             k.table_id = identity->context.analysis.table_id;

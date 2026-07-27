@@ -2482,9 +2482,14 @@ ASTNode* Analyzer::group_key_alias_item(ASTNode* key, ASTNode* select_list,
     if (!qref.qualifier.empty()) {
         return nullptr;
     }
-    // Input column wins on ambiguity: only fall through to the alias when the
-    // FROM scope does not provide this name.
-    if (scope.resolve_bare(qref.column).found) {
+    // The input column wins: only fall through to the output alias when the FROM
+    // scope neither resolves this name NOR finds it ambiguous. An AMBIGUOUS bare
+    // name has found == false but ambiguous == true; reinterpreting it as an
+    // output alias silently suppressed the AmbiguousColumn error and changed the
+    // query's meaning. Returning nullptr lets normal resolution raise the
+    // ambiguity (`GROUP BY id` over a join where two inputs expose `id`).
+    const auto res = scope.resolve_bare(qref.column);
+    if (res.found || res.ambiguous) {
         return nullptr;
     }
     // Match the name against each projected item's output name (its alias, or
@@ -2504,6 +2509,13 @@ ASTNode* Analyzer::group_key_alias_item(ASTNode* key, ASTNode* select_list,
             out_name = item->primary_text;
         }
         if (iequals(out_name, qref.column)) {
+            // GROUP BY on an alias that names an aggregate expression is illegal
+            // (Postgres: "aggregate functions are not allowed in GROUP BY").
+            // Decline the alias so the key falls to normal resolution and is
+            // rejected, rather than silently accepting a nonsensical grouping.
+            if (contains_aggregate(item)) {
+                return nullptr;
+            }
             return item;
         }
     }

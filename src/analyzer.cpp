@@ -102,6 +102,14 @@ constexpr std::array<std::string_view, 15> kAggregateNames = {
            op == ">" || op == "<=" || op == ">=";
 }
 
+// `a IS [NOT] DISTINCT FROM b`: a null-safe comparison. Same operand
+// compatibility as an ordinary comparison, but the result is ALWAYS a plain
+// boolean, never NULL (two NULLs are "not distinct"; NULL vs non-NULL is
+// "distinct"). The parser emits these exact uppercase operator texts.
+[[nodiscard]] bool is_null_safe_comparison_op(std::string_view op) {
+    return op == "IS DISTINCT FROM" || op == "IS NOT DISTINCT FROM";
+}
+
 [[nodiscard]] bool is_logical_op(std::string_view op) {
     return op == "AND" || op == "OR" || op == "and" || op == "or";
 }
@@ -1924,6 +1932,18 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                    expr, Severity::Warning);
                 }
                 result = DataType::Boolean;
+            } else if (is_null_safe_comparison_op(op)) {
+                // IS [NOT] DISTINCT FROM: same operand-compatibility rules as a
+                // plain comparison (cross-category is a soft coercion), but the
+                // result is a plain boolean that is never NULL (handled below).
+                const Coercion c = coerce(lt, rt, CoercionKind::Comparison);
+                if (c.status != CoercionStatus::Ok) {
+                    add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                                   "implicit coercion in IS [NOT] DISTINCT FROM between "
+                                   "operands of different type categories",
+                                   expr, Severity::Warning);
+                }
+                result = DataType::Boolean;
             } else if (is_logical_op(op)) {
                 result = DataType::Boolean;
             } else if (op == "||") {
@@ -1959,8 +1979,11 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                 }
             }
             record_type(expr, result);
-            // A binary result is nullable if either operand can be NULL.
-            record_nullability(expr, combine_nullable_any({null_of(lhs), null_of(rhs)}));
+            // A binary result is nullable if either operand can be NULL - except a
+            // null-safe comparison (IS [NOT] DISTINCT FROM), which is never NULL.
+            record_nullability(expr, is_null_safe_comparison_op(op)
+                                         ? 1
+                                         : combine_nullable_any({null_of(lhs), null_of(rhs)}));
             return result;
         }
 

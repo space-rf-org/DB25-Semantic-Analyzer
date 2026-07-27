@@ -2642,6 +2642,40 @@ void test_between_boolean() {
     CHECK(bt != nullptr && a.nullability_of(bt) == 2);  // salary is nullable
 }
 
+// IS [NOT] DISTINCT FROM is a null-safe comparison: Boolean and NEVER NULL, even
+// when both operands are nullable (unlike a plain `=`, whose result is nullable).
+void test_is_distinct_from_boolean_notnull() {
+    std::printf("test_is_distinct_from_boolean_notnull\n");
+    auto cat = make_catalog_emp();  // salary DOUBLE (nullable), age INTEGER (nullable)
+    parser::Parser p;
+    for (const char* sql : {"SELECT id FROM emp WHERE salary IS DISTINCT FROM age",
+                            "SELECT id FROM emp WHERE salary IS NOT DISTINCT FROM age"}) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(!a.has_errors());
+        CHECK(a.diagnostics().empty());  // numeric vs numeric: no coercion warning
+        ASTNode* be = find_descendant(res.value(), NodeType::BinaryExpr);
+        CHECK(be != nullptr && a.type_of(be) == DataType::Boolean);
+        // Both operands are nullable, yet the null-safe comparison is NOT NULL.
+        CHECK(be != nullptr && a.nullability_of(be) == 1);
+    }
+    // A plain `=` over the same nullable operands IS nullable - contrast guard
+    // proving the not-null result is specific to the null-safe operator.
+    {
+        auto res = p.parse("SELECT id FROM emp WHERE salary = age");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            ASTNode* be = find_descendant(res.value(), NodeType::BinaryExpr);
+            CHECK(be != nullptr && a.nullability_of(be) == 2);  // nullable
+        }
+    }
+}
+
 void test_between_coercion_warns() {
     std::printf("test_between_coercion_warns\n");
     auto cat = make_catalog_emp();
@@ -3481,6 +3515,7 @@ int main() {
     test_cast_expr_type();
     test_cast_varchar_type();
     test_between_boolean();
+    test_is_distinct_from_boolean_notnull();
     test_between_coercion_warns();
     test_like_boolean();
     test_like_nonstring_warns();

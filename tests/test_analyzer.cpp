@@ -1140,6 +1140,56 @@ void test_groupby_output_alias_key() {
     }
 }
 
+// The GROUP BY output-alias extension must not swallow two illegal shapes:
+//   (a) an AMBIGUOUS key silently reinterpreted as an alias (input precedence
+//       is decided on found OR ambiguous, not found alone), and
+//   (b) an alias that names an aggregate expression (illegal in GROUP BY).
+void test_groupby_alias_ambiguity_and_aggregate() {
+    std::printf("test_groupby_alias_ambiguity_and_aggregate\n");
+    InMemoryCatalog cat;
+    cat.add_table("emp", { ColumnInfo{"id", DataType::Integer, false},
+                           ColumnInfo{"dept", DataType::Text, true} });
+    cat.add_table("t2",  { ColumnInfo{"id", DataType::Integer, false},
+                           ColumnInfo{"v", DataType::Text, true} });
+    parser::Parser p;
+
+    // (a) `id` is exposed by both emp and t2 -> ambiguous. Even though an output
+    // alias `id` exists, GROUP BY resolves input-first, so the ambiguity must be
+    // reported (previously the alias path suppressed it, silently changing the
+    // grouping to `dept`).
+    {
+        auto res = p.parse("SELECT emp.dept AS id FROM emp JOIN t2 ON emp.id = t2.id "
+                           "GROUP BY id");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::AmbiguousColumn) == 1);
+        }
+    }
+    // (b) An alias naming an aggregate is not a valid grouping key. The query
+    // must be rejected (not silently accepted with zero diagnostics).
+    {
+        auto res = p.parse("SELECT COUNT(*) AS c FROM emp GROUP BY c");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(a.has_errors());
+        }
+    }
+    // Control: an unambiguous non-aggregate alias still groups cleanly.
+    {
+        auto res = p.parse("SELECT dept AS d, COUNT(*) FROM emp GROUP BY d");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(!a.has_errors());
+        }
+    }
+}
+
 void test_groupby_having_aggregate_clean() {
     std::printf("test_groupby_having_aggregate_clean\n");
     auto cat = make_catalog_emp();
@@ -3621,6 +3671,7 @@ int main() {
     test_groupby_clean_count_star();
     test_groupby_non_grouped_column();
     test_groupby_output_alias_key();
+    test_groupby_alias_ambiguity_and_aggregate();
     test_groupby_having_aggregate_clean();
     test_having_non_grouped_column();
     test_nested_aggregate();

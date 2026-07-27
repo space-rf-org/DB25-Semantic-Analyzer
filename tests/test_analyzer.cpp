@@ -1193,6 +1193,91 @@ void test_groupby_aggregate_in_having_or_orderby_groups() {
     }
 }
 
+// GUARDRAIL MATRIX: the "query is grouped" trigger. Passes have adjusted what
+// forces grouping (SELECT-list aggregate, then HAVING presence + ORDER-BY
+// aggregate); this table pins the full trigger truth-set so a regression that
+// drops or over-adds a trigger fails loudly. Column is the expected count of
+// NonGroupedColumn diagnostics.
+void test_grouping_trigger_matrix() {
+    std::printf("test_grouping_trigger_matrix\n");
+    auto cat = make_catalog_emp();
+    struct Case { const char* sql; int non_grouped; };
+    const Case cases[] = {
+        // grouped -> a bare non-key column is flagged
+        {"SELECT id FROM emp GROUP BY dept", 1},
+        {"SELECT id FROM emp HAVING COUNT(*) > 0", 1},
+        {"SELECT id FROM emp ORDER BY COUNT(*)", 1},
+        {"SELECT id, COUNT(*) FROM emp", 1},
+        // NOT grouped, or grouped-and-legal -> nothing flagged
+        {"SELECT COUNT(*) FROM emp HAVING COUNT(*) > 0", 0},
+        {"SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > 0", 0},
+        {"SELECT dept, COUNT(*) FROM emp GROUP BY dept", 0},
+        {"SELECT id FROM emp ORDER BY id", 0},
+        {"SELECT id FROM emp", 0},
+        // a WINDOWED aggregate does not collapse rows -> not grouped
+        {"SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM emp", 0},
+        // an aggregate inside a SUBQUERY does not group the OUTER query
+        {"SELECT id FROM emp WHERE id IN (SELECT COUNT(*) FROM emp)", 0},
+    };
+    for (const auto& c : cases) {
+        parser::Parser p;
+        auto res = p.parse(c.sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == c.non_grouped);
+    }
+}
+
+// GUARDRAIL MATRIX: multi-row VALUES column typing. A VALUES derived table is a
+// UNION ALL of its rows; each column's type reconciles across all rows (arity
+// #66, then types #69). This pins the reconciliation truth-set: numeric widening
+// is legal, an incompatible type mix is flagged once per bad column (no cascade),
+// NULL unifies, and a ragged row still triggers the arity check.
+void test_values_type_reconciliation_matrix() {
+    std::printf("test_values_type_reconciliation_matrix\n");
+    auto cat = make_catalog_emp();
+    struct Case { const char* sql; int type_mismatch; int arity_mismatch; };
+    const Case cases[] = {
+        // legal reconciliations
+        {"SELECT a FROM (VALUES (1),(2),(3)) AS t(a)",            0, 0},
+        {"SELECT a FROM (VALUES (1),(2.5)) AS t(a)",             0, 0},  // int+double widen
+        {"SELECT a FROM (VALUES (2.5),(1)) AS t(a)",             0, 0},  // double+int widen
+        {"SELECT a FROM (VALUES (1),(2.0),(3)) AS t(a)",         0, 0},  // 3-row widen
+        {"SELECT a FROM (VALUES (1),(NULL)) AS t(a)",            0, 0},  // NULL unifies
+        {"SELECT a FROM (VALUES (NULL),(1)) AS t(a)",            0, 0},
+        {"SELECT a,b FROM (VALUES (1,'x'),(2,'y')) AS t(a,b)",   0, 0},  // per-column
+        {"SELECT a FROM (VALUES (1)) AS t(a)",                   0, 0},  // single row
+        // incompatible type mixes (flagged once per bad column, no cascade)
+        {"SELECT a FROM (VALUES (1),('x')) AS t(a)",             1, 0},
+        {"SELECT a FROM (VALUES ('x'),(1)) AS t(a)",             1, 0},
+        {"SELECT a FROM (VALUES (1),(2),('x')) AS t(a)",         1, 0},
+        {"SELECT a FROM (VALUES (1),('x'),(2)) AS t(a)",         1, 0},  // no cascade after row2
+        {"SELECT a FROM (VALUES (1),('x'),('y')) AS t(a)",       1, 0},  // still one per column
+        {"SELECT a FROM (VALUES (1),(2.5),('x')) AS t(a)",       1, 0},
+        {"SELECT a,b FROM (VALUES (1,'x'),(2,3)) AS t(a,b)",     1, 0},  // only col b bad
+        {"SELECT a,b FROM (VALUES (1,'x'),('y',2)) AS t(a,b)",   2, 0},  // both cols bad
+        // ragged arity is independent of typing
+        {"SELECT a FROM (VALUES (1,2),(3)) AS t(a,b)",           -1, 1},
+        {"SELECT a FROM (VALUES (1),(2,3)) AS t(a)",             -1, 1},
+    };
+    for (const auto& c : cases) {
+        parser::Parser p;
+        auto res = p.parse(c.sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        if (c.type_mismatch >= 0) {
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == c.type_mismatch);
+        }
+        if (c.arity_mismatch >= 0) {
+            CHECK(count_code(a, DiagnosticCode::ValuesRowArityMismatch) == c.arity_mismatch);
+        }
+    }
+}
+
 void test_groupby_output_alias_key() {
     std::printf("test_groupby_output_alias_key\n");
     auto cat = make_catalog_emp();
@@ -3809,6 +3894,8 @@ int main() {
     test_groupby_clean_count_star();
     test_groupby_non_grouped_column();
     test_groupby_aggregate_in_having_or_orderby_groups();
+    test_grouping_trigger_matrix();
+    test_values_type_reconciliation_matrix();
     test_groupby_output_alias_key();
     test_groupby_alias_ambiguity_and_aggregate();
     test_groupby_having_aggregate_clean();

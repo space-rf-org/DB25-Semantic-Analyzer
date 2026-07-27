@@ -172,14 +172,26 @@ private:
             const bool rf = (rv.k == V::Bool && !rv.b);
             const bool lt = (lv.k == V::Bool && lv.b);
             const bool rt = (rv.k == V::Bool && rv.b);
+            // An operand that folded to a concrete NON-boolean value (a string /
+            // int / double - e.g. a BOOLEAN column assigned the legal string
+            // literal 'true', which this evaluator does not coerce) cannot be read
+            // as a truth value, so the connective is Unknown, exactly like a Fail
+            // operand. Without this guard `lt`/`rt` are simply false for a
+            // non-boolean operand and the connective folded to a definite FALSE -
+            // a spurious CHECK violation on a legal row (the module contract is
+            // "only False is a violation, so no false positives").
+            const bool l_nonbool = lv.k != V::Bool && lv.k != V::Null && lv.k != V::Fail;
+            const bool r_nonbool = rv.k != V::Bool && rv.k != V::Null && rv.k != V::Fail;
             if (op == "AND") {
                 if (lf || rf) return V::B(false);          // FALSE AND x = FALSE
                 if (lv.k == V::Fail || rv.k == V::Fail) return V::fail();
+                if (l_nonbool || r_nonbool) return V::fail();  // non-boolean -> Unknown
                 if (lv.k == V::Null || rv.k == V::Null) return V::null_();
                 return V::B(lt && rt);
             }
             if (lt || rt) return V::B(true);               // TRUE OR x = TRUE
             if (lv.k == V::Fail || rv.k == V::Fail) return V::fail();
+            if (l_nonbool || r_nonbool) return V::fail();      // non-boolean -> Unknown
             if (lv.k == V::Null || rv.k == V::Null) return V::null_();
             return V::B(false);                            // both FALSE
         }

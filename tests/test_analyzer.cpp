@@ -2531,6 +2531,51 @@ void test_check_unary_negation_overflow_bails() {
     CHECK(count_code(a, DiagnosticCode::CheckViolation) == 0);
 }
 
+void test_check_and_or_nonboolean_operand_is_unknown() {
+    std::printf("test_check_and_or_nonboolean_operand_is_unknown\n");
+    // A logical AND/OR whose operand folds to a concrete NON-boolean value (a
+    // string / int the evaluator does not coerce to a truth value) is UNKNOWN,
+    // never a definite FALSE - otherwise a legal INSERT gets a spurious
+    // CheckViolation. A BOOLEAN column assigned the string literal 'true' is
+    // legal (see test_assign_string_to_temporal_boolean), so `active AND verified`
+    // with active='true' must not be folded to FALSE.
+    db25::semantic::CheckBindings bnd;
+    using db25::semantic::CheckResult;
+    // Non-boolean operands -> Unknown.
+    CHECK(db25::semantic::evaluate_check("'true' AND 'true'", bnd) == CheckResult::Unknown);
+    CHECK(db25::semantic::evaluate_check("'true' OR 'false'", bnd) == CheckResult::Unknown);
+    CHECK(db25::semantic::evaluate_check("TRUE AND 'true'", bnd) == CheckResult::Unknown);
+    CHECK(db25::semantic::evaluate_check("1 AND 1", bnd) == CheckResult::Unknown);
+    // Genuine boolean logic still folds exactly, and short-circuit is preserved.
+    CHECK(db25::semantic::evaluate_check("TRUE AND TRUE", bnd) == CheckResult::True);
+    CHECK(db25::semantic::evaluate_check("TRUE AND FALSE", bnd) == CheckResult::False);
+    CHECK(db25::semantic::evaluate_check("TRUE OR FALSE", bnd) == CheckResult::True);
+    CHECK(db25::semantic::evaluate_check("FALSE OR FALSE", bnd) == CheckResult::False);
+    CHECK(db25::semantic::evaluate_check("FALSE AND 'true'", bnd) == CheckResult::False);  // short-circuit
+    CHECK(db25::semantic::evaluate_check("TRUE OR 'x'", bnd) == CheckResult::True);        // short-circuit
+
+    // End-to-end: a BOOLEAN column CHECK `active AND verified` with string-literal
+    // values must NOT raise a violation on a legal INSERT.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("flags", {
+        ColumnInfo{"id", DataType::Integer, /*nullable=*/false},      // column_id 1
+        ColumnInfo{"active", DataType::Boolean, /*nullable=*/true},   // column_id 2
+        ColumnInfo{"verified", DataType::Boolean, /*nullable=*/true}, // column_id 3
+    });
+    Constraint ck; ck.kind = Constraint::Kind::Check;
+    ck.expr = "active AND verified"; ck.columns = {2, 3};
+    t.constraints.push_back(ck);
+
+    parser::Parser p;
+    auto r2 = p.parse("INSERT INTO flags (id, active, verified) VALUES (1, 'true', 'true')");
+    CHECK(r2.has_value());
+    if (r2) {
+        Analyzer a(cat);
+        a.analyze(r2.value());
+        CHECK(count_code(a, DiagnosticCode::CheckViolation) == 0);
+    }
+}
+
 void test_insert_check_violation_from_default() {
     std::printf("test_insert_check_violation_from_default\n");
     // A column omitted from an INSERT takes its DEFAULT. When that default is a
@@ -3967,6 +4012,7 @@ int main() {
     test_check_integer_overflow_bails();
     test_check_division_overflow_bails();
     test_check_unary_negation_overflow_bails();
+    test_check_and_or_nonboolean_operand_is_unknown();
     test_insert_check_violation_from_default();
     test_insert_check_violation_constant_fold();
 

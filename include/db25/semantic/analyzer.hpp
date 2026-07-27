@@ -200,6 +200,16 @@ private:
     void analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
                           const std::vector<ResolvedColumn>& output);
 
+    // A GROUP BY key may name a SELECT-list output alias (a Postgres extension):
+    // `SELECT id AS x FROM t GROUP BY x` groups by `id`. If `key` is an
+    // unqualified column reference that names an output alias AND is NOT itself
+    // an input column (in case of ambiguity a GROUP BY name binds to the input
+    // column first), return the matching SELECT-list item node; otherwise
+    // nullptr. Shared by the resolution pass and the grouping-legality pass so
+    // both treat the alias key as grouping the aliased expression.
+    [[nodiscard]] ASTNode* group_key_alias_item(ASTNode* key, ASTNode* select_list,
+                                                Scope& scope) const;
+
     // Recursively check an expression subtree for grouping legality:
     //   * a bare column reference not exempt from the grouping rule must be a
     //     grouping key (else NonGroupedColumn);

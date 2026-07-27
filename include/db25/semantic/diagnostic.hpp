@@ -74,6 +74,10 @@ enum class DiagnosticCode : std::uint16_t {
     // A derived table's column-alias list "(a, b, ...)" names more columns than
     // the derived table produces.
     ColumnAliasCountMismatch,
+    // A VALUES list has rows of differing lengths (e.g. `(VALUES (1, 2), (3))`).
+    // Every row must supply the same number of values; the relation's width is
+    // set by the first row.
+    ValuesRowArityMismatch,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

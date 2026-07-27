@@ -1525,6 +1525,26 @@ std::vector<ResolvedColumn> Analyzer::columns_from_values(ASTNode* values_stmt,
         const DataType t = infer_expr(v, scope);
         cols.push_back(ResolvedColumn{std::string{}, t, /*nullable=*/true, 0, 0});
     }
+    // Every subsequent row must supply the same number of values as the first
+    // (which sets the relation's width). A ragged VALUES list - accepted before,
+    // as a derived table - would leave a row narrower/wider than the schema, a
+    // malformed relation. INSERT already rejects this shape; do the same here.
+    // Infer the extra rows' expressions too (resolves columns / types), then
+    // flag any width mismatch.
+    for (ASTNode* row = first_row->next_sibling; row != nullptr; row = row->next_sibling) {
+        std::size_t width = 0;
+        for (ASTNode* v = first_child(row); v != nullptr; v = v->next_sibling) {
+            infer_expr(v, scope);
+            ++width;
+        }
+        if (width != cols.size()) {
+            add_diagnostic(DiagnosticCode::ValuesRowArityMismatch,
+                           "VALUES row has " + std::to_string(width) +
+                               " values but the first row has " +
+                               std::to_string(cols.size()),
+                           row);
+        }
+    }
     return cols;
 }
 

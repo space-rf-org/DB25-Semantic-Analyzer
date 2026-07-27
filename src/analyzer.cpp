@@ -588,9 +588,12 @@ struct FunctionType {
     if (upper_name == "NULLIF") {
         return 2;
     }
-    if (upper_name == "COALESCE") {
-        // NOT NULL iff any argument is known not-null (in particular a not-null
-        // final default guarantees a non-NULL result).
+    if (upper_name == "COALESCE" || upper_name == "GREATEST" || upper_name == "LEAST") {
+        // COALESCE returns its first non-NULL argument; GREATEST / LEAST skip NULL
+        // arguments and yield NULL only when EVERY argument is NULL (Postgres). All
+        // three are therefore NOT NULL iff any argument is known not-null - not the
+        // default "nullable if any argument is nullable", which over-reported
+        // GREATEST(not_null, nullable) as nullable.
         bool any_not_null = false;
         bool any_nullable = false;
         for (const int p : arg_nulls) {
@@ -1622,8 +1625,22 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
             RelationBinding binding;
             binding.name = std::string{alias};
             binding.alias = std::string{alias};
-            if (ASTNode* body = find_child(item, NodeType::SelectStmt)) {
-                binding.columns = analyze_query(body, &scope);
+            // The derived-table body is a query: a SELECT, a set operation
+            // (UNION / INTERSECT / EXCEPT), or a VALUES list. Dispatch a SELECT or
+            // set-op body through analyze_stmt (which reconciles set-op branch
+            // columns) - previously only a direct SelectStmt child was handled, so
+            // a set-op body registered ZERO columns and every reference to the
+            // derived relation was falsely UnresolvedColumn (the CTE path already
+            // accepts a set-op body; this is the derived-table sibling of that).
+            ASTNode* query_body = nullptr;
+            for (ASTNode* c = first_child(item); c != nullptr; c = c->next_sibling) {
+                if (c->node_type == NodeType::SelectStmt || is_setop(c->node_type)) {
+                    query_body = c;
+                    break;
+                }
+            }
+            if (query_body != nullptr) {
+                binding.columns = analyze_stmt(query_body, &scope);
             } else if (ASTNode* values = find_child(item, NodeType::ValuesStmt)) {
                 // A VALUES list used as a derived table: its columns are the
                 // per-position value types; they are anonymous until named by the

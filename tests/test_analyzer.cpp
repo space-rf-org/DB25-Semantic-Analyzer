@@ -1867,6 +1867,57 @@ void test_nullability_columns_and_functions() {
     CHECK(id != nullptr && id->context.analysis.nullability == 1);
 }
 
+void test_greatest_least_nullability() {
+    std::printf("test_greatest_least_nullability\n");
+    // GREATEST / LEAST skip NULL arguments (Postgres), so the result is NOT NULL
+    // iff any argument is NOT NULL - the same rule as COALESCE, not the default
+    // "nullable if any argument is nullable". Regression: they fell through to the
+    // generic combine_nullable_any and were over-reported nullable.
+    auto cat = make_catalog_null();  // users(id NOT NULL, note nullable)
+    parser::Parser p;
+    auto res = p.parse(
+        "SELECT GREATEST(id, note), LEAST(id, note), GREATEST(note, note) FROM users");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* g = list ? first_child(list) : nullptr;
+    ASTNode* l = g ? g->next_sibling : nullptr;
+    ASTNode* gn = l ? l->next_sibling : nullptr;
+    CHECK(g != nullptr && a.nullability_of(g) == 1);   // GREATEST(NN, nullable) -> NOT NULL
+    CHECK(l != nullptr && a.nullability_of(l) == 1);    // LEAST(NN, nullable) -> NOT NULL
+    CHECK(gn != nullptr && a.nullability_of(gn) == 2);  // GREATEST(nullable,nullable) -> nullable
+}
+
+void test_setop_derived_table_columns() {
+    std::printf("test_setop_derived_table_columns\n");
+    // A derived table whose body is a set operation registers its reconciled
+    // columns (named/typed from the first branch), so references to them resolve -
+    // the derived-table sibling of the set-op CTE fix. Regression: the body was
+    // matched only as a direct SelectStmt, so a set-op body registered ZERO
+    // columns and every reference was falsely UnresolvedColumn.
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false}});
+    cat.add_table("orders", {ColumnInfo{"oid", DataType::Integer, /*nullable=*/false}});
+    parser::Parser p;
+    const char* sqls[] = {
+        "SELECT id FROM (SELECT id FROM users UNION SELECT oid FROM orders) AS t",
+        "SELECT id FROM (SELECT id FROM users INTERSECT SELECT oid FROM orders) AS t",
+        "SELECT id FROM (SELECT id FROM users EXCEPT SELECT oid FROM orders) AS t",
+        "SELECT a FROM (SELECT id AS a FROM users UNION SELECT oid FROM orders) AS t(a)",
+    };
+    for (const char* sql : sqls) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+        CHECK(!a.has_errors());
+    }
+}
+
 void test_in_expr_nullability() {
     std::printf("test_in_expr_nullability\n");
     auto cat = make_catalog_null();  // users(id NOT NULL, note nullable)
@@ -3970,6 +4021,8 @@ int main() {
 
     // Nullability propagation
     test_nullability_columns_and_functions();
+    test_greatest_least_nullability();
+    test_setop_derived_table_columns();
     test_in_expr_nullability();
     test_left_join_nullability();
     test_inner_join_nullability_unchanged();

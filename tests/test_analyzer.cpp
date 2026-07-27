@@ -1630,6 +1630,37 @@ void test_nullability_columns_and_functions() {
     CHECK(id != nullptr && id->context.analysis.nullability == 1);
 }
 
+void test_in_expr_nullability() {
+    std::printf("test_in_expr_nullability\n");
+    auto cat = make_catalog_null();  // users(id NOT NULL, note nullable)
+    parser::Parser p;
+    // Under 3-valued logic `x IN (...)` is NULL when no element equals x but x or
+    // some element is NULL, so the result is nullable if the left operand OR any
+    // list element / subquery column is nullable - not just when the left is.
+    auto in_null = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* in = find_descendant(res.value(), NodeType::InExpr);
+        CHECK(in != nullptr);
+        return in != nullptr ? a.nullability_of(in) : -1;
+    };
+    // NOT NULL left, but a NULL in the list -> nullable (regression: was 1).
+    CHECK(in_null("SELECT id IN (1, NULL) FROM users") == 2);
+    // NOT NULL left and an all-not-null list -> not-null (unchanged).
+    CHECK(in_null("SELECT id IN (1, 2) FROM users") == 1);
+    // NOT IN has the same nullability.
+    CHECK(in_null("SELECT id NOT IN (1, NULL) FROM users") == 2);
+    // A nullable list element (the column `note`) makes it nullable.
+    CHECK(in_null("SELECT id IN (note) FROM users") == 2);
+    // Subquery RHS: a nullable projected column -> nullable; a not-null column
+    // with a not-null left -> not-null.
+    CHECK(in_null("SELECT id IN (SELECT note FROM users) FROM users") == 2);
+    CHECK(in_null("SELECT id IN (SELECT uid FROM orders) FROM users") == 1);
+}
+
 void test_left_join_nullability() {
     std::printf("test_left_join_nullability\n");
     auto cat = make_catalog_null();
@@ -3617,6 +3648,7 @@ int main() {
 
     // Nullability propagation
     test_nullability_columns_and_functions();
+    test_in_expr_nullability();
     test_left_join_nullability();
     test_inner_join_nullability_unchanged();
 

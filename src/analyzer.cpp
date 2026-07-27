@@ -2142,6 +2142,14 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             ASTNode* left = first_child(expr);
             const DataType lt = infer_expr(left, scope);
             ASTNode* right = left != nullptr ? left->next_sibling : nullptr;
+            // Under three-valued logic `x IN (...)` is NULL when no element
+            // equals x but some element (or x itself) is NULL - so the result is
+            // nullable if the left operand OR any element/subquery column is
+            // nullable, not just when the left operand is. Inferring NOT NULL
+            // from the left alone (as before) is the unsafe direction: a
+            // consumer could drop a needed NULL check. `x IN (1, NULL)` is the
+            // canonical case. (NOT IN has the same nullability.)
+            std::vector<int> nulls{null_of(left)};
             if (right != nullptr && (right->node_type == NodeType::Subquery ||
                                      right->node_type == NodeType::SubqueryExpr)) {
                 // `expr IN (subquery)`: the subquery must project exactly one
@@ -2153,6 +2161,7 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                        std::to_string(proj.size()) +
                                        " columns; exactly one is required",
                                    expr);
+                    nulls.push_back(2);  // shape unknown: conservatively nullable
                 } else {
                     const Coercion c = coerce(lt, proj.front().type,
                                               CoercionKind::Comparison);
@@ -2162,15 +2171,20 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                        "subquery column of a different type category",
                                        expr, Severity::Warning);
                     }
+                    // A NULL in the projected column makes a non-matching row
+                    // yield NULL rather than FALSE.
+                    nulls.push_back(proj.front().nullable ? 2 : 1);
                 }
             } else {
-                // `expr IN (list)`: infer each list element (resolves columns).
+                // `expr IN (list)`: infer each list element (resolves columns)
+                // and fold its nullability into the result.
                 for (ASTNode* c = right; c != nullptr; c = c->next_sibling) {
                     infer_expr(c, scope);
+                    nulls.push_back(null_of(c));
                 }
             }
             record_type(expr, DataType::Boolean);
-            record_nullability(expr, null_of(left));
+            record_nullability(expr, combine_nullable_any(nulls));
             return DataType::Boolean;
         }
 

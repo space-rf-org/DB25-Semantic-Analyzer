@@ -196,9 +196,24 @@ private:
                 if (!ints || rv.i == 0) return V::fail();
                 return V::I(lv.i % rv.i);
             }
+            // Two integer operands: compute + - * EXACTLY in int64. Going through
+            // double (as this used to) silently loses precision past 2^53 - so a
+            // CHECK like `a + b = 9007199254740993` would compare a rounded sum
+            // and flip the result - and casting an out-of-range double back to
+            // long long is undefined behavior. Overflow can't be folded to a
+            // definite value, so bail (the CHECK stays Unknown - never a false
+            // verdict). A real operand keeps the double path.
+            if (ints) {
+                long long r = 0;
+                const bool overflow = op == "+"   ? __builtin_add_overflow(lv.i, rv.i, &r)
+                                      : op == "-" ? __builtin_sub_overflow(lv.i, rv.i, &r)
+                                                  : __builtin_mul_overflow(lv.i, rv.i, &r);
+                if (overflow) return V::fail();
+                return V::I(r);
+            }
             const double a = lv.as_d(), b = rv.as_d();
             const double res = op == "+" ? a + b : op == "-" ? a - b : a * b;
-            return ints ? V::I(static_cast<long long>(res)) : V::D(res);
+            return V::D(res);
         }
         return V::fail();
     }

@@ -353,11 +353,15 @@ degrading them to `Unknown`:
 
 ### GROUP BY / HAVING legality
 
-A query is *grouped* if it has a `GroupByClause` or any **non-windowed**
-aggregate in the SELECT list (a windowed aggregate like `SUM(x) OVER (…)` does
-not collapse rows and so does not force grouping — its arguments and `OVER`
-expressions are exempt from the grouping rule, as columns beneath an aggregate
-are). `analyze_grouping` collects the grouping keys (as resolved
+A query is *grouped* if it has a `GroupByClause`, a `HavingClause` (whose
+presence collapses the whole table into a single group even without `GROUP BY`),
+or any **non-windowed** aggregate in the SELECT list **or ORDER BY** (a windowed
+aggregate like `SUM(x) OVER (…)` does not collapse rows and so does not force
+grouping — its arguments and `OVER` expressions are exempt from the grouping
+rule, as columns beneath an aggregate are). So `SELECT id FROM emp HAVING
+COUNT(*) > 0` and `SELECT id FROM emp ORDER BY COUNT(*)` are grouped queries in
+which the bare `id` is flagged, matching Postgres. `analyze_grouping` collects
+the grouping keys (as resolved
 `(table_id, column_id)` identity, with the reference text as a fallback for
 unresolved / derived keys) and walks the SELECT list, ORDER BY, and HAVING:
 

@@ -2559,18 +2559,34 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
 
     ASTNode* select_list = find_child(select_stmt, NodeType::SelectList);
 
-    // The query is "grouped" if it has a GROUP BY clause or any aggregate in the
-    // SELECT list. Only grouped queries are subject to the legality rules.
-    bool grouped = group_by != nullptr;
-    if (!grouped && select_list != nullptr) {
-        for (ASTNode* item = first_child(select_list); item != nullptr;
+    // The query is "grouped" (subject to the legality rules) if it has a GROUP BY
+    // clause, a HAVING clause, or any non-windowed aggregate in a clause that
+    // forces aggregation - the SELECT list or the ORDER BY. Per SQL, the presence
+    // of HAVING alone collapses the whole table into a single group even without
+    // GROUP BY, and an aggregate anywhere in SELECT / HAVING / ORDER BY makes the
+    // query an aggregate query (so `SELECT id FROM emp HAVING COUNT(*) > 0` and
+    // `SELECT id FROM emp ORDER BY COUNT(*)` must flag the bare `id`, matching
+    // Postgres). Previously only GROUP BY and a SELECT-list aggregate set this, so
+    // an aggregate confined to HAVING / ORDER BY silently accepted a non-grouped
+    // column. contains_aggregate stops at subquery boundaries and excludes
+    // windowed calls, so neither forces grouping of THIS block.
+    ASTNode* having_clause = find_child(select_stmt, NodeType::HavingClause);
+    ASTNode* order_by_clause = find_child(select_stmt, NodeType::OrderByClause);
+    const auto clause_has_aggregate = [](ASTNode* clause) {
+        if (clause == nullptr) {
+            return false;
+        }
+        for (ASTNode* item = first_child(clause); item != nullptr;
              item = item->next_sibling) {
             if (contains_aggregate(item)) {
-                grouped = true;
-                break;
+                return true;
             }
         }
-    }
+        return false;
+    };
+    const bool grouped = group_by != nullptr || having_clause != nullptr ||
+                         clause_has_aggregate(select_list) ||
+                         clause_has_aggregate(order_by_clause);
     if (!grouped) {
         return;
     }

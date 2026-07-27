@@ -2338,6 +2338,42 @@ void test_check_division_overflow_bails() {
     CHECK(db25::semantic::evaluate_check("10 % 3 = 1", b) == db25::semantic::CheckResult::True);
 }
 
+void test_check_unary_negation_overflow_bails() {
+    std::printf("test_check_unary_negation_overflow_bails\n");
+    // Applying unary '-' to INT64_MIN is signed-overflow UB: -INT64_MIN is not
+    // representable in int64 (aborts under the sanitizers CI job). The binary
+    // + - * / % paths guard INT64_MIN, but the unary-minus operator did not, so
+    // a CHECK that negates a subexpression folding to INT64_MIN invoked UB.
+    // INT64_MIN is written as (-9223372036854775807 - 1) because the literal
+    // 9223372036854775808 does not parse. The evaluator must fold WITHOUT UB,
+    // yielding Unknown (the negation is unrepresentable), never a false verdict.
+    db25::semantic::CheckBindings b;
+    CHECK(db25::semantic::evaluate_check("-(-9223372036854775807 - 1) = 0", b)
+          == db25::semantic::CheckResult::Unknown);
+    CHECK(db25::semantic::evaluate_check("-(-9223372036854775807 - 1) > 0", b)
+          == db25::semantic::CheckResult::Unknown);
+    // Ordinary unary minus (and double negation) still fold exactly.
+    CHECK(db25::semantic::evaluate_check("- -5 = 5", b) == db25::semantic::CheckResult::True);
+    CHECK(db25::semantic::evaluate_check("-3 < 0", b) == db25::semantic::CheckResult::True);
+
+    // End-to-end through analyze(): a CHECK negating INT64_MIN reports no
+    // violation (folds Unknown) and, under ASan/UBSan, no signed-overflow error.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("uneg", {
+        ColumnInfo{"a", DataType::BigInt, /*nullable=*/true},  // column_id 1
+    });
+    Constraint cu; cu.kind = Constraint::Kind::Check;
+    cu.expr = "-(-9223372036854775807 - 1) <> 0";  // negation: Unknown
+    t.constraints.push_back(cu);
+
+    parser::Parser p;
+    auto r = p.parse("INSERT INTO uneg (a) VALUES (1)");
+    CHECK(r.has_value());
+    Analyzer a(cat);
+    a.analyze(r.value());
+    CHECK(count_code(a, DiagnosticCode::CheckViolation) == 0);
+}
+
 void test_insert_check_violation_from_default() {
     std::printf("test_insert_check_violation_from_default\n");
     // A column omitted from an INSERT takes its DEFAULT. When that default is a
@@ -3770,6 +3806,7 @@ int main() {
     test_check_large_integer_arithmetic();
     test_check_integer_overflow_bails();
     test_check_division_overflow_bails();
+    test_check_unary_negation_overflow_bails();
     test_insert_check_violation_from_default();
     test_insert_check_violation_constant_fold();
 

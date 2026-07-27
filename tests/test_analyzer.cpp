@@ -2054,6 +2054,63 @@ void test_insert_check_violation() {
     CHECK(viol("INSERT INTO t (age) VALUES (1), (-2), (3)") == 1);
 }
 
+void test_check_large_integer_arithmetic() {
+    std::printf("test_check_large_integer_arithmetic\n");
+    // CHECK arithmetic on BIGINT operands must be EXACT int64. Evaluating through
+    // double loses precision past 2^53, which would flip a comparison and flag a
+    // false violation on a valid row.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("big", {
+        ColumnInfo{"a", DataType::BigInt, /*nullable=*/true},   // column_id 1
+        ColumnInfo{"b", DataType::BigInt, /*nullable=*/true},   // column_id 2
+    });
+    Constraint c; c.kind = Constraint::Kind::Check;
+    c.expr = "a + b = 9007199254740993"; c.columns = {1, 2};  // 2^53 + 1
+    t.constraints.push_back(c);
+
+    parser::Parser p;
+    auto viol = [&](const char* sql) {
+        auto r = p.parse(sql);
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::CheckViolation);
+    };
+    // 2^53 + 1: a+b EXACTLY equals the RHS, so the CHECK is satisfied. In double
+    // the sum rounds to 2^53 and mis-compares - the old code flagged a false
+    // violation here.
+    CHECK(viol("INSERT INTO big (a, b) VALUES (9007199254740992, 1)") == 0);
+    // A genuine violation still fires (sum != RHS).
+    CHECK(viol("INSERT INTO big (a, b) VALUES (1, 1)") == 1);
+}
+
+void test_check_integer_overflow_bails() {
+    std::printf("test_check_integer_overflow_bails\n");
+    // Integer overflow in a CHECK cannot be folded to a definite value, so the
+    // evaluator bails (predicate stays Unknown) rather than invoking UB (an
+    // out-of-range double->long long cast) or guessing - no false verdict.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("ovf", {
+        ColumnInfo{"a", DataType::BigInt, /*nullable=*/true},   // column_id 1
+        ColumnInfo{"b", DataType::BigInt, /*nullable=*/true},   // column_id 2
+    });
+    Constraint c; c.kind = Constraint::Kind::Check; c.expr = "a * b = 0"; c.columns = {1, 2};
+    t.constraints.push_back(c);
+
+    parser::Parser p;
+    auto viol = [&](const char* sql) {
+        auto r = p.parse(sql);
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::CheckViolation);
+    };
+    // a*b overflows int64: unfoldable -> predicate Unknown -> no (false) violation.
+    CHECK(viol("INSERT INTO ovf (a, b) VALUES (9223372036854775807, 2)") == 0);
+    // A small, non-overflowing violation still fires (2*3 = 6 <> 0).
+    CHECK(viol("INSERT INTO ovf (a, b) VALUES (2, 3)") == 1);
+}
+
 void test_insert_check_violation_from_default() {
     std::printf("test_insert_check_violation_from_default\n");
     // A column omitted from an INSERT takes its DEFAULT. When that default is a
@@ -3479,6 +3536,8 @@ int main() {
     test_insert_default_values();
     test_insert_default_values_all_defaulted_ok();
     test_insert_check_violation();
+    test_check_large_integer_arithmetic();
+    test_check_integer_overflow_bails();
     test_insert_check_violation_from_default();
     test_insert_check_violation_constant_fold();
 

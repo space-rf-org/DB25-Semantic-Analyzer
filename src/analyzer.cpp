@@ -1225,11 +1225,23 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             if (def->node_type != NodeType::CTEDefinition) {
                 continue;
             }
-            ASTNode* body = find_child(def, NodeType::SelectStmt);
+            // A CTE body is a SELECT *or* a set operation (UNION/INTERSECT/EXCEPT).
+            // find_child only matched SelectStmt, so a set-op body -
+            // `WITH t AS (SELECT .. UNION SELECT ..)` - registered the CTE with no
+            // columns, and a later `SELECT * FROM t` resolved to nothing. Take the
+            // first query child (select or set-op) and analyze it via analyze_stmt,
+            // which dispatches both.
+            ASTNode* body = nullptr;
+            for (ASTNode* c = first_child(def); c != nullptr; c = c->next_sibling) {
+                if (c->node_type == NodeType::SelectStmt || is_setop(c->node_type)) {
+                    body = c;
+                    break;
+                }
+            }
             NamedRelation cte;
             cte.name = std::string{def->primary_text};
             if (body != nullptr) {
-                cte.columns = analyze_query(body, &scope);
+                cte.columns = analyze_stmt(body, &scope);
             }
             // Optional column-list rename `WITH t(a, b) AS (...)`: rename the CTE's
             // output columns positionally so a later `SELECT a FROM t` resolves.

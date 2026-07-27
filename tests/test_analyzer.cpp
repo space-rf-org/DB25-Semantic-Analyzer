@@ -517,6 +517,31 @@ void test_cte_resolution() {
     CHECK(a.diagnostics().empty());
 }
 
+// A CTE whose body is a set operation (UNION/INTERSECT/EXCEPT) must register its
+// columns so the outer query can resolve them. Previously the body lookup only
+// matched a SelectStmt, so a set-op body registered the CTE with no columns and
+// the outer reference went unresolved.
+void test_cte_setop_body() {
+    std::printf("test_cte_setop_body\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT)
+    parser::Parser p;
+    auto res = p.parse(
+        "WITH t AS (SELECT id FROM users UNION SELECT id FROM users) "
+        "SELECT id FROM t WHERE id > 0");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+    CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 0);
+    CHECK(count_code(a, DiagnosticCode::UnresolvedTable) == 0);
+    // The outer `id` resolves to the CTE's column (Integer, from users.id).
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* id = list != nullptr ? first_child(list) : nullptr;
+    CHECK(id != nullptr && a.type_of(id) == DataType::Integer);
+}
+
 void test_unresolved_table() {
     std::printf("test_unresolved_table\n");
     auto cat = make_catalog();
@@ -3436,6 +3461,7 @@ int main() {
     test_values_derived_table();
     test_where_type_inference();
     test_cte_resolution();
+    test_cte_setop_body();
     test_unresolved_table();
 
     // SELECT * / table.* expansion

@@ -78,6 +78,10 @@ enum class DiagnosticCode : std::uint16_t {
     // Every row must supply the same number of values; the relation's width is
     // set by the first row.
     ValuesRowArityMismatch,
+    // A column of a multi-row VALUES has incompatible types across rows (e.g.
+    // `(VALUES (1), ('x'))`). A multi-row VALUES is a UNION ALL of its rows, so
+    // each column's type must reconcile across every row.
+    ValuesColumnTypeMismatch,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

@@ -506,6 +506,48 @@ void test_values_derived_table() {
             CHECK(count_code(a, DiagnosticCode::ValuesRowArityMismatch) == 0);
         }
     }
+    // A multi-row VALUES is a UNION ALL of its rows, so each column's type is
+    // reconciled across every row (not taken from the first row only). A widening
+    // mix (int + double) is legal and reconciles cleanly; an incompatible mix
+    // (int + text, either order) is flagged. Regression: the later-rows loop only
+    // checked arity, so both were silently accepted.
+    {
+        auto res = p.parse("SELECT a FROM (VALUES (1), (2.5)) AS t(a)");  // numeric widen: legal
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == 0);
+        }
+    }
+    {
+        auto res = p.parse("SELECT a FROM (VALUES (1), ('x')) AS t(a)");  // int then text: illegal
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == 1);
+        }
+    }
+    {
+        auto res = p.parse("SELECT a FROM (VALUES ('x'), (1)) AS t(a)");  // text then int: illegal
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == 1);
+        }
+    }
+    {
+        // Per-column reconciliation: an int column beside a text column is fine.
+        auto res = p.parse("SELECT a, b FROM (VALUES (1, 'x'), (2, 'y')) AS t(a, b)");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == 0);
+        }
+    }
 }
 
 void test_where_type_inference() {
@@ -1119,6 +1161,36 @@ void test_groupby_non_grouped_column() {
     a.analyze(res.value());
     // name is neither grouped nor aggregated.
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
+void test_groupby_aggregate_in_having_or_orderby_groups() {
+    std::printf("test_groupby_aggregate_in_having_or_orderby_groups\n");
+    // An aggregate confined to HAVING or ORDER BY (or the mere presence of
+    // HAVING) makes the query grouped even without GROUP BY, so a bare
+    // non-grouped column in the SELECT list is illegal - matching Postgres.
+    // Regression: the `grouped` trigger only looked at GROUP BY and the SELECT
+    // list, so these were silently accepted.
+    auto cat = make_catalog_emp();
+    struct Case { const char* sql; int expect_non_grouped; };
+    const Case cases[] = {
+        {"SELECT id FROM emp HAVING COUNT(*) > 0", 1},      // HAVING groups; id illegal
+        {"SELECT id FROM emp ORDER BY COUNT(*)", 1},        // aggregate in ORDER BY groups
+        {"SELECT dept FROM emp HAVING COUNT(*) > 0", 1},    // dept illegal too
+        // Legal controls: must NOT be flagged.
+        {"SELECT COUNT(*) FROM emp HAVING COUNT(*) > 0", 0},          // only aggregate projected
+        {"SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) > 0", 0},// dept is a group key
+        {"SELECT id FROM emp ORDER BY id", 0},              // not grouped at all
+        {"SELECT id FROM emp", 0},                          // plain select
+    };
+    for (const auto& c : cases) {
+        parser::Parser p;
+        auto res = p.parse(c.sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == c.expect_non_grouped);
+    }
 }
 
 void test_groupby_output_alias_key() {
@@ -3736,6 +3808,7 @@ int main() {
     // GROUP BY / HAVING legality & function typing
     test_groupby_clean_count_star();
     test_groupby_non_grouped_column();
+    test_groupby_aggregate_in_having_or_orderby_groups();
     test_groupby_output_alias_key();
     test_groupby_alias_ambiguity_and_aggregate();
     test_groupby_having_aggregate_clean();

@@ -476,6 +476,36 @@ void test_values_derived_table() {
             CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
         }
     }
+    // Ragged VALUES rows (a later row narrower or wider than the first, which
+    // sets the width) make a malformed relation and must be flagged.
+    {
+        auto res = p.parse("SELECT * FROM (VALUES (1, 2), (3)) t");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesRowArityMismatch) == 1);
+        }
+    }
+    {
+        auto res = p.parse("SELECT * FROM (VALUES (1, 2), (3, 4, 5)) t");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesRowArityMismatch) == 1);
+        }
+    }
+    // Uniform VALUES rows stay clean (regression guard for the new check).
+    {
+        auto res = p.parse("SELECT * FROM (VALUES (1, 2), (3, 4)) t");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesRowArityMismatch) == 0);
+        }
+    }
 }
 
 void test_where_type_inference() {

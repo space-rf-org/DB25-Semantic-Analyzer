@@ -6,6 +6,7 @@
 #include "db25/parser/parser.hpp"
 #include "db25/semantic/analyzer.hpp"
 #include "db25/semantic/ast_helpers.hpp"
+#include "db25/semantic/check_eval.hpp"
 #include "db25/semantic/catalog.hpp"
 #include "db25/semantic/identifier.hpp"
 
@@ -2136,6 +2137,47 @@ void test_check_integer_overflow_bails() {
     CHECK(viol("INSERT INTO ovf (a, b) VALUES (2, 3)") == 1);
 }
 
+void test_check_division_overflow_bails() {
+    std::printf("test_check_division_overflow_bails\n");
+    // INT64_MIN / -1 (and INT64_MIN % -1) overflow int64 - evaluating them is
+    // signed-overflow UB (the / and % paths were previously computed directly,
+    // unlike the guarded + - * paths). INT64_MIN is spelled as (-INT64_MAX - 1)
+    // because the literal 9223372036854775808 does not parse. The evaluator must
+    // fold WITHOUT UB: `/` bails to Unknown (quotient unrepresentable), `%`
+    // returns the well-defined 0. Neither yields a false violation. This test
+    // also runs under the sanitizers CI job, which is what catches the UB.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("dvz", {
+        ColumnInfo{"a", DataType::BigInt, /*nullable=*/true},  // column_id 1
+    });
+    // Two all-constant CHECKs (no column refs); both fold over INT64_MIN.
+    Constraint cd; cd.kind = Constraint::Kind::Check;
+    cd.expr = "(-9223372036854775807 - 1) / -1 <> 0";       // div: Unknown
+    t.constraints.push_back(cd);
+    Constraint cm; cm.kind = Constraint::Kind::Check;
+    cm.expr = "(-9223372036854775807 - 1) % -1 = 0";        // mod: True (= 0)
+    t.constraints.push_back(cm);
+
+    parser::Parser p;
+    auto r = p.parse("INSERT INTO dvz (a) VALUES (1)");
+    CHECK(r.has_value());
+    Analyzer a(cat);
+    a.analyze(r.value());
+    // No CHECK folds to a definite False, so no violation is reported (and, under
+    // ASan/UBSan, no signed-overflow error occurs).
+    CHECK(count_code(a, DiagnosticCode::CheckViolation) == 0);
+
+    // Direct evaluator checks pinning the exact folded verdicts.
+    db25::semantic::CheckBindings b;
+    CHECK(db25::semantic::evaluate_check("(-9223372036854775807 - 1) / -1 <> 0", b)
+          == db25::semantic::CheckResult::Unknown);
+    CHECK(db25::semantic::evaluate_check("(-9223372036854775807 - 1) % -1 = 0", b)
+          == db25::semantic::CheckResult::True);
+    // Ordinary division/modulo still fold exactly.
+    CHECK(db25::semantic::evaluate_check("7 / 2 = 3", b) == db25::semantic::CheckResult::True);
+    CHECK(db25::semantic::evaluate_check("10 % 3 = 1", b) == db25::semantic::CheckResult::True);
+}
+
 void test_insert_check_violation_from_default() {
     std::printf("test_insert_check_violation_from_default\n");
     // A column omitted from an INSERT takes its DEFAULT. When that default is a
@@ -3564,6 +3606,7 @@ int main() {
     test_insert_check_violation();
     test_check_large_integer_arithmetic();
     test_check_integer_overflow_bails();
+    test_check_division_overflow_bails();
     test_insert_check_violation_from_default();
     test_insert_check_violation_constant_fold();
 

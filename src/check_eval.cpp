@@ -123,7 +123,16 @@ private:
             return V::fail();
         }
         if (op == "-") {
-            if (x.k == V::Int) return V::I(-x.i);
+            if (x.k == V::Int) {
+                // -INT64_MIN is not representable in a signed 64-bit int, so
+                // computing `-x.i` there is signed-overflow UB (aborts under the
+                // CI's -fsanitize=undefined -fno-sanitize-recover). This is the
+                // same hazard the eval_binary INT64_MIN / -1 path guards; bail so
+                // the fold stays Unknown rather than invoking UB or producing a
+                // false verdict.
+                if (x.i == (std::numeric_limits<long long>::min)()) return V::fail();
+                return V::I(-x.i);
+            }
             if (x.k == V::Dbl) return V::D(-x.d);
             if (x.k == V::Null) return V::null_();
         }

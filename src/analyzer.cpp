@@ -1529,13 +1529,29 @@ std::vector<ResolvedColumn> Analyzer::columns_from_values(ASTNode* values_stmt,
     // (which sets the relation's width). A ragged VALUES list - accepted before,
     // as a derived table - would leave a row narrower/wider than the schema, a
     // malformed relation. INSERT already rejects this shape; do the same here.
-    // Infer the extra rows' expressions too (resolves columns / types), then
-    // flag any width mismatch.
+    //
+    // A multi-row VALUES is a UNION ALL of its rows, so each column's type is
+    // reconciled ACROSS every row (exactly as analyze_setop folds set-op
+    // branches), not taken from the first row alone. Without this a legal
+    // `(VALUES (1), (2.5))` was mis-typed Integer instead of numeric, and an
+    // illegal `(VALUES (1), ('x'))` was silently accepted. Reconcile each
+    // in-range position and flag an incompatible column; the last row's width
+    // still drives the separate arity check.
     for (ASTNode* row = first_row->next_sibling; row != nullptr; row = row->next_sibling) {
         std::size_t width = 0;
-        for (ASTNode* v = first_child(row); v != nullptr; v = v->next_sibling) {
-            infer_expr(v, scope);
-            ++width;
+        for (ASTNode* v = first_child(row); v != nullptr; v = v->next_sibling, ++width) {
+            const DataType t = infer_expr(v, scope);
+            if (width < cols.size()) {
+                const Coercion r =
+                    coerce(cols[width].type, t, CoercionKind::UnionReconcile);
+                if (r.status == CoercionStatus::Incompatible) {
+                    add_diagnostic(DiagnosticCode::ValuesColumnTypeMismatch,
+                                   "incompatible types in VALUES for column " +
+                                       std::to_string(width + 1),
+                                   v);
+                }
+                cols[width].type = r.type;  // reconciled column type
+            }
         }
         if (width != cols.size()) {
             add_diagnostic(DiagnosticCode::ValuesRowArityMismatch,

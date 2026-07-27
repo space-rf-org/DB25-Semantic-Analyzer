@@ -506,6 +506,48 @@ void test_values_derived_table() {
             CHECK(count_code(a, DiagnosticCode::ValuesRowArityMismatch) == 0);
         }
     }
+    // A multi-row VALUES is a UNION ALL of its rows, so each column's type is
+    // reconciled across every row (not taken from the first row only). A widening
+    // mix (int + double) is legal and reconciles cleanly; an incompatible mix
+    // (int + text, either order) is flagged. Regression: the later-rows loop only
+    // checked arity, so both were silently accepted.
+    {
+        auto res = p.parse("SELECT a FROM (VALUES (1), (2.5)) AS t(a)");  // numeric widen: legal
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == 0);
+        }
+    }
+    {
+        auto res = p.parse("SELECT a FROM (VALUES (1), ('x')) AS t(a)");  // int then text: illegal
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == 1);
+        }
+    }
+    {
+        auto res = p.parse("SELECT a FROM (VALUES ('x'), (1)) AS t(a)");  // text then int: illegal
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == 1);
+        }
+    }
+    {
+        // Per-column reconciliation: an int column beside a text column is fine.
+        auto res = p.parse("SELECT a, b FROM (VALUES (1, 'x'), (2, 'y')) AS t(a, b)");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::ValuesColumnTypeMismatch) == 0);
+        }
+    }
 }
 
 void test_where_type_inference() {

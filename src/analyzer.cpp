@@ -1772,22 +1772,12 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
                 case JoinNullSide::None:
                     break;
             }
-            // A USING / NATURAL column collapses the two per-side copies into one
-            // merged output column. The surviving (non-coalesced) copy is what a
-            // bare reference resolves to, so it must be the PRESERVED side: for a
-            // RIGHT JOIN the left side is null-supplied, so coalesce the LEFT copy
-            // and let the right (preserved) copy back the merged column - giving
-            // it the right base column identity and its not-null nullability
-            // instead of the null-supplied left's. (LEFT/INNER keep the left copy;
-            // FULL is null-supplied on both sides, so either copy yields the same
-            // conservatively-nullable merged column.)
-            const bool coalesce_left = (join_null_side(item) == JoinNullSide::Left);
             // Pass 2: resolve the ON expression / USING columns against the now
             // fully-populated scope.
             for (ASTNode* child = first_child(item); child != nullptr;
                  child = child->next_sibling) {
                 if (child->node_type == NodeType::UsingClause) {
-                    resolve_using(child, scope, left_end, right_end, coalesce_left);
+                    resolve_using(child, scope, left_end, right_end);
                 } else if (!is_relation_node(child->node_type)) {
                     // The ON predicate: a normal expression whose column refs
                     // resolve (and emit diagnostics) through infer_expr.
@@ -1798,7 +1788,7 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
             // or USING clause; coalesce its common columns so bare references to
             // them resolve unambiguously.
             if (to_upper(item->primary_text).find("NATURAL") != std::string::npos) {
-                resolve_natural(scope, left_end, right_end, coalesce_left);
+                resolve_natural(scope, left_end, right_end);
             }
             return;
         }
@@ -1809,8 +1799,7 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
 }
 
 void Analyzer::resolve_using(ASTNode* using_clause, Scope& scope,
-                             std::size_t left_end, std::size_t right_end,
-                             bool coalesce_left) {
+                             std::size_t left_end, std::size_t right_end) {
     const auto& relations = scope.relations();
     for (ASTNode* col = first_child(using_clause); col != nullptr;
          col = col->next_sibling) {
@@ -1823,48 +1812,45 @@ void Analyzer::resolve_using(ASTNode* using_clause, Scope& scope,
                 left_hit = c;
             }
         }
-        const ResolvedColumn* right_hit = nullptr;
+        bool right_found = false;
         for (std::size_t i = left_end; i < right_end && i < relations.size(); ++i) {
-            if (const auto* c = relations[i].find_column(name)) {
-                right_hit = c;
+            if (relations[i].find_column(name) != nullptr) {
+                right_found = true;
             }
         }
 
-        if (left_hit == nullptr || right_hit == nullptr) {
+        if (left_hit == nullptr || !right_found) {
             add_diagnostic(DiagnosticCode::UsingColumnMissing,
                            "USING column '" + std::string{name} +
                                "' is not present in both joined relations",
                            col);
             continue;
         }
-        // A USING column collapses to a single merged output column. Coalesce the
-        // NULL-SUPPLIED side's copy so the surviving (preserved-side) copy backs a
-        // bare reference; record the preserved side's type/identity on the node.
-        const ResolvedColumn* preserved = coalesce_left ? right_hit : left_hit;
-        record_type(col, preserved->type);
-        col->context.analysis.table_id = preserved->table_id;
-        col->context.analysis.column_id = preserved->column_id;
-        if (coalesce_left) {
-            scope.mark_column_coalesced(0, left_end, name);
-        } else {
-            scope.mark_column_coalesced(left_end, right_end, name);
-        }
+        // A USING column collapses to a single merged output column; record its
+        // resolved type on the node so downstream consumers see it, and coalesce
+        // the right-hand copy so a bare reference is not ambiguous. The bare
+        // merged column keeps the LEFT copy's (table_id, column_id): the binder's
+        // input contract - it builds the visible COALESCE(left, right) column
+        // with the left identity and routes a bare reference to it by that id, and
+        // computes the merged column's true value/nullability itself. (An RIGHT/
+        // FULL merged column has no single base column; the left identity is a
+        // stable routing key, not a value claim.)
+        record_type(col, left_hit->type);
+        col->context.analysis.table_id = left_hit->table_id;
+        col->context.analysis.column_id = left_hit->column_id;
+        scope.mark_column_coalesced(left_end, right_end, name);
     }
 }
 
 // A NATURAL join is USING over every column common to both inputs: coalesce each
 // column that appears in both the left ([0, left_end)) and right
 // ([left_end, right_end)) relations, so a bare reference to it resolves to the
-// single surviving copy rather than reporting ambiguity. `coalesce_left` picks
-// which side's copy is coalesced (the null-supplied side, so the surviving copy
-// is the preserved side) - see resolve_using. (An out-of-scope subtlety: a
-// common column that is itself ambiguous on the surviving side stays ambiguous -
-// its copy is not coalesced, so resolve_bare still sees more than one.)
+// single left copy rather than reporting ambiguity. (An out-of-scope subtlety:
+// a common column that is itself ambiguous on the left stays ambiguous - the
+// left copy is not coalesced, so resolve_bare still sees more than one.)
 void Analyzer::resolve_natural(Scope& scope, std::size_t left_end,
-                               std::size_t right_end, bool coalesce_left) {
+                               std::size_t right_end) {
     const auto& relations = scope.relations();
-    const std::size_t cbegin = coalesce_left ? 0 : left_end;
-    const std::size_t cend = coalesce_left ? left_end : right_end;
     for (std::size_t li = 0; li < left_end && li < relations.size(); ++li) {
         for (const auto& lc : relations[li].columns) {
             bool in_right = false;
@@ -1875,7 +1861,7 @@ void Analyzer::resolve_natural(Scope& scope, std::size_t left_end,
                 }
             }
             if (in_right) {
-                scope.mark_column_coalesced(cbegin, cend, lc.name);
+                scope.mark_column_coalesced(left_end, right_end, lc.name);
             }
         }
     }

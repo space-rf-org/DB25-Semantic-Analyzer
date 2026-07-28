@@ -1945,21 +1945,41 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             // text; a non-decimal spelling (hex / binary) or unparseable text
             // conservatively stays Integer. `promote_numeric` ranks
             // Integer < BigInt < Decimal, so a wider type reconciles cleanly.
+            //
+            // The parser folds a leading sign into the literal's text (a negative
+            // literal is a single IntegerLiteral "-3000000000", not unary-minus of
+            // a positive), so strip an optional +/- before reading the magnitude:
+            // from_chars into an unsigned type rejects the sign and would otherwise
+            // leave every out-of-int32 negative typed Integer. A negative value
+            // reaches one further at each width (two's complement: INT32_MIN is
+            // -2147483648, INT64_MIN is -2^63), so the bounds are sign-aware.
             DataType t = DataType::Integer;
-            const std::string_view txt = expr->primary_text;
+            std::string_view txt = expr->primary_text;
+            bool negative = false;
+            if (!txt.empty() && (txt.front() == '-' || txt.front() == '+')) {
+                negative = (txt.front() == '-');
+                txt.remove_prefix(1);
+            }
             unsigned long long mag = 0;
             const char* const end = txt.data() + txt.size();
             const auto [ptr, ec] = std::from_chars(txt.data(), end, mag);
-            // `ptr == end` means the WHOLE text was decimal digits (so a hex / binary
-            // `0x..` / `0b..` spelling, whose parse stops at the first non-digit,
-            // conservatively stays Integer).
-            if (ptr == end) {
+            // `ptr == end` (with a non-empty digit run) means the WHOLE text after
+            // the sign was decimal digits (so a hex / binary `0x..` / `0b..`
+            // spelling, whose parse stops at the first non-digit, conservatively
+            // stays Integer).
+            if (ptr == end && !txt.empty()) {
+                // Largest magnitude each signed width holds: negatives reach one
+                // further than positives (|INT_MIN| = INT_MAX + 1).
+                const unsigned long long int32_max = negative ? 2147483648ULL
+                                                              : 2147483647ULL;
+                const unsigned long long int64_max = negative ? 9223372036854775808ULL
+                                                              : 9223372036854775807ULL;
                 if (ec == std::errc::result_out_of_range) {
                     t = DataType::Decimal;      // more digits than fit in uint64
                 } else if (ec == std::errc{}) {
-                    if (mag > 9223372036854775807ULL) {
+                    if (mag > int64_max) {
                         t = DataType::Decimal;  // beyond signed int64
-                    } else if (mag > 2147483647ULL) {
+                    } else if (mag > int32_max) {
                         t = DataType::BigInt;   // beyond signed int32, within int64
                     }
                 }

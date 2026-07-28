@@ -1257,6 +1257,37 @@ void test_groupby_aggregate_key_rejected() {
         a.analyze(ok2.value());
         CHECK(count_code(a, DiagnosticCode::AggregateInGroupBy) == 0);
     }
+
+    // A POSITIONAL key resolving to an aggregate SELECT item must be rejected
+    // just like the directly-written form - the ordinal literal is not itself an
+    // aggregate, so the raw-key check misses it; the resolved n-th item must be
+    // re-tested. Regression: `SELECT COUNT(*) FROM emp GROUP BY 1` slipped
+    // through and the binder was handed COUNT() as a group key.
+    auto pos_agg = [&](const char* sql) {
+        auto r = p.parse(sql);
+        CHECK(r.has_value());
+        if (!r) return;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        CHECK(count_code(a, DiagnosticCode::AggregateInGroupBy) == 1);
+    };
+    pos_agg("SELECT COUNT(*) FROM emp GROUP BY 1");
+    // A window function is likewise illegal as a group key, in every spelling
+    // (grouping precedes windowing). contains_aggregate skips windowed calls, so
+    // these are caught by the dedicated window check.
+    pos_agg("SELECT RANK() OVER (ORDER BY salary) FROM emp GROUP BY 1");        // positional
+    pos_agg("SELECT RANK() OVER (ORDER BY salary) FROM emp "
+            "GROUP BY RANK() OVER (ORDER BY salary)");                         // direct
+    pos_agg("SELECT RANK() OVER (ORDER BY salary) AS r FROM emp GROUP BY r");  // alias
+
+    // Legal positional keys pointing at a non-aggregate item stay clean.
+    auto ok3 = p.parse("SELECT salary + 1, COUNT(*) FROM emp GROUP BY 1");
+    CHECK(ok3.has_value());
+    if (ok3) {
+        Analyzer a(cat);
+        a.analyze(ok3.value());
+        CHECK(count_code(a, DiagnosticCode::AggregateInGroupBy) == 0);
+    }
 }
 
 void test_groupby_self_join_distinct_instances() {
@@ -2264,6 +2295,52 @@ void test_left_join_nullability() {
     ASTNode* uid = oid ? oid->next_sibling : nullptr;
     CHECK(oid != nullptr && a.nullability_of(oid) == 2);  // null-supplied side
     CHECK(uid != nullptr && a.nullability_of(uid) == 1);  // preserved side
+}
+
+void test_comma_then_outer_join_nullability() {
+    std::printf("test_comma_then_outer_join_nullability\n");
+    // Comma binds looser than JOIN, so `events e, users u RIGHT JOIN orders o` is
+    // `events CROSS (users RIGHT JOIN orders)`: only the RIGHT/FULL join's own
+    // left operand (users) is null-supplied. A comma-joined relation that
+    // precedes the join (events) must keep its base NOT NULL. Regression: the
+    // null-supplying range started at index 0, wrongly nullifying every preceding
+    // comma relation.
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"note", DataType::Text, /*nullable=*/true}});
+    cat.add_table("orders", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                             ColumnInfo{"uid", DataType::Integer, /*nullable=*/false}});
+    cat.add_table("sessions", {ColumnInfo{"sid", DataType::Integer, /*nullable=*/false}});
+    cat.add_table("events", {ColumnInfo{"eid", DataType::Integer, /*nullable=*/false},
+                             ColumnInfo{"n", DataType::Integer, /*nullable=*/false}});
+    parser::Parser p;
+
+    // Read the nullability the analyzer records on the FIRST select-list column.
+    auto null_of_first = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* first = list ? first_child(list) : nullptr;
+        return first ? a.nullability_of(first) : -1;
+    };
+
+    // Comma relation preceding a RIGHT / FULL join keeps NOT NULL (== 1).
+    CHECK(null_of_first("SELECT e.n FROM events e, users u "
+                        "RIGHT JOIN orders o ON u.id = o.uid") == 1);
+    CHECK(null_of_first("SELECT u.id FROM users u, orders o "
+                        "FULL JOIN sessions s ON o.uid = s.sid") == 1);
+    // The join's OWN left operand IS null-supplied (== 2).
+    CHECK(null_of_first("SELECT u.id FROM events e, users u "
+                        "RIGHT JOIN orders o ON u.id = o.uid") == 2);
+    // Unchanged: comma + LEFT join leaves the comma relation NOT NULL; a single
+    // RIGHT/FULL still null-supplies its (only) left operand.
+    CHECK(null_of_first("SELECT e.n FROM events e, users u "
+                        "LEFT JOIN orders o ON u.id = o.uid") == 1);
+    CHECK(null_of_first("SELECT u.id FROM users u "
+                        "RIGHT JOIN orders o ON u.id = o.uid") == 2);
 }
 
 void test_inner_join_nullability_unchanged() {
@@ -4448,6 +4525,7 @@ int main() {
     test_setop_derived_table_columns();
     test_in_expr_nullability();
     test_left_join_nullability();
+    test_comma_then_outer_join_nullability();
     test_inner_join_nullability_unchanged();
 
     // Type coercion

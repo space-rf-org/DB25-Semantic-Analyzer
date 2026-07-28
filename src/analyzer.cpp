@@ -1543,9 +1543,32 @@ std::vector<ResolvedColumn> Analyzer::analyze_setop(ASTNode* setop, Scope* paren
     return result;
 }
 
+// A FROM item begins a new comma-separated table_reference when it is a
+// relation that is not itself a JOIN node: a bare table, a derived table /
+// subquery, or a parenthesized join group. A JOIN node instead EXTENDS the
+// current table_reference (its left operand is that group).
+[[nodiscard]] bool starts_comma_group(NodeType t) {
+    switch (t) {
+        case NodeType::TableRef:
+        case NodeType::Subquery:
+        case NodeType::SubqueryExpr:
+        case NodeType::FromClause:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void Analyzer::resolve_from(ASTNode* from_clause, Scope& scope) {
+    std::size_t comma_group_start = scope.relations().size();
     for (ASTNode* item = first_child(from_clause); item != nullptr; item = item->next_sibling) {
-        resolve_from_item(item, scope);
+        // A new comma item resets the group start to the relations it is about to
+        // add; a JOIN keeps the current group start so its left operand spans the
+        // whole preceding table_reference, not a comma-joined sibling.
+        if (starts_comma_group(item->node_type)) {
+            comma_group_start = scope.relations().size();
+        }
+        resolve_from_item(item, scope, comma_group_start);
     }
 
     // Every relation brought into scope must have a distinct correlation name:
@@ -1652,7 +1675,8 @@ void Analyzer::apply_column_aliases(std::vector<ResolvedColumn>& cols,
     }
 }
 
-void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
+void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
+                                 std::size_t comma_group_start) {
     if (item == nullptr) {
         return;
     }
@@ -1728,9 +1752,16 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
         // any outer join written over it (its inner join predicates resolve as
         // they are visited, just like a top-level FROM).
         case NodeType::FromClause: {
+            // A parenthesized join group is its own comma/JOIN sequence; track the
+            // group start within it exactly as the top-level FROM does, based at
+            // the relations this group introduces.
+            std::size_t inner_group_start = scope.relations().size();
             for (ASTNode* child = first_child(item); child != nullptr;
                  child = child->next_sibling) {
-                resolve_from_item(child, scope);
+                if (starts_comma_group(child->node_type)) {
+                    inner_group_start = scope.relations().size();
+                }
+                resolve_from_item(child, scope, inner_group_start);
             }
             return;
         }
@@ -1756,18 +1787,21 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope) {
             const std::size_t right_end = scope.relations().size();
             // Outer-join nullability: the null-supplying side's columns become
             // nullable regardless of their base NOT NULL constraint. The left
-            // side is the relations already in scope before this join
-            // ([0, left_end)); the right side is those just added
-            // ([left_end, right_end)). Marked before predicates / SELECT resolve.
+            // side is this join's own left operand - the current comma-separated
+            // table_reference, [comma_group_start, left_end) - NOT every relation
+            // in scope: comma binds looser than JOIN, so `A, B RIGHT JOIN C` is
+            // `A CROSS (B RIGHT JOIN C)` and A must keep its base nullability. The
+            // right side is the relations just added ([left_end, right_end)).
+            // Marked before predicates / SELECT resolve.
             switch (join_null_side(item)) {
                 case JoinNullSide::Right:
                     scope.mark_join_nullable(left_end, right_end);
                     break;
                 case JoinNullSide::Left:
-                    scope.mark_join_nullable(0, left_end);
+                    scope.mark_join_nullable(comma_group_start, left_end);
                     break;
                 case JoinNullSide::Both:
-                    scope.mark_join_nullable(0, right_end);
+                    scope.mark_join_nullable(comma_group_start, right_end);
                     break;
                 case JoinNullSide::None:
                     break;
@@ -2606,6 +2640,50 @@ namespace {
     return false;
 }
 
+// Does the subtree rooted at `node` contain a WINDOW function call (any call
+// carrying an OVER / WindowSpec)? Mirrors contains_aggregate: bounded by the
+// shared expression-depth limit and stopping at a nested subquery boundary (a
+// window inside a subquery belongs to that inner block). Used to reject a
+// window function used as a GROUP BY key (Postgres: "window functions are not
+// allowed in GROUP BY") - grouping happens before windowing, so a window call
+// can never be a grouping key.
+[[nodiscard]] bool contains_window(const ASTNode* node, int depth = 0) {
+    if (node == nullptr || depth >= kMaxExprDepth) {
+        return false;
+    }
+    if (node->node_type == NodeType::Subquery ||
+        node->node_type == NodeType::SubqueryExpr) {
+        return false;
+    }
+    if ((node->node_type == NodeType::FunctionCall ||
+         node->node_type == NodeType::FunctionExpr) &&
+        has_window_spec(node)) {
+        return true;
+    }
+    for (const ASTNode* c = node->first_child; c != nullptr; c = c->next_sibling) {
+        if (contains_window(c, depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True if `key` is illegal as a GROUP BY key because it is (or contains) a
+// non-windowed aggregate or a window function. Writes the matching Postgres
+// message into `msg`. Grouping is what PRODUCES aggregates and precedes
+// windowing, so neither can itself be a grouping key.
+[[nodiscard]] bool illegal_group_key(const ASTNode* key, const char*& msg) {
+    if (contains_aggregate(key)) {
+        msg = "aggregate functions are not allowed in GROUP BY";
+        return true;
+    }
+    if (contains_window(key)) {
+        msg = "window functions are not allowed in GROUP BY";
+        return true;
+    }
+    return false;
+}
+
 // Two resolved column references can share a (table_id, column_id) yet name
 // DIFFERENT relation instances: a self-join (`users a JOIN users b`) binds both
 // aliases to the same catalog table, so `a.id` and `b.id` carry the identical
@@ -2808,17 +2886,17 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
     std::vector<GroupKey> keys;
     if (group_by != nullptr) {
         for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
-            // A GROUP BY key may not be (or contain) a non-windowed aggregate:
-            // grouping is what PRODUCES aggregates, so `GROUP BY MAX(age)` is
-            // illegal (Postgres: "aggregate functions are not allowed in GROUP
-            // BY"). The output-alias path (group_key_alias_item) already declines
-            // an alias that names an aggregate; this catches a directly-written
-            // aggregate key. (contains_aggregate stops at subquery boundaries, so
-            // an aggregate inside a scalar subquery key is not flagged here.)
-            if (contains_aggregate(key)) {
-                add_diagnostic(DiagnosticCode::AggregateInGroupBy,
-                               "aggregate functions are not allowed in GROUP BY",
-                               key);
+            // A GROUP BY key may not be (or contain) a non-windowed aggregate or
+            // a window function: grouping is what PRODUCES aggregates and runs
+            // before windowing, so `GROUP BY MAX(age)` / `GROUP BY RANK() OVER
+            // (...)` is illegal (Postgres: "aggregate/window functions are not
+            // allowed in GROUP BY"). This catches a directly-written aggregate /
+            // window key; the positional and alias spellings are re-checked on
+            // their resolved SELECT item below. (contains_aggregate / _window
+            // stop at subquery boundaries, so one inside a scalar subquery key is
+            // not flagged here.)
+            if (const char* why = nullptr; illegal_group_key(key, why)) {
+                add_diagnostic(DiagnosticCode::AggregateInGroupBy, why, key);
                 continue;  // not a valid grouping key; do not register it
             }
             // Positional GROUP BY: `GROUP BY n` refers to the n-th (1-based)
@@ -2856,6 +2934,21 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                 // (single column or a compound expression alike), and the aliased
                 // item itself is not flagged as non-grouped.
                 identity = alias_item;
+            }
+            // A positional (`GROUP BY 1`) or alias (`GROUP BY c`) key resolves to
+            // a SELECT item; that item is just as illegal a grouping key as a
+            // directly-written aggregate / window would be. The raw-key check
+            // above only saw the ordinal literal or the alias name, so re-test the
+            // RESOLVED item - otherwise `SELECT COUNT(*) FROM emp GROUP BY 1` (or
+            // `... GROUP BY <alias-of-a-window>`) slips through and the binder is
+            // handed an aggregate / window node as a group key. (group_key_alias_item
+            // already declines an aggregate alias, but not a window alias; the
+            // positional path had no such guard at all.)
+            if (identity != key) {
+                if (const char* why = nullptr; illegal_group_key(identity, why)) {
+                    add_diagnostic(DiagnosticCode::AggregateInGroupBy, why, key);
+                    continue;
+                }
             }
             GroupKey k;
             k.table_id = identity->context.analysis.table_id;

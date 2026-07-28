@@ -2218,11 +2218,29 @@ void test_integer_literal_width_by_magnitude() {
     CHECK(proj_type("SELECT 9223372036854775808") == DataType::Decimal); // int64 max + 1
     CHECK(proj_type("SELECT 99999999999999999999999999") == DataType::Decimal);  // > uint64
 
+    // Negative literals: the parser folds the sign into the IntegerLiteral text,
+    // so the magnitude read must strip it (from_chars into an unsigned type
+    // rejects '-' and used to leave every out-of-int32 negative typed Integer).
+    // A negative value reaches one further at each width (|INT_MIN| = INT_MAX+1),
+    // so the bounds are sign-aware.
+    CHECK(proj_type("SELECT -5") == DataType::Integer);
+    CHECK(proj_type("SELECT -2147483648") == DataType::Integer);           // int32 min
+    CHECK(proj_type("SELECT -2147483649") == DataType::BigInt);            // past int32 min
+    CHECK(proj_type("SELECT -3000000000") == DataType::BigInt);            // pg: bigint
+    CHECK(proj_type("SELECT -9223372036854775808") == DataType::BigInt);   // int64 min
+    CHECK(proj_type("SELECT -99999999999999999999999999") == DataType::Decimal);
+
     // The wider type must WIDEN the reconciled set-op / VALUES column, not narrow
     // back to Integer (the cascade the wrong literal type used to cause).
     CHECK(proj_type("SELECT c FROM (SELECT id AS c FROM users "
                     "UNION SELECT 9223372036854775807 AS c) AS t") == DataType::BigInt);
     CHECK(proj_type("SELECT c FROM (VALUES (1),(9223372036854775807)) AS t(c)") ==
+          DataType::BigInt);
+    // Same cascade, negative RHS: a bigint-magnitude negative literal must widen
+    // the reconciled column to BigInt, not narrow it to Integer.
+    CHECK(proj_type("SELECT c FROM (SELECT id AS c FROM users "
+                    "UNION SELECT -3000000000 AS c) AS t") == DataType::BigInt);
+    CHECK(proj_type("SELECT c FROM (VALUES (1),(-9223372036854775808)) AS t(c)") ==
           DataType::BigInt);
 }
 

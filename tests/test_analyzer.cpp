@@ -1890,6 +1890,67 @@ void test_greatest_least_nullability() {
     CHECK(gn != nullptr && a.nullability_of(gn) == 2);  // GREATEST(nullable,nullable) -> nullable
 }
 
+void test_coalesce_greatest_least_type_reconciliation() {
+    std::printf("test_coalesce_greatest_least_type_reconciliation\n");
+    // COALESCE / GREATEST / LEAST reconcile their argument types with the same
+    // UnionReconcile rule as a set operation / VALUES / CASE. Incompatible argument
+    // types (text vs integer - which PostgreSQL rejects) must raise a TypeMismatch,
+    // not be silently accepted; and with 3+ arguments the fold must NOT re-establish
+    // a concrete type that masks the mismatch (regression: `COALESCE(name,id,age)`
+    // returned Integer with zero diagnostics).
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"name", DataType::Text, /*nullable=*/true},
+                            ColumnInfo{"age", DataType::Integer, /*nullable=*/true}});
+    parser::Parser p;
+
+    // Helper: analyze `SELECT <expr> FROM users`, return the projected item.
+    auto proj = [&](Analyzer& a, const parser::ParseResult& res) -> ASTNode* {
+        a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        return list ? first_child(list) : nullptr;
+    };
+
+    // --- incompatible (text vs integer): flagged, degraded to Unknown ---
+    struct Bad { const char* sql; };
+    const Bad bad[] = {
+        {"SELECT COALESCE(id, name) FROM users"},
+        {"SELECT GREATEST(id, name) FROM users"},
+        {"SELECT LEAST(id, name) FROM users"},
+        {"SELECT COALESCE(name, id, age) FROM users"},   // 3-arg: must not mask
+        {"SELECT GREATEST(id, name, age) FROM users"},    // mismatch in the middle
+    };
+    for (const Bad& b : bad) {
+        auto res = p.parse(b.sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        ASTNode* item = proj(a, res);
+        CHECK(item != nullptr);
+        CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 1);  // b.sql
+        CHECK(item != nullptr && a.type_of(item) == DataType::Unknown);
+    }
+
+    // --- compatible: no diagnostic, correct reconciled type ---
+    struct Good { const char* sql; DataType type; };
+    const Good good[] = {
+        {"SELECT COALESCE(id, age) FROM users", DataType::Integer},   // int + int
+        {"SELECT GREATEST(id, age) FROM users", DataType::Integer},
+        {"SELECT COALESCE(name, name) FROM users", DataType::Text},   // text + text
+        {"SELECT COALESCE(id, age, id) FROM users", DataType::Integer},  // 3-arg clean
+    };
+    for (const Good& g : good) {
+        auto res = p.parse(g.sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        ASTNode* item = proj(a, res);
+        CHECK(item != nullptr);
+        CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);  // g.sql
+        CHECK(item != nullptr && a.type_of(item) == g.type);
+    }
+}
+
 void test_setop_derived_table_columns() {
     std::printf("test_setop_derived_table_columns\n");
     // A derived table whose body is a set operation registers its reconciled
@@ -4022,6 +4083,7 @@ int main() {
     // Nullability propagation
     test_nullability_columns_and_functions();
     test_greatest_least_nullability();
+    test_coalesce_greatest_least_type_reconciliation();
     test_setop_derived_table_columns();
     test_in_expr_nullability();
     test_left_join_nullability();

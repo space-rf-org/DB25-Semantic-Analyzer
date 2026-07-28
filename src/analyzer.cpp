@@ -306,12 +306,6 @@ struct Coercion {
     return {CoercionStatus::Incompatible, DataType::Unknown};
 }
 
-// Unify two types for a value-producing context (set-operation branch column,
-// COALESCE argument list): the common type, or Unknown when incompatible.
-[[nodiscard]] DataType unify_type(DataType a, DataType b) {
-    return coerce(a, b, CoercionKind::UnionReconcile).type;
-}
-
 // Temporal arithmetic. The plain numeric coercion model (`coerce`) cannot type
 // date/time arithmetic because the result depends on the *operator*, not just
 // the operand categories: `date - date` is an Interval, `date + interval` is a
@@ -414,6 +408,11 @@ struct TemporalArith {
 struct FunctionType {
     DataType type;
     bool known;  // false => name not in the signature table (soft-diagnose)
+    // COALESCE / GREATEST / LEAST reconcile their arguments to a common type; set
+    // when that reconciliation hit an incompatible pair (text vs integer, …), so
+    // the caller can emit a TypeMismatch as the set-op / VALUES / CASE reconcilers
+    // already do. Kept separate from `known` (the name IS known).
+    bool arg_type_mismatch = false;
 };
 
 // Result type for a function call given its (already inferred) argument types.
@@ -534,14 +533,34 @@ struct FunctionType {
         return {arg0, true};
     }
     // GREATEST / LEAST and COALESCE reconcile all argument types to a common
-    // type (Unknown when the arguments are incompatible).
+    // type (the same UnionReconcile rule as a set operation / VALUES / CASE). When
+    // a pair is incompatible (e.g. text vs integer, which PostgreSQL rejects) we
+    // must NOT re-concretize a later step's type - the 3+-argument fold
+    // `unify(unify(text,int)->Unknown, int)->int` would otherwise mask the error
+    // and hand back a bogus Integer. Track the mismatch and degrade to Unknown so
+    // the caller flags it, honouring "Unknown when the arguments are incompatible".
     if (upper_name == "GREATEST" || upper_name == "LEAST" ||
         upper_name == "COALESCE") {
         DataType unified = DataType::Unknown;
+        bool seeded = false;
+        bool mismatch = false;
         for (const DataType a : args) {
-            unified = unify_type(unified, a);
+            if (!seeded) {
+                unified = a;
+                seeded = true;
+                continue;
+            }
+            const Coercion r = coerce(unified, a, CoercionKind::UnionReconcile);
+            if (r.status == CoercionStatus::Incompatible) {
+                mismatch = true;  // sticky: a later compatible pair must not clear it
+            } else {
+                unified = r.type;
+            }
         }
-        return {unified, true};
+        if (mismatch) {
+            return {DataType::Unknown, true, true};
+        }
+        return {unified, true, false};
     }
     return {DataType::Unknown, false};
 }
@@ -1982,6 +2001,13 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                "unknown function '" + std::string{expr->primary_text} +
                                    "'; result type is Unknown",
                                expr, Severity::Warning);
+            }
+            if (ft.arg_type_mismatch) {
+                add_diagnostic(DiagnosticCode::TypeMismatch,
+                               "incompatible argument types to " + upper +
+                                   "(): the arguments cannot be reconciled to a "
+                                   "common type",
+                               expr);
             }
             record_type(expr, ft.type);
             record_nullability(expr, function_nullability(upper, arg_nulls));

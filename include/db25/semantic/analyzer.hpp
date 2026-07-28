@@ -170,13 +170,19 @@ private:
 
     // Resolve a JOIN's USING (col, ...) columns against the left relations
     // (indices [0, left_end)) and right relations ([left_end, right_end)).
+    // `coalesce_left` marks the LEFT copy of each shared column as coalesced
+    // (rather than the right), so the surviving bare-reference copy is the
+    // right one: used for a RIGHT JOIN, whose LEFT side is null-supplied, so the
+    // preserved (right) side backs the merged column with correct identity and
+    // nullability.
     void resolve_using(ASTNode* using_clause, Scope& scope, std::size_t left_end,
-                       std::size_t right_end);
+                       std::size_t right_end, bool coalesce_left);
 
     // Coalesce the columns common to a NATURAL join's left ([0, left_end)) and
     // right ([left_end, right_end)) relations, so a bare reference to a shared
-    // column is not ambiguous.
-    void resolve_natural(Scope& scope, std::size_t left_end, std::size_t right_end);
+    // column is not ambiguous. `coalesce_left` as in resolve_using.
+    void resolve_natural(Scope& scope, std::size_t left_end, std::size_t right_end,
+                         bool coalesce_left);
 
     // Resolve a column reference against `scope`, recording type + context and
     // emitting a diagnostic on failure.

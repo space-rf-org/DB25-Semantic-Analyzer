@@ -3721,6 +3721,80 @@ void test_full_join_nullability() {
     CHECK(uid != nullptr && a.nullability_of(uid) == 2);  // null-supplied
 }
 
+// The bare (coalesced) USING column of a RIGHT JOIN must resolve to the
+// PRESERVED (right) side, not the null-supplied left copy. Regression: the
+// merged column always survived as the left copy, so in a RIGHT JOIN it recorded
+// the null-supplied side's base column (a binder reading it yields NULL for
+// unmatched rows) and its post-outer-join nullability (wrongly nullable).
+void test_right_join_using_merged_column_takes_preserved_side() {
+    std::printf("test_right_join_using_merged_column_takes_preserved_side\n");
+    auto cat = make_catalog_joins();  // orders(...,user_id NOT NULL), sessions(user_id NOT NULL,...)
+    parser::Parser p;
+    auto res = p.parse("SELECT s.user_id, user_id "
+                       "FROM orders o RIGHT JOIN sessions s USING (user_id)");
+    CHECK(res.has_value());
+    if (!res) return;
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(!a.has_errors());
+
+    ASTNode* list = find_child(res.value(), NodeType::SelectList);
+    ASTNode* s_uid = first_child(list);          // qualified s.user_id (sessions)
+    ASTNode* bare = s_uid ? s_uid->next_sibling : nullptr;  // merged bare user_id
+    CHECK(s_uid != nullptr && bare != nullptr);
+    if (s_uid == nullptr || bare == nullptr) return;
+    // The merged column is backed by the preserved (right / sessions) copy: same
+    // base (table_id, column_id) as the qualified s.user_id...
+    CHECK(bare->context.analysis.table_id == s_uid->context.analysis.table_id);
+    CHECK(bare->context.analysis.column_id == s_uid->context.analysis.column_id);
+    // ...and NOT NULL (sessions.user_id is preserved and NOT NULL), not the
+    // null-supplied left side's nullability.
+    CHECK(a.nullability_of(bare) == 1);
+
+    // LEFT JOIN keeps the (preserved) left side and stays NOT NULL.
+    auto lres = p.parse("SELECT user_id FROM orders o LEFT JOIN sessions s USING (user_id)");
+    CHECK(lres.has_value());
+    if (!lres) return;
+    Analyzer la(cat);
+    la.analyze(lres.value());
+    ASTNode* llist = find_child(lres.value(), NodeType::SelectList);
+    ASTNode* lbare = llist ? first_child(llist) : nullptr;
+    CHECK(lbare != nullptr && la.nullability_of(lbare) == 1);
+}
+
+// date +/- integer is legal day arithmetic (-> date); date +/- a non-integer
+// numeric (double / decimal) is not an SQL operator and must be rejected, not
+// silently typed date. Regression: temporal_arith gated on the whole Numeric
+// category, so `date + 2.5` / `date + x::double` were accepted and typed date.
+void test_date_arith_rejects_non_integer_numeric() {
+    std::printf("test_date_arith_rejects_non_integer_numeric\n");
+    InMemoryCatalog cat;
+    cat.add_table("events", {ColumnInfo{"d", DataType::Date, false},
+                             ColumnInfo{"x", DataType::Double, false},
+                             ColumnInfo{"n", DataType::Integer, false}});
+    parser::Parser p;
+    auto first_type = [&](const char* sql, bool& had_error) -> DataType {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return DataType::Unknown;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        had_error = a.has_errors();
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* item = list ? first_child(list) : nullptr;
+        return item ? a.type_of(item) : DataType::Unknown;
+    };
+    bool err = false;
+    // Legal: date +/- integer -> date, no error.
+    CHECK(first_type("SELECT d + n FROM events", err) == DataType::Date && !err);
+    CHECK(first_type("SELECT d + 1 FROM events", err) == DataType::Date && !err);
+    CHECK(first_type("SELECT d - 7 FROM events", err) == DataType::Date && !err);
+    // Illegal: date +/- double / decimal -> rejected.
+    first_type("SELECT d + x FROM events", err);   CHECK(err);
+    first_type("SELECT d + 2.5 FROM events", err);  CHECK(err);
+    first_type("SELECT x + d FROM events", err);    CHECK(err);
+}
+
 // --- Bind-parameter typing ---------------------------------------------
 
 // The consumed parser build drops bind parameters ($1 / ?) before the analyzer
@@ -4412,6 +4486,8 @@ int main() {
     // RIGHT / FULL JOIN nullability
     test_right_join_nullability();
     test_full_join_nullability();
+    test_right_join_using_merged_column_takes_preserved_side();
+    test_date_arith_rejects_non_integer_numeric();
 
     // Bind-parameter typing
     test_parameter_typing();

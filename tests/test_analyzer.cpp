@@ -2257,6 +2257,39 @@ void test_coercion_text_int_comparison_warns() {
     CHECK(!a.has_errors());
 }
 
+void test_in_value_list_coercion_warns() {
+    std::printf("test_in_value_list_coercion_warns\n");
+    // `x IN (value-list)` must apply the SAME cross-type comparison check as
+    // `x = y`, `x BETWEEN ..`, and `x IN (subquery)`: a cross-category element
+    // raises one ImplicitCoercion warning. Regression: the value-list branch only
+    // inferred each element's nullability and skipped coerce(), so `id IN (note)`
+    // was silently accepted while `id = note` warned.
+    auto cat = make_catalog_null();  // users(id INTEGER NOT NULL, note TEXT nullable)
+    parser::Parser p;
+
+    auto warns = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(!a.has_errors());  // implicit coercion is a warning, never an error
+        return count_code(a, DiagnosticCode::ImplicitCoercion);
+    };
+
+    // Cross-category IN value lists warn once (matching the `=` sibling).
+    CHECK(warns("SELECT id FROM users WHERE id IN (note)") == 1);
+    CHECK(warns("SELECT id FROM users WHERE id IN (1, note, 2)") == 1);  // one per IN
+    CHECK(warns("SELECT id FROM users WHERE note IN (1, 2)") == 1);
+    // Two independent IN expressions each warn.
+    CHECK(warns("SELECT id FROM users WHERE id IN (note) OR id IN (note)") == 2);
+    // Same-category lists do NOT warn (no over-flagging regression).
+    CHECK(warns("SELECT id FROM users WHERE id IN (1, 2, 3)") == 0);
+    CHECK(warns("SELECT id FROM users WHERE note IN ('a', 'b')") == 0);
+    // A NULL element (wildcard) is compatible with anything - no warning.
+    CHECK(warns("SELECT id FROM users WHERE id IN (1, NULL)") == 0);
+}
+
 void test_coercion_arithmetic_text_int_error() {
     std::printf("test_coercion_arithmetic_text_int_error\n");
     auto cat = make_catalog_null();
@@ -4273,6 +4306,7 @@ int main() {
     test_integer_literal_width_by_magnitude();
     test_coercion_numeric_comparison_clean();
     test_coercion_text_int_comparison_warns();
+    test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();
 
     // Subquery correlation & scalar / IN subqueries

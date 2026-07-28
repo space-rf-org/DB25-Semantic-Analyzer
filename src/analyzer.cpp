@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <deque>
 #include <string>
 #include <string_view>
@@ -1933,10 +1934,40 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
     switch (expr->node_type) {
         // A non-NULL literal is, by construction, not-null; a NULL literal is
         // nullable.
-        case NodeType::IntegerLiteral:
-            record_type(expr, DataType::Integer);
+        case NodeType::IntegerLiteral: {
+            // Type an integer literal by its MAGNITUDE, matching PostgreSQL's
+            // int4 -> int8 -> numeric widening: Integer if it fits signed 32-bit,
+            // BigInt if it fits signed 64-bit, else Decimal (numeric). Always
+            // not-null. The narrowest type that holds the literal keeps a reconciled
+            // set-op / VALUES column (and any downstream plan slot) wide enough for
+            // the value; typing every literal Integer silently narrowed a bigint
+            // constant to 32 bits. The magnitude is read from the literal's decimal
+            // text; a non-decimal spelling (hex / binary) or unparseable text
+            // conservatively stays Integer. `promote_numeric` ranks
+            // Integer < BigInt < Decimal, so a wider type reconciles cleanly.
+            DataType t = DataType::Integer;
+            const std::string_view txt = expr->primary_text;
+            unsigned long long mag = 0;
+            const char* const end = txt.data() + txt.size();
+            const auto [ptr, ec] = std::from_chars(txt.data(), end, mag);
+            // `ptr == end` means the WHOLE text was decimal digits (so a hex / binary
+            // `0x..` / `0b..` spelling, whose parse stops at the first non-digit,
+            // conservatively stays Integer).
+            if (ptr == end) {
+                if (ec == std::errc::result_out_of_range) {
+                    t = DataType::Decimal;      // more digits than fit in uint64
+                } else if (ec == std::errc{}) {
+                    if (mag > 9223372036854775807ULL) {
+                        t = DataType::Decimal;  // beyond signed int64
+                    } else if (mag > 2147483647ULL) {
+                        t = DataType::BigInt;   // beyond signed int32, within int64
+                    }
+                }
+            }
+            record_type(expr, t);
             record_nullability(expr, 1);
-            return DataType::Integer;
+            return t;
+        }
         case NodeType::FloatLiteral:
             record_type(expr, DataType::Double);
             record_nullability(expr, 1);

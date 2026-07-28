@@ -834,6 +834,20 @@ namespace {
     }
     return nullptr;
 }
+
+// May the constant CHECK evaluator soundly reason about column `col_type` bound
+// to the literal `value`? A temporal column whose value is written as a STRING
+// literal ('2020-01-01 09:30:00', '06/15/2020') cannot: the evaluator has no date
+// parser and would order it LEXICALLY - so '2020-01-01 9:30:00' compares GREATER
+// than '2020-01-01 10:00:00' (at the hour, '9' > '1'), flipping a chronologically
+// legal row to a false CheckViolation. Leaving such a value unbound keeps any
+// CHECK over it Unknown (never a false False), honouring the evaluator's
+// no-false-positive contract. A NULL value still binds (it is not a string
+// literal), so IS [NOT] NULL folding on temporal columns is unaffected.
+[[nodiscard]] bool check_binding_is_sound(DataType col_type, const ASTNode* value) {
+    return !(category_of(col_type) == TypeCategory::Temporal && value != nullptr &&
+             value->node_type == NodeType::StringLiteral);
+}
 }  // namespace
 
 void Analyzer::check_row_against_checks(const TableInfo& table,
@@ -850,7 +864,8 @@ void Analyzer::check_row_against_checks(const TableInfo& table,
         if (target_cols[i] != nullptr) supplied.insert(target_cols[i]->name);
     }
     for (std::size_t i = 0; i < n; ++i) {
-        if (target_cols[i] != nullptr && is_constant_expr(vals[i])) {
+        if (target_cols[i] != nullptr && is_constant_expr(vals[i]) &&
+            check_binding_is_sound(target_cols[i]->type, vals[i])) {
             binds.emplace(target_cols[i]->name, vals[i]);
         }
     }
@@ -875,7 +890,7 @@ void Analyzer::check_row_against_checks(const TableInfo& table,
                 if (ch->node_type == NodeType::SelectList) { list = ch; break; }
             }
             ASTNode* item = list != nullptr ? list->first_child : nullptr;
-            if (is_constant_expr(item)) {
+            if (is_constant_expr(item) && check_binding_is_sound(col.type, item)) {
                 binds.emplace(col.name, item);
             }
         }

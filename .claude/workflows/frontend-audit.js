@@ -89,7 +89,12 @@ You OWN exactly one stage (stated below). Your INPUT contract is defined by your
 - Everything else - the fix is entirely inside your stage - is boundary="internal".
 
 METHOD (mandatory):
-1. Clone fresh into the scratchpad path given below, init submodules, and get the existing test suite GREEN first. Mirror the CI build/sanitizer flags for repros (-fsanitize=address,undefined -fno-sanitize-recover=all where applicable).
+1. Get a CURRENT, CLEAN checkout at the scratchpad path given below, then get the existing test suite GREEN. The scratchpad PERSISTS across audit runs, so a stale clone from a previous pass may already be sitting at that path - auditing it re-reports bugs that were fixed on main weeks ago. You MUST hard-sync to the latest default branch, never trust a pre-existing checkout:
+   - If the directory does not exist: \`git clone <url> <path>\`.
+   - If it DOES exist: \`cd <path> && git fetch origin && git checkout main && git reset --hard origin/main && git clean -fdx -e build\* \` (do NOT skip this - a failed \`git clone\` over an existing dir leaves the OLD commit in place).
+   - Then ALWAYS: \`git submodule sync --recursive && git submodule update --init --recursive --force\` so pinned submodules match the synced main.
+   - VERIFY before auditing: run \`git log --oneline -1\` and \`git rev-parse HEAD\`, and confirm it equals origin/main (\`git rev-parse origin/main\`). State the HEAD sha in your report. If they differ, STOP and re-sync - do not audit a stale tree.
+   Build in a FRESH build directory (e.g. \`rm -rf build-audit && cmake -S . -B build-audit ...\`) so no stale object files from an earlier pass survive a source change. Mirror the CI build/sanitizer flags for repros (-fsanitize=address,undefined -fno-sanitize-recover=all where applicable).
 2. Run \`git log --oneline -25\` and REGRESSION-AUDIT the most recent changes specifically: attack the newly-changed code paths and their edges hard.
 3. For every SUSPECTED defect, construct a minimal repro, run it, and CONFIRM (sanitizer error, or actual-vs-expected AST/plan/diagnostic captured). Report nothing you have not reproduced. Classify each finding's boundary honestly per the discipline above.
 

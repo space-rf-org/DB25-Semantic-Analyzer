@@ -2189,6 +2189,43 @@ void test_inner_join_nullability_unchanged() {
 
 // --- Type coercion -----------------------------------------------------
 
+void test_integer_literal_width_by_magnitude() {
+    std::printf("test_integer_literal_width_by_magnitude\n");
+    // An integer literal is typed by its MAGNITUDE (PostgreSQL int4 -> int8 ->
+    // numeric): Integer within signed 32-bit, BigInt within signed 64-bit, else
+    // Decimal. Regression: every integer literal was typed Integer, silently
+    // narrowing a bigint constant to 32 bits - and that wrong type propagated
+    // through set-op / VALUES column reconciliation.
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false}});
+    parser::Parser p;
+
+    auto proj_type = [&](const char* sql) -> DataType {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return DataType::Unknown;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* item = list ? first_child(list) : nullptr;
+        return item ? a.type_of(item) : DataType::Unknown;
+    };
+
+    CHECK(proj_type("SELECT 5") == DataType::Integer);
+    CHECK(proj_type("SELECT 2147483647") == DataType::Integer);            // int32 max
+    CHECK(proj_type("SELECT 2147483648") == DataType::BigInt);            // int32 max + 1
+    CHECK(proj_type("SELECT 9223372036854775807") == DataType::BigInt);  // int64 max
+    CHECK(proj_type("SELECT 9223372036854775808") == DataType::Decimal); // int64 max + 1
+    CHECK(proj_type("SELECT 99999999999999999999999999") == DataType::Decimal);  // > uint64
+
+    // The wider type must WIDEN the reconciled set-op / VALUES column, not narrow
+    // back to Integer (the cascade the wrong literal type used to cause).
+    CHECK(proj_type("SELECT c FROM (SELECT id AS c FROM users "
+                    "UNION SELECT 9223372036854775807 AS c) AS t") == DataType::BigInt);
+    CHECK(proj_type("SELECT c FROM (VALUES (1),(9223372036854775807)) AS t(c)") ==
+          DataType::BigInt);
+}
+
 void test_coercion_numeric_comparison_clean() {
     std::printf("test_coercion_numeric_comparison_clean\n");
     auto cat = make_catalog_null();
@@ -4233,6 +4270,7 @@ int main() {
     test_inner_join_nullability_unchanged();
 
     // Type coercion
+    test_integer_literal_width_by_magnitude();
     test_coercion_numeric_comparison_clean();
     test_coercion_text_int_comparison_warns();
     test_coercion_arithmetic_text_int_error();

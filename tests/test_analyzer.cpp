@@ -1206,6 +1206,51 @@ void test_groupby_self_join_distinct_instances() {
     CHECK(flags("SELECT name FROM users GROUP BY id") == 1);
 }
 
+void test_orderby_qualified_ref_resolves_to_base_column() {
+    std::printf("test_orderby_qualified_ref_resolves_to_base_column\n");
+    // A QUALIFIED ORDER BY reference names a base/input column, never a SELECT
+    // output alias. Regression: step-7 matched a qualified order-by ref to an
+    // output column by BARE name and skipped FROM-scope resolution, so
+    // (a) `GROUP BY dept ... ORDER BY emp.dept` left the ref unresolved and the
+    //     grouping check falsely raised NonGroupedColumn on a legal query, and
+    // (b) `SELECT salary AS id ... ORDER BY e.id` typed the ref from the output
+    //     column (Double) instead of base emp.id (Integer).
+    auto cat = make_catalog_emp();  // emp(id INT NOT NULL, ..., salary DOUBLE, ...)
+    parser::Parser p;
+
+    auto ng = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::NonGroupedColumn);
+    };
+
+    // (a) A qualified ORDER BY of the grouped column is legal - no false error.
+    CHECK(ng("SELECT dept, SUM(salary) FROM emp GROUP BY dept ORDER BY emp.dept") == 0);
+    CHECK(ng("SELECT dept, SUM(salary) FROM emp e GROUP BY dept ORDER BY e.dept") == 0);
+    // An UNQUALIFIED output alias in ORDER BY is still exempt (unchanged).
+    CHECK(ng("SELECT dept, COUNT(*) AS c FROM emp GROUP BY dept ORDER BY c") == 0);
+    // A qualified ORDER BY of a genuinely non-grouped column is still illegal.
+    CHECK(ng("SELECT dept, SUM(salary) FROM emp GROUP BY dept ORDER BY emp.salary") == 1);
+
+    // (b) `e.id` must resolve to base emp.id (Integer, NOT NULL), not the output
+    // alias `id` (which renames salary, Double).
+    {
+        auto res = p.parse("SELECT salary AS id FROM emp e ORDER BY e.id");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            ASTNode* ob = find_child(res.value(), NodeType::OrderByClause);
+            ASTNode* item = ob ? first_child(ob) : nullptr;
+            CHECK(item != nullptr && a.type_of(item) == DataType::Integer);
+            CHECK(item != nullptr && a.nullability_of(item) == 1);  // emp.id is NOT NULL
+        }
+    }
+}
+
 void test_groupby_aggregate_in_having_or_orderby_groups() {
     std::printf("test_groupby_aggregate_in_having_or_orderby_groups\n");
     // An aggregate confined to HAVING or ORDER BY (or the mere presence of
@@ -4094,6 +4139,7 @@ int main() {
     test_groupby_clean_count_star();
     test_groupby_non_grouped_column();
     test_groupby_self_join_distinct_instances();
+    test_orderby_qualified_ref_resolves_to_base_column();
     test_groupby_aggregate_in_having_or_orderby_groups();
     test_grouping_trigger_matrix();
     test_values_type_reconciliation_matrix();

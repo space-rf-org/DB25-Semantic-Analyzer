@@ -2793,6 +2793,19 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
     std::vector<GroupKey> keys;
     if (group_by != nullptr) {
         for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
+            // A GROUP BY key may not be (or contain) a non-windowed aggregate:
+            // grouping is what PRODUCES aggregates, so `GROUP BY MAX(age)` is
+            // illegal (Postgres: "aggregate functions are not allowed in GROUP
+            // BY"). The output-alias path (group_key_alias_item) already declines
+            // an alias that names an aggregate; this catches a directly-written
+            // aggregate key. (contains_aggregate stops at subquery boundaries, so
+            // an aggregate inside a scalar subquery key is not flagged here.)
+            if (contains_aggregate(key)) {
+                add_diagnostic(DiagnosticCode::AggregateInGroupBy,
+                               "aggregate functions are not allowed in GROUP BY",
+                               key);
+                continue;  // not a valid grouping key; do not register it
+            }
             // Positional GROUP BY: `GROUP BY n` refers to the n-th (1-based)
             // output column of the SELECT list (legal in Postgres / MySQL /
             // SQLite / DuckDB). The key node is an IntegerLiteral carrying the

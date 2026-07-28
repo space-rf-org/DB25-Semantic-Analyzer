@@ -1215,6 +1215,50 @@ void test_groupby_non_grouped_column() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
+// A GROUP BY key that IS (or contains) a non-windowed aggregate is illegal:
+// grouping produces aggregates, so an aggregate cannot be a grouping key
+// (Postgres: "aggregate functions are not allowed in GROUP BY").
+void test_groupby_aggregate_key_rejected() {
+    std::printf("test_groupby_aggregate_key_rejected\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+
+    // Direct aggregate key alongside a valid one: only the aggregate key flags.
+    auto res = p.parse("SELECT dept, SUM(salary) FROM emp GROUP BY dept, MAX(age)");
+    CHECK(res.has_value());
+    if (res) {
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::AggregateInGroupBy) == 1);
+    }
+
+    // An aggregate as the sole key is still flagged (the non-grouped `dept` is a
+    // separate diagnostic; we assert the aggregate-key one is present).
+    auto res2 = p.parse("SELECT dept FROM emp GROUP BY COUNT(*)");
+    CHECK(res2.has_value());
+    if (res2) {
+        Analyzer a(cat);
+        a.analyze(res2.value());
+        CHECK(count_code(a, DiagnosticCode::AggregateInGroupBy) == 1);
+    }
+
+    // A plain column key and a positional key are NOT aggregates: no diagnostic.
+    auto ok = p.parse("SELECT dept, COUNT(*) FROM emp GROUP BY dept");
+    CHECK(ok.has_value());
+    if (ok) {
+        Analyzer a(cat);
+        a.analyze(ok.value());
+        CHECK(count_code(a, DiagnosticCode::AggregateInGroupBy) == 0);
+    }
+    auto ok2 = p.parse("SELECT dept, COUNT(*) FROM emp GROUP BY 1");
+    CHECK(ok2.has_value());
+    if (ok2) {
+        Analyzer a(cat);
+        a.analyze(ok2.value());
+        CHECK(count_code(a, DiagnosticCode::AggregateInGroupBy) == 0);
+    }
+}
+
 void test_groupby_self_join_distinct_instances() {
     std::printf("test_groupby_self_join_distinct_instances\n");
     // A self-join binds both aliases to the SAME catalog table, so `a.id` and
@@ -4312,6 +4356,7 @@ int main() {
     // GROUP BY / HAVING legality & function typing
     test_groupby_clean_count_star();
     test_groupby_non_grouped_column();
+    test_groupby_aggregate_key_rejected();
     test_groupby_self_join_distinct_instances();
     test_orderby_qualified_ref_resolves_to_base_column();
     test_groupby_aggregate_in_having_or_orderby_groups();

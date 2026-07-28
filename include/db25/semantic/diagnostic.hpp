@@ -57,6 +57,11 @@ enum class DiagnosticCode : std::uint16_t {
     // An aggregate function call appears in a WHERE clause. Aggregates are
     // evaluated after grouping, so they belong in HAVING, not WHERE.
     AggregateInWhere,
+    // A GROUP BY key is (or contains) a non-windowed aggregate, e.g.
+    // `GROUP BY MAX(age)`. Grouping is what produces aggregates, so an aggregate
+    // cannot itself be a grouping key (Postgres: "aggregate functions are not
+    // allowed in GROUP BY").
+    AggregateInGroupBy,
     // The same correlation name (table alias, or table name when unaliased) is
     // specified more than once in a single FROM clause.
     DuplicateRelation,

@@ -154,7 +154,12 @@ private:
 
     // Populate `scope` with the relations named in a FROM clause.
     void resolve_from(ASTNode* from_clause, Scope& scope);
-    void resolve_from_item(ASTNode* item, Scope& scope);
+    // `comma_group_start` is the scope-relation index at which the current
+    // comma-separated table_reference began. A JOIN's left operand is that whole
+    // group (comma binds looser than JOIN), so an outer join null-supplies only
+    // [comma_group_start, ...) - never the relations of a preceding comma item.
+    void resolve_from_item(ASTNode* item, Scope& scope,
+                           std::size_t comma_group_start = 0);
 
     // Columns of a VALUES list used as a derived table: one per value position in
     // the first row, typed by inference (nullable, anonymous). A column-alias

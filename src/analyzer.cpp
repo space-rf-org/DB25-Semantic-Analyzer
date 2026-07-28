@@ -1365,11 +1365,23 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
         for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
             const ResolvedColumn* out_match = nullptr;
             if (is_column_ref_node(item->node_type)) {
-                const std::string_view name = split_column_ref(item->primary_text).column;
-                for (const auto& col : output) {
-                    if (iequals(col.name, name)) {
-                        out_match = &col;
-                        break;
+                const QualifiedRef qref = split_column_ref(item->primary_text);
+                // Only an UNQUALIFIED order-by ref may name a SELECT output column
+                // by its alias/name. A qualified `t.col` always names a base/input
+                // column - never an output alias - so it must resolve against the
+                // FROM scope (this mirrors the grouping-legality exemption below).
+                // Matching a qualified ref to an output column by bare name skipped
+                // infer_expr, leaving table_id/column_id 0: a legal `GROUP BY dept
+                // ... ORDER BY emp.dept` was then falsely NonGroupedColumn (the key
+                // match fell back to text and failed), and `SELECT sal AS id ...
+                // ORDER BY e.id` took the output column's type (Double) instead of
+                // base emp.id (Integer).
+                if (qref.qualifier.empty()) {
+                    for (const auto& col : output) {
+                        if (iequals(col.name, qref.column)) {
+                            out_match = &col;
+                            break;
+                        }
                     }
                 }
             }

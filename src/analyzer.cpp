@@ -2313,11 +2313,27 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                     nulls.push_back(proj.front().nullable ? 2 : 1);
                 }
             } else {
-                // `expr IN (list)`: infer each list element (resolves columns)
-                // and fold its nullability into the result.
+                // `expr IN (list)`: infer each list element (resolves columns),
+                // fold its nullability, AND apply the SAME cross-type comparison
+                // check the other comparison forms do - `x = e`, `x BETWEEN`, and
+                // `x IN (subquery)` all run coerce(...Comparison) and warn on a
+                // cross-category pair; the value-list branch previously skipped it,
+                // so `id IN (name)` was silently accepted while `id = name` warned.
+                // One warning per IN (a list of N incompatible elements is one type
+                // problem, not N), matching the single-diagnostic sibling paths.
+                bool coercion_warned = false;
                 for (ASTNode* c = right; c != nullptr; c = c->next_sibling) {
-                    infer_expr(c, scope);
+                    const DataType et = infer_expr(c, scope);
                     nulls.push_back(null_of(c));
+                    if (!coercion_warned &&
+                        coerce(lt, et, CoercionKind::Comparison).status !=
+                            CoercionStatus::Ok) {
+                        add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                                       "implicit coercion between IN operand and a "
+                                       "list value of a different type category",
+                                       expr, Severity::Warning);
+                        coercion_warned = true;
+                    }
                 }
             }
             record_type(expr, DataType::Boolean);

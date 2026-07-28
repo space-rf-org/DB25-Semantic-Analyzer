@@ -1302,6 +1302,57 @@ void test_groupby_self_join_distinct_instances() {
     CHECK(flags("SELECT name FROM users GROUP BY id") == 1);
 }
 
+void test_groupby_derived_same_base_alias() {
+    std::printf("test_groupby_derived_same_base_alias\n");
+    // A derived table whose body projects ONE base column under TWO names -
+    // `(SELECT id AS a, id AS b FROM users) t` - gives t.a and t.b the SAME
+    // (table_id, column_id): a derived column carries through the identity of the
+    // expression it projects. GROUP BY t.a therefore must NOT be treated as
+    // covering t.b (Postgres rejects the second - they are distinct output
+    // columns). Regression: grouping identity compared only (table_id,
+    // column_id) + relation instance, so a same-base derived alias silently
+    // satisfied the key. The referenced column NAME must also agree.
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"name", DataType::Text, /*nullable=*/true}});
+    parser::Parser p;
+
+    auto flags = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::NonGroupedColumn);
+    };
+
+    // Two aliases of the same base column; grouping only one leaves the other
+    // non-grouped - unqualified and qualified reference forms alike.
+    CHECK(flags("SELECT a, b FROM (SELECT id AS a, id AS b FROM users) t "
+                "GROUP BY a") == 1);
+    CHECK(flags("SELECT t.a, t.b FROM (SELECT id AS a, id AS b FROM users) t "
+                "GROUP BY t.a") == 1);
+    // The non-grouped same-base alias is caught in HAVING and ORDER BY too.
+    CHECK(flags("SELECT a FROM (SELECT id AS a, id AS b FROM users) t "
+                "GROUP BY a HAVING b > 0") == 1);
+    CHECK(flags("SELECT a FROM (SELECT id AS a, id AS b FROM users) t "
+                "GROUP BY a ORDER BY b") == 1);
+
+    // Grouping BOTH aliases, or referencing only the grouped alias, is clean -
+    // no false positive from the added name check.
+    CHECK(flags("SELECT a, b FROM (SELECT id AS a, id AS b FROM users) t "
+                "GROUP BY a, b") == 0);
+    CHECK(flags("SELECT a FROM (SELECT id AS a, id AS b FROM users) t "
+                "GROUP BY a") == 0);
+    // A derived table that simply passes a base column through keeps working:
+    // grouping the (single) derived column covers a reference to it.
+    CHECK(flags("SELECT a FROM (SELECT id AS a FROM users) t GROUP BY a") == 0);
+    // Positional and alias-form keys resolve to the derived item's identity, so
+    // GROUP BY 1 covers a but not the same-base b.
+    CHECK(flags("SELECT a, b FROM (SELECT id AS a, id AS b FROM users) t "
+                "GROUP BY 1") == 1);
+}
+
 void test_orderby_qualified_ref_resolves_to_base_column() {
     std::printf("test_orderby_qualified_ref_resolves_to_base_column\n");
     // A QUALIFIED ORDER BY reference names a base/input column, never a SELECT
@@ -4358,6 +4409,7 @@ int main() {
     test_groupby_non_grouped_column();
     test_groupby_aggregate_key_rejected();
     test_groupby_self_join_distinct_instances();
+    test_groupby_derived_same_base_alias();
     test_orderby_qualified_ref_resolves_to_base_column();
     test_groupby_aggregate_in_having_or_orderby_groups();
     test_grouping_trigger_matrix();

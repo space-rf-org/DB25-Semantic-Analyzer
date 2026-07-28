@@ -2625,6 +2625,19 @@ namespace {
     return true;
 }
 
+// Two resolved column references can share a (table_id, column_id) yet denote
+// DIFFERENT columns of a derived relation: a derived table / CTE whose body
+// projects the same base column under two names - `(SELECT id AS a, id AS b
+// FROM users) t` - gives t.a and t.b the base column's (users, id) identity,
+// because a derived column carries through the identity of the expression it
+// projects. Grouping by t.a does not cover t.b (Postgres rejects the second),
+// so an id match alone is not enough: the referenced column NAME must also
+// agree. For a plain base column the name is invariant for a given id, so this
+// is a no-op there; it only separates same-base derived aliases.
+[[nodiscard]] bool same_column_name(std::string_view a_text, std::string_view b_text) {
+    return iequals(split_column_ref(a_text).column, split_column_ref(b_text).column);
+}
+
 // Does a column reference `ref` match the grouping key `k`? Prefer resolved
 // (table_id, column_id) identity; fall back to the reference text when either
 // side is unresolved (e.g. derived columns or expression keys).
@@ -2633,7 +2646,8 @@ namespace {
     const std::uint32_t cid = ref->context.analysis.column_id;
     if (cid != 0 && k.column_id != 0) {
         return tid == k.table_id && cid == k.column_id &&
-               same_relation_instance(ref->primary_text, k.text);
+               same_relation_instance(ref->primary_text, k.text) &&
+               same_column_name(ref->primary_text, k.text);
     }
     return iequals(ref->primary_text, k.text);  // identifiers compare case-insensitively
 }
@@ -2660,7 +2674,8 @@ namespace {
         const std::uint32_t kc = k->context.analysis.column_id;
         if (ec != 0 && kc != 0) {
             return e->context.analysis.table_id == k->context.analysis.table_id && ec == kc &&
-                   same_relation_instance(e->primary_text, k->primary_text);
+                   same_relation_instance(e->primary_text, k->primary_text) &&
+                   same_column_name(e->primary_text, k->primary_text);
         }
         return iequals(e->primary_text, k->primary_text);
     }

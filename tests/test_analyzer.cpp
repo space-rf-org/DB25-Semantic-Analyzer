@@ -444,6 +444,58 @@ void test_case_insensitive_check_binding() {
     CHECK(viol("INSERT INTO t (AGE) VALUES (5)") == 0);
 }
 
+void test_check_temporal_value_not_compared_lexically() {
+    std::printf("test_check_temporal_value_not_compared_lexically\n");
+    // The constant CHECK evaluator has no date parser: comparing a temporal
+    // column's string value LEXICALLY is unsound ('2020-01-01 9:30:00' orders
+    // GREATER than '2020-01-01 10:00:00' at the hour, '9' > '1'). Such a value is
+    // left UNBOUND so the CHECK folds to Unknown - never a false violation - while
+    // numeric / text CHECKs and NULL handling are unaffected.
+    InMemoryCatalog cat;
+    TableInfo& t = cat.add_table("t", {
+        ColumnInfo{"ts", DataType::Timestamp, /*nullable=*/true},   // column_id 1
+        ColumnInfo{"d", DataType::Date, /*nullable=*/true},         // column_id 2
+        ColumnInfo{"note", DataType::Text, /*nullable=*/true},      // column_id 3
+        ColumnInfo{"age", DataType::Integer, /*nullable=*/true},    // column_id 4
+    });
+    auto add_check = [&](const char* expr, std::uint32_t col) {
+        Constraint c; c.kind = Constraint::Kind::Check; c.expr = expr; c.columns = {col};
+        t.constraints.push_back(c);
+    };
+    add_check("ts < '2020-01-01 10:00:00'", 1);
+    add_check("d > '2019-01-01'", 2);
+    add_check("note <> 'x'", 3);
+    add_check("age >= 0", 4);
+    add_check("ts IS NOT NULL", 1);
+
+    parser::Parser p;
+    auto viol = [&](const char* sql) {
+        auto r = p.parse(sql);
+        CHECK(r.has_value());
+        if (!r.has_value()) return -1;
+        Analyzer a(cat);
+        a.analyze(r.value());
+        return count_code(a, DiagnosticCode::CheckViolation);
+    };
+
+    // The bug: a chronologically-legal timestamp was flagged by lexical order.
+    CHECK(viol("INSERT INTO t (ts) VALUES ('2020-01-01 9:30:00')") == 0);
+    // The zero-padded spelling of the same instant was always accepted - the fix
+    // makes both spellings agree (no lexical dependence).
+    CHECK(viol("INSERT INTO t (ts) VALUES ('2020-01-01 09:30:00')") == 0);
+    // A DateStyle-dependent DATE value (MDY '06/15/2020' = 2020-06-15) is likewise
+    // no longer lexically flagged.
+    CHECK(viol("INSERT INTO t (d) VALUES ('06/15/2020')") == 0);
+
+    // Sound comparisons are unaffected: a text-equality CHECK and a numeric CHECK
+    // still catch a definite violation.
+    CHECK(viol("INSERT INTO t (note) VALUES ('x')") == 1);
+    CHECK(viol("INSERT INTO t (age) VALUES (-5)") == 1);
+    // A NULL temporal value still binds (it is not a string literal), so an
+    // IS NOT NULL CHECK still catches the violation.
+    CHECK(viol("INSERT INTO t (ts) VALUES (NULL)") == 1);
+}
+
 void test_values_derived_table() {
     std::printf("test_values_derived_table\n");
     auto cat = make_catalog();
@@ -4098,6 +4150,7 @@ int main() {
     test_case_insensitive_ambiguity_preserved();
     test_case_insensitive_duplicate_relation();
     test_case_insensitive_check_binding();
+    test_check_temporal_value_not_compared_lexically();
     test_values_derived_table();
     test_where_type_inference();
     test_cte_resolution();

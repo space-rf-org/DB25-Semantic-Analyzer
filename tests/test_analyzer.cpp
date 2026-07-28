@@ -1163,6 +1163,49 @@ void test_groupby_non_grouped_column() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
+void test_groupby_self_join_distinct_instances() {
+    std::printf("test_groupby_self_join_distinct_instances\n");
+    // A self-join binds both aliases to the SAME catalog table, so `a.id` and
+    // `b.id` share (table_id, column_id). A GROUP BY key on one alias must NOT be
+    // treated as covering the same column of the OTHER alias - each self-join
+    // correlation is a distinct relation instance (Postgres rejects these).
+    // Regression: grouping identity compared only (table_id, column_id), so the
+    // other alias's column silently satisfied the key.
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"name", DataType::Text, /*nullable=*/true}});
+    parser::Parser p;
+
+    auto flags = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::NonGroupedColumn);
+    };
+
+    // Key on one alias, projected column on the OTHER alias -> non-grouped.
+    CHECK(flags("SELECT a.id, b.id FROM users a JOIN users b ON a.id > b.id "
+                "GROUP BY a.id") == 1);
+    CHECK(flags("SELECT a.name FROM users a JOIN users b ON a.id = b.id "
+                "GROUP BY b.name") == 1);
+    // The recent grouping-trigger widening also reaches HAVING.
+    CHECK(flags("SELECT a.id FROM users a JOIN users b ON a.id = b.id "
+                "GROUP BY a.id HAVING b.id > 0") == 1);
+
+    // Grouping BOTH instances, or referencing the grouped instance, is clean.
+    CHECK(flags("SELECT a.id, b.id FROM users a JOIN users b ON a.id = b.id "
+                "GROUP BY a.id, b.id") == 0);
+    CHECK(flags("SELECT b.name FROM users a JOIN users b ON a.id = b.id "
+                "GROUP BY b.name") == 0);
+
+    // Non-self-join behaviour is unchanged: a bare key still covers a qualified
+    // reference to the single relation, and a genuinely non-grouped column flags.
+    CHECK(flags("SELECT users.id FROM users GROUP BY id") == 0);
+    CHECK(flags("SELECT name FROM users GROUP BY id") == 1);
+}
+
 void test_groupby_aggregate_in_having_or_orderby_groups() {
     std::printf("test_groupby_aggregate_in_having_or_orderby_groups\n");
     // An aggregate confined to HAVING or ORDER BY (or the mere presence of
@@ -4050,6 +4093,7 @@ int main() {
     // GROUP BY / HAVING legality & function typing
     test_groupby_clean_count_star();
     test_groupby_non_grouped_column();
+    test_groupby_self_join_distinct_instances();
     test_groupby_aggregate_in_having_or_orderby_groups();
     test_grouping_trigger_matrix();
     test_values_type_reconciliation_matrix();

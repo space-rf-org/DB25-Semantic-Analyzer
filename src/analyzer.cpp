@@ -2488,6 +2488,25 @@ namespace {
     return false;
 }
 
+// Two resolved column references can share a (table_id, column_id) yet name
+// DIFFERENT relation instances: a self-join (`users a JOIN users b`) binds both
+// aliases to the same catalog table, so `a.id` and `b.id` carry the identical
+// (table_id, column_id). A grouping key on one alias does not cover the same
+// column of the other, so their qualifiers must also agree. Self-join instances
+// are always aliased (a bare reference in a self-join is ambiguous and diagnosed
+// separately), so it is enough to reject the case where both references are
+// qualified and their qualifiers differ; a bare reference falls through to the
+// (table_id, column_id) test, which is unambiguous outside a self-join.
+[[nodiscard]] bool same_relation_instance(std::string_view a_text,
+                                          std::string_view b_text) {
+    const std::string_view qa = split_column_ref(a_text).qualifier;
+    const std::string_view qb = split_column_ref(b_text).qualifier;
+    if (!qa.empty() && !qb.empty()) {
+        return iequals(qa, qb);
+    }
+    return true;
+}
+
 // Does a column reference `ref` match the grouping key `k`? Prefer resolved
 // (table_id, column_id) identity; fall back to the reference text when either
 // side is unresolved (e.g. derived columns or expression keys).
@@ -2495,7 +2514,8 @@ namespace {
     const std::uint32_t tid = ref->context.analysis.table_id;
     const std::uint32_t cid = ref->context.analysis.column_id;
     if (cid != 0 && k.column_id != 0) {
-        return tid == k.table_id && cid == k.column_id;
+        return tid == k.table_id && cid == k.column_id &&
+               same_relation_instance(ref->primary_text, k.text);
     }
     return iequals(ref->primary_text, k.text);  // identifiers compare case-insensitively
 }
@@ -2521,7 +2541,8 @@ namespace {
         const std::uint32_t ec = e->context.analysis.column_id;
         const std::uint32_t kc = k->context.analysis.column_id;
         if (ec != 0 && kc != 0) {
-            return e->context.analysis.table_id == k->context.analysis.table_id && ec == kc;
+            return e->context.analysis.table_id == k->context.analysis.table_id && ec == kc &&
+                   same_relation_instance(e->primary_text, k->primary_text);
         }
         return iequals(e->primary_text, k->primary_text);
     }

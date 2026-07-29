@@ -667,6 +667,34 @@ void test_cte_setop_body() {
     CHECK(id != nullptr && a.type_of(id) == DataType::Integer);
 }
 
+// A CTE column-alias list `WITH t(a, b, ...)` may not name MORE columns than the
+// CTE body projects (Postgres: `WITH query "t" has N columns available but M
+// columns specified`). Regression: the CTE rename loop silently truncated the
+// extra aliases, so the arity error went unreported and a later reference to a
+// dropped alias failed with a misleading UnresolvedColumn. The derived-table
+// sibling already rejected this; the CTE path now reuses the same check.
+void test_cte_column_alias_count_mismatch() {
+    std::printf("test_cte_column_alias_count_mismatch\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT)
+    parser::Parser p;
+
+    auto mismatches = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::ColumnAliasCountMismatch);
+    };
+
+    // 3 aliases over a 1-column body -> flagged.
+    CHECK(mismatches("WITH t(a, b, c) AS (SELECT id FROM users) SELECT a FROM t") == 1);
+    // Exact and fewer alias counts are both legal -> not flagged.
+    CHECK(mismatches("WITH t(a) AS (SELECT id FROM users) SELECT a FROM t") == 0);
+    CHECK(mismatches("WITH t(a, b) AS (SELECT id, name FROM users) SELECT a FROM t") == 0);
+    CHECK(mismatches("WITH t(a) AS (SELECT id, name FROM users) SELECT a FROM t") == 0);
+}
+
 void test_unresolved_table() {
     std::printf("test_unresolved_table\n");
     auto cat = make_catalog();
@@ -1213,6 +1241,45 @@ void test_groupby_non_grouped_column() {
     a.analyze(res.value());
     // name is neither grouped nor aggregated.
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
+// A window function runs AFTER grouping, so its arguments and OVER (PARTITION BY
+// / ORDER BY) expressions may reference only the grouped output - a group key or
+// an aggregate. A bare ungrouped column there is illegal, exactly as in the
+// SELECT list (Postgres: "column ... must appear in the GROUP BY clause or be
+// used in an aggregate function"). Regression: the grouping check exempted every
+// child of a window call, so an ungrouped column hidden in an OVER clause slipped
+// past the analyzer and only failed later at bind.
+void test_groupby_window_ungrouped_column() {
+    std::printf("test_groupby_window_ungrouped_column\n");
+    auto cat = make_catalog_emp();  // emp(id, name, dept, region, salary, age)
+    parser::Parser p;
+    auto flags = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::NonGroupedColumn);
+    };
+
+    // Ungrouped column inside the window's OVER clause / argument -> flagged.
+    CHECK(flags("SELECT dept, ROW_NUMBER() OVER (ORDER BY salary) "
+                "FROM emp GROUP BY dept") == 1);
+    CHECK(flags("SELECT dept, RANK() OVER (PARTITION BY age) "
+                "FROM emp GROUP BY dept") == 1);
+    CHECK(flags("SELECT dept, SUM(salary) OVER (PARTITION BY dept) "
+                "FROM emp GROUP BY dept") == 1);  // raw salary arg of a window aggregate
+
+    // Legal: OVER references a group key or an aggregate; a window OVER an
+    // aggregate; or the query is not grouped at all.
+    CHECK(flags("SELECT dept, ROW_NUMBER() OVER (ORDER BY dept) "
+                "FROM emp GROUP BY dept") == 0);
+    CHECK(flags("SELECT dept, RANK() OVER (ORDER BY SUM(salary)) "
+                "FROM emp GROUP BY dept") == 0);
+    CHECK(flags("SELECT dept, SUM(SUM(salary)) OVER (PARTITION BY dept) "
+                "FROM emp GROUP BY dept") == 0);
+    CHECK(flags("SELECT ROW_NUMBER() OVER (ORDER BY salary) FROM emp") == 0);
 }
 
 // A GROUP BY key that IS (or contains) a non-windowed aggregate is illegal:
@@ -4448,6 +4515,7 @@ int main() {
     test_where_type_inference();
     test_cte_resolution();
     test_cte_setop_body();
+    test_cte_column_alias_count_mismatch();
     test_unresolved_table();
 
     // SELECT * / table.* expansion
@@ -4484,6 +4552,7 @@ int main() {
     // GROUP BY / HAVING legality & function typing
     test_groupby_clean_count_star();
     test_groupby_non_grouped_column();
+    test_groupby_window_ungrouped_column();
     test_groupby_aggregate_key_rejected();
     test_groupby_self_join_distinct_instances();
     test_groupby_derived_same_base_alias();

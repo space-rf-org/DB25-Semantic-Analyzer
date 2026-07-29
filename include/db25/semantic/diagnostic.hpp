@@ -99,6 +99,13 @@ enum class DiagnosticCode : std::uint16_t {
     // single self-reference (Postgres: `recursive reference to query "t" must not
     // appear more than once`); a non-linear reference has no defined fixpoint.
     RecursiveReferenceNotLinear,
+    // A constant division or modulo by zero (`1 / 0`, `x % 0`) in a reachable
+    // expression position. PostgreSQL folds such a constant at plan time and
+    // errors; DB25 accepts the statement but warns. Suppressed inside a CASE arm
+    // that constant-fold analysis proves unreachable (a constant-false guard, or
+    // an arm after a constant-true guard), so `CASE WHEN 1=0 THEN 1/0 ...` stays
+    // clean while `CASE WHEN i>100 THEN 1/0 ...` warns.
+    DivisionByZero,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

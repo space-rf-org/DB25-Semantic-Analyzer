@@ -1301,15 +1301,15 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             }
             // Optional column-list rename `WITH t(a, b) AS (...)`: rename the CTE's
             // output columns positionally so a later `SELECT a FROM t` resolves.
-            // Without this the renamed names never entered the relation.
+            // Reuse apply_column_aliases (the derived-table path) so the CTE gets
+            // the SAME arity check: naming MORE columns than the body projects is
+            // illegal (Postgres: `WITH query "t" has N columns available but M
+            // columns specified`). The bare rename loop here silently truncated the
+            // extra aliases, so `WITH t(a,b,c) AS (SELECT id ...)` registered just
+            // `a` and a later `SELECT c FROM t` failed with a misleading
+            // UnresolvedColumn instead of the real ColumnAliasCountMismatch.
             if (ASTNode* col_list = find_child(def, NodeType::ColumnList)) {
-                std::size_t i = 0;
-                for (ASTNode* cn = first_child(col_list);
-                     cn != nullptr && i < cte.columns.size();
-                     cn = cn->next_sibling, ++i) {
-                    cte.columns[i].name =
-                        std::string{split_column_ref(cn->primary_text).column};
-                }
+                apply_column_aliases(cte.columns, col_list, def);
             }
             scope.add_cte(std::move(cte));
         }
@@ -1661,11 +1661,12 @@ void Analyzer::apply_column_aliases(std::vector<ResolvedColumn>& cols,
     for (ASTNode* id = first_child(alias_list); id != nullptr; id = id->next_sibling) {
         names.push_back(id->primary_text);
     }
-    // A derived table may not be given more column aliases than it has columns
-    // (fewer is allowed - the trailing columns keep their inferred names).
+    // A relation (derived table or CTE) may not be given more column aliases than
+    // it has columns (fewer is allowed - the trailing columns keep their inferred
+    // names).
     if (names.size() > cols.size()) {
         add_diagnostic(DiagnosticCode::ColumnAliasCountMismatch,
-                       "derived table has " + std::to_string(cols.size()) +
+                       "relation has " + std::to_string(cols.size()) +
                            " columns but " + std::to_string(names.size()) +
                            " column aliases were specified",
                        at);
@@ -3050,12 +3051,19 @@ void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& k
                                "' nested inside another aggregate",
                            expr);
         }
-        // Columns beneath an aggregate or inside a window function are exempt from
-        // the grouping-key rule. But a window boundary is NOT aggregate nesting:
-        // an aggregate inside an OVER clause (e.g. RANK() OVER (ORDER BY SUM(x)))
-        // is legal, so `in_aggregate` is reset to false through a window and only
-        // set through a plain aggregate.
-        const bool child_exempt = grouping_exempt || is_agg || windowed;
+        // Columns beneath an aggregate are exempt from the grouping-key rule.
+        // Columns inside a WINDOW function are NOT: a window function runs AFTER
+        // grouping, so its arguments and OVER (PARTITION BY / ORDER BY) expressions
+        // see only the grouped output - a group key or an aggregate is fine, but a
+        // bare ungrouped column is illegal (Postgres flags e.g. `ROW_NUMBER() OVER
+        // (ORDER BY sal)` / `SUM(sal) OVER (...)` in a query grouped by dept). So a
+        // window does not exempt its children; the normal rule applies, and an
+        // aggregate nested in the OVER clause still exempts its own arguments when
+        // the recursion reaches it. A window boundary is NOT aggregate nesting: an
+        // aggregate inside an OVER clause (RANK() OVER (ORDER BY SUM(x))) is legal,
+        // so `in_aggregate` is reset to false through a window and only set through
+        // a plain aggregate.
+        const bool child_exempt = grouping_exempt || is_agg;
         const bool child_in_aggregate = is_agg ? true : (windowed ? false : in_aggregate);
         for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
             check_grouping_expr(c, keys, child_exempt, child_in_aggregate);

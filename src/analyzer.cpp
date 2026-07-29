@@ -1277,6 +1277,9 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     // 1. CTEs: register each definition as a named relation before resolving
     //    FROM, so the body can reference the current scope and earlier CTEs.
     if (ASTNode* cte_clause = find_child(select_stmt, NodeType::CTEClause)) {
+        // `WITH RECURSIVE` (parser sets NodeFlags::IsRecursive on the clause) lets
+        // a CTE reference itself inside its own body.
+        const bool clause_recursive = cte_clause->has_flag(ast::NodeFlags::IsRecursive);
         for (ASTNode* def = first_child(cte_clause); def != nullptr; def = def->next_sibling) {
             if (def->node_type != NodeType::CTEDefinition) {
                 continue;
@@ -1294,8 +1297,35 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
                     break;
                 }
             }
+            ASTNode* col_list = find_child(def, NodeType::ColumnList);
             NamedRelation cte;
             cte.name = std::string{def->primary_text};
+
+            // A recursive CTE references itself inside its own body, so it must be
+            // visible in scope BEFORE that body is analyzed. Its shape is
+            // `<non-recursive anchor> UNION [ALL] <recursive term>`; per SQL /
+            // Postgres the CTE's column names and types are taken from the ANCHOR
+            // term alone. Analyze the anchor first, register the CTE with the
+            // anchor's (column-list-renamed) columns, then analyze the whole UNION
+            // body so the recursive term's self-reference resolves and the two
+            // branches reconcile (a genuine arity/type mismatch is still reported
+            // by analyze_setop). Without this the self-reference was a false
+            // UnresolvedTable and each recursive column a false UnresolvedColumn.
+            // The CTE is registered only once (with anchor columns); no push into
+            // scope's CTE list happens during the body analysis, so the
+            // self-reference's find_cte pointer stays valid.
+            if (clause_recursive && body != nullptr && is_setop(body->node_type)) {
+                if (ASTNode* anchor = first_child(body)) {
+                    cte.columns = analyze_stmt(anchor, &scope);
+                }
+                if (col_list != nullptr) {
+                    apply_column_aliases(cte.columns, col_list, def);
+                }
+                scope.add_cte(std::move(cte));
+                analyze_stmt(body, &scope);
+                continue;
+            }
+
             if (body != nullptr) {
                 cte.columns = analyze_stmt(body, &scope);
             }
@@ -1308,7 +1338,7 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             // extra aliases, so `WITH t(a,b,c) AS (SELECT id ...)` registered just
             // `a` and a later `SELECT c FROM t` failed with a misleading
             // UnresolvedColumn instead of the real ColumnAliasCountMismatch.
-            if (ASTNode* col_list = find_child(def, NodeType::ColumnList)) {
+            if (col_list != nullptr) {
                 apply_column_aliases(cte.columns, col_list, def);
             }
             scope.add_cte(std::move(cte));

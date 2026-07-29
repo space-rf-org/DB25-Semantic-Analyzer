@@ -2652,7 +2652,9 @@ void test_case_constant_div_by_zero() {
         CHECK(res.has_value());
         Analyzer a(cat);
         if (res) a.analyze(res.value());
-        CHECK(!a.has_errors());  // always accepted; the diagnostic is a warning
+        // The division-by-zero diagnostic is a soft WARNING (DB25 preserves 1/0),
+        // so the statement is always accepted - has_errors() stays false.
+        CHECK(!a.has_errors());
         return count_code(a, DiagnosticCode::DivisionByZero);
     };
     // Reachable constant div/mod by zero warns.
@@ -2672,6 +2674,44 @@ void test_case_constant_div_by_zero() {
                "FROM case_tbl") == 2);
     // An ELSE after a constant-true arm is dead.
     CHECK(div0("SELECT CASE WHEN 1=1 THEN 1 ELSE 1/0 END") == 0);
+}
+
+// `||` is array concatenation when an operand is an array (yielding an array),
+// not string concatenation to Text. Without this a CASE branch `ARRAY[...] || y`
+// was typed Text and failed to reconcile with a sibling ARRAY[...] branch,
+// raising a spurious "incompatible CASE result types" error.
+void test_array_concat_typing() {
+    std::printf("test_array_concat_typing\n");
+    InMemoryCatalog cat;
+    parser::Parser p;
+    auto errs = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        return a.has_errors();
+    };
+    auto type1 = [&](const char* sql) -> DataType {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* it = list != nullptr ? first_child(list) : nullptr;
+        return it != nullptr ? a.type_of(it) : DataType::Unknown;
+    };
+    // Array || array is an array; string || string stays text.
+    CHECK(type1("SELECT ARRAY['a','b'] || ARRAY['c']") == DataType::Array);
+    CHECK(type1("SELECT 'a' || 'b'") == DataType::Text);
+    // A CASE whose branches are arrays (one via ||) reconciles cleanly.
+    CHECK(!errs("SELECT CASE WHEN true THEN ARRAY['a'] || ARRAY['b'] "
+                "ELSE ARRAY['x','y'] END"));
+    // The pg_case corpus statement: no false CASE-result-type error.
+    CHECK(!errs("SELECT CASE 'foo'::text WHEN 'foo' "
+                "THEN ARRAY['a','b','c','d'] || enum_range(NULL::casetestenum)::text[] "
+                "ELSE ARRAY['x','y'] END"));
+    // A genuine mismatch (integer vs text branches) is still an error.
+    CHECK(errs("SELECT CASE WHEN true THEN 1 ELSE 'x' END"));
 }
 
 void test_in_value_list_coercion_warns() {
@@ -4764,6 +4804,7 @@ int main() {
     test_coercion_text_int_comparison_warns();
     test_nullif_cross_category_warns();
     test_case_constant_div_by_zero();
+    test_array_concat_typing();
     test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();
 

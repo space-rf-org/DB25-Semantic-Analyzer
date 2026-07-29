@@ -2391,10 +2391,17 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             } else if (is_logical_op(op)) {
                 result = DataType::Boolean;
             } else if (op == "||") {
-                // String concatenation always yields text (operands are rendered
-                // to their string form). Nullability is combined below like any
-                // other binary operator.
-                result = DataType::Text;
+                // `||` is overloaded: ARRAY CONCATENATION when either operand is
+                // an array (array||array, element||array, array||element all yield
+                // an array), otherwise STRING concatenation (operands rendered to
+                // their text form -> text). Without the array case, `ARRAY[...] ||
+                // x::text[]` was typed Text and then failed to reconcile with a
+                // sibling array - e.g. a CASE whose other branch is an ARRAY[...] -
+                // producing a spurious "incompatible CASE result types" error.
+                // Nullability is combined below like any other binary operator.
+                result = (lt == DataType::Array || rt == DataType::Array)
+                             ? DataType::Array
+                             : DataType::Text;
             } else if (is_arithmetic_op(op)) {
                 // Temporal arithmetic (date/time ± interval, temporal − temporal,
                 // date ± integer) is operator-aware and handled first; a genuinely
@@ -2421,11 +2428,14 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                     }
                     result = c.type;
                 }
-                // A constant division / modulo by a zero divisor is a definite
-                // error PostgreSQL folds and rejects at plan time; DB25 accepts
-                // but warns. Suppressed inside a provably-dead CASE arm (see the
-                // CaseExpr handler), so `CASE WHEN 1=0 THEN 1/0 ...` stays clean
-                // while a reachable `1/0` warns.
+                // A constant division / modulo by a zero divisor is a soft
+                // WARNING, not an error: DB25 deliberately treats `1/0` as a legal
+                // runtime operation that flows through the pipeline (the optimizer
+                // PRESERVES it rather than folding it, and the harness relies on it
+                // analyzing clean) - a divergence from PostgreSQL, which folds and
+                // rejects at plan time. Suppressed inside a provably-dead CASE arm
+                // (see the CaseExpr handler), so `CASE WHEN 1=0 THEN 1/0 ...` is
+                // silent while a reachable `1/0` gets the advisory warning.
                 if (div0_suppress_ == 0 && (op == "/" || op == "%")) {
                     if (const auto d = eval_const_int(rhs); d.has_value() && *d == 0) {
                         add_diagnostic(DiagnosticCode::DivisionByZero,

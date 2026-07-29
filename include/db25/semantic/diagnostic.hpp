@@ -101,10 +101,13 @@ enum class DiagnosticCode : std::uint16_t {
     RecursiveReferenceNotLinear,
     // A constant division or modulo by zero (`1 / 0`, `x % 0`) in a reachable
     // expression position. PostgreSQL folds such a constant at plan time and
-    // errors; DB25 accepts the statement but warns. Suppressed inside a CASE arm
-    // that constant-fold analysis proves unreachable (a constant-false guard, or
-    // an arm after a constant-true guard), so `CASE WHEN 1=0 THEN 1/0 ...` stays
-    // clean while `CASE WHEN i>100 THEN 1/0 ...` warns.
+    // errors; DB25 deliberately DIVERGES - it treats `1/0` as a legal runtime
+    // operation the optimizer preserves - so this is a soft WARNING, not an
+    // error, and the statement still analyzes/binds/optimizes cleanly. Suppressed
+    // inside a CASE arm that constant-fold analysis proves unreachable (a
+    // constant-false guard, or an arm after a constant-true guard), so
+    // `CASE WHEN 1=0 THEN 1/0 ...` is silent while `CASE WHEN i>100 THEN 1/0 ...`
+    // gets the advisory warning.
     DivisionByZero,
 };
 

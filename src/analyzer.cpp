@@ -1271,6 +1271,27 @@ void Analyzer::add_diagnostic(DiagnosticCode code, std::string message, const AS
     diagnostics_.push_back(std::move(d));
 }
 
+namespace {
+
+// Count the table references named `name` (identifiers fold case) in `node`'s
+// subtree. Used to detect NON-LINEAR recursion: the recursive term of a WITH
+// RECURSIVE CTE may reference the CTE at most once, so a count > 1 is illegal.
+int count_table_refs(const ASTNode* node, std::string_view name) {
+    if (node == nullptr) {
+        return 0;
+    }
+    int n = (node->node_type == NodeType::TableRef &&
+             iequals(node->primary_text, name))
+                ? 1
+                : 0;
+    for (const ASTNode* c = first_child(node); c != nullptr; c = c->next_sibling) {
+        n += count_table_refs(c, name);
+    }
+    return n;
+}
+
+}  // namespace
+
 std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope* parent) {
     Scope scope(parent);
 
@@ -1315,14 +1336,72 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             // scope's CTE list happens during the body analysis, so the
             // self-reference's find_cte pointer stays valid.
             if (clause_recursive && body != nullptr && is_setop(body->node_type)) {
-                if (ASTNode* anchor = first_child(body)) {
+                ASTNode* anchor = first_child(body);
+                ASTNode* rec_term = anchor != nullptr ? anchor->next_sibling : nullptr;
+                // Derive the CTE's columns from the ANCHOR term alone. The whole
+                // UNION body is analyzed again below (analyze_setop re-walks the
+                // anchor and re-emits its diagnostics), so DISCARD the diagnostics
+                // this pre-pass produces - otherwise every anchor-level diagnostic
+                // is reported twice. Types recorded here are overwritten
+                // idempotently by the body pass, so only the diagnostics leak.
+                if (anchor != nullptr) {
+                    const std::size_t diag_mark = diagnostics_.size();
                     cte.columns = analyze_stmt(anchor, &scope);
+                    diagnostics_.resize(diag_mark);
                 }
                 if (col_list != nullptr) {
                     apply_column_aliases(cte.columns, col_list, def);
                 }
+                // Keep the CTE name and the anchor column types before the CTE is
+                // moved into scope: the reconciled UNION body is validated against
+                // the anchor types afterwards.
+                const std::string cte_name = cte.name;
+                std::vector<DataType> anchor_types;
+                anchor_types.reserve(cte.columns.size());
+                for (const auto& c : cte.columns) {
+                    anchor_types.push_back(c.type);
+                }
+                // Non-linear recursion is illegal: the recursive term may
+                // reference the CTE at most once (a self-join of the working table
+                // has no defined fixpoint). Postgres: "recursive reference to
+                // query "t" must not appear more than once".
+                if (rec_term != nullptr &&
+                    count_table_refs(rec_term, cte_name) > 1) {
+                    add_diagnostic(DiagnosticCode::RecursiveReferenceNotLinear,
+                                   "recursive reference to '" + cte_name +
+                                       "' must not appear more than once",
+                                   rec_term);
+                }
                 scope.add_cte(std::move(cte));
-                analyze_stmt(body, &scope);
+                // Analyze the whole UNION body: the self-reference resolves and
+                // the branches reconcile. The reconciled column types are the
+                // return value.
+                const std::vector<ResolvedColumn> body_cols =
+                    analyze_stmt(body, &scope);
+                // The recursive term must be COERCIBLE to the anchor's column
+                // types, not WIDEN them: SQL fixes the CTE's column types from the
+                // anchor (non-recursive) term. If reconciling the recursive branch
+                // produced a wider type for any column, reject it (Postgres:
+                // `recursive query "t" column N has type X in non-recursive term
+                // but type Y overall`). Without this the analyzer reported the
+                // outer reference with the anchor type but projection_of(body)
+                // with the wider type - a silently inconsistent result type.
+                for (std::size_t i = 0;
+                     i < anchor_types.size() && i < body_cols.size(); ++i) {
+                    if (anchor_types[i] != DataType::Unknown &&
+                        body_cols[i].type != DataType::Unknown &&
+                        body_cols[i].type != anchor_types[i]) {
+                        add_diagnostic(
+                            DiagnosticCode::RecursiveTypeMismatch,
+                            "recursive query '" + cte_name + "' column " +
+                                std::to_string(i + 1) + " has type " +
+                                ast::data_type_to_string(anchor_types[i]) +
+                                " in the non-recursive term but type " +
+                                ast::data_type_to_string(body_cols[i].type) +
+                                " overall",
+                            def);
+                    }
+                }
                 continue;
             }
 
@@ -2175,6 +2254,19 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                    "(): the arguments cannot be reconciled to a "
                                    "common type",
                                expr);
+            }
+            // NULLIF(a, b) is defined as `CASE WHEN a = b THEN NULL ELSE a END`,
+            // i.e. a comparison; a cross-category operand pair is the same soft
+            // implicit coercion the other comparison sites (=, IN, BETWEEN, IS
+            // [NOT] DISTINCT FROM) already warn on. (Postgres rejects it outright;
+            // the project models these as warnings.)
+            if (upper == "NULLIF" && arg_types.size() == 2 &&
+                coerce(arg_types[0], arg_types[1], CoercionKind::Comparison).status !=
+                    CoercionStatus::Ok) {
+                add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                               "implicit coercion in NULLIF between operands of "
+                               "different type categories",
+                               expr, Severity::Warning);
             }
             record_type(expr, ft.type);
             record_nullability(expr, function_nullability(upper, arg_nulls));

@@ -87,6 +87,18 @@ enum class DiagnosticCode : std::uint16_t {
     // `(VALUES (1), ('x'))`). A multi-row VALUES is a UNION ALL of its rows, so
     // each column's type must reconcile across every row.
     ValuesColumnTypeMismatch,
+    // The recursive term of a WITH RECURSIVE CTE produces a column whose type is
+    // not the same as (nor coercible to) the anchor (non-recursive) term's type
+    // for that column - the recursive term would WIDEN the column past the type
+    // the anchor fixes. SQL takes the CTE's column types from the anchor term and
+    // requires the recursive term to conform (Postgres: `recursive query "t"
+    // column N has type X in non-recursive term but type Y overall`).
+    RecursiveTypeMismatch,
+    // The recursive term of a WITH RECURSIVE CTE references the CTE itself more
+    // than once (non-linear recursion, e.g. `FROM t a, t b`). SQL permits only a
+    // single self-reference (Postgres: `recursive reference to query "t" must not
+    // appear more than once`); a non-linear reference has no defined fixpoint.
+    RecursiveReferenceNotLinear,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

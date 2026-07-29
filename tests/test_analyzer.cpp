@@ -753,6 +753,46 @@ void test_recursive_cte() {
         analyze("WITH RECURSIVE t(a, b, c) AS (SELECT 1 UNION ALL SELECT a+1 FROM t) "
                 "SELECT a FROM t"),
         DiagnosticCode::ColumnAliasCountMismatch) == 1);
+
+    // A recursive term may not WIDEN a column past the anchor type: SQL fixes the
+    // CTE's column types from the anchor (SELECT 1 -> Integer), so a recursive
+    // term producing Double (n * 1.5) is rejected, not silently accepted with an
+    // inconsistent result type. (Postgres: "column 1 has type integer in
+    // non-recursive term but type numeric overall".)
+    CHECK(count_code(
+        analyze("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n * 1.5 FROM t "
+                "WHERE n < 5) SELECT n FROM t"),
+        DiagnosticCode::RecursiveTypeMismatch) == 1);
+    // A recursive term coercible to the anchor type (n + 1 stays Integer) is fine.
+    CHECK(count_code(
+        analyze("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t "
+                "WHERE n < 5) SELECT n FROM t"),
+        DiagnosticCode::RecursiveTypeMismatch) == 0);
+
+    // Non-linear recursion (the recursive term references the CTE more than once)
+    // is illegal - a self-join of the working table has no defined fixpoint.
+    CHECK(count_code(
+        analyze("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL "
+                "SELECT a.n + b.n FROM t a, t b WHERE a.n < 5) SELECT n FROM t"),
+        DiagnosticCode::RecursiveReferenceNotLinear) == 1);
+    // The JOIN form of a double self-reference is likewise rejected.
+    CHECK(count_code(
+        analyze("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL "
+                "SELECT t1.n + 1 FROM t t1 JOIN t t2 ON t1.n = t2.n) SELECT n FROM t"),
+        DiagnosticCode::RecursiveReferenceNotLinear) == 1);
+    // A single self-reference (linear recursion) is accepted.
+    CHECK(count_code(
+        analyze("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t "
+                "WHERE n < 5) SELECT n FROM t"),
+        DiagnosticCode::RecursiveReferenceNotLinear) == 0);
+
+    // A semantic error in the ANCHOR term is reported exactly ONCE, not doubled
+    // (the anchor is analyzed once for its columns and once as the UNION's first
+    // branch; the pre-registration pass must not leak its diagnostics).
+    CHECK(count_code(
+        analyze("WITH RECURSIVE t(n) AS (SELECT nosuchcol UNION ALL SELECT n FROM t) "
+                "SELECT n FROM t"),
+        DiagnosticCode::UnresolvedColumn) == 1);
 }
 
 void test_unresolved_table() {
@@ -2572,6 +2612,30 @@ void test_coercion_text_int_comparison_warns() {
     CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
     // A warning, not an error.
     CHECK(!a.has_errors());
+}
+
+void test_nullif_cross_category_warns() {
+    std::printf("test_nullif_cross_category_warns\n");
+    auto cat = make_catalog_null();
+    parser::Parser p;
+    // NULLIF(id, note) compares an integer to TEXT: a cross-category comparison,
+    // so a soft implicit-coercion warning (matching =, IN, BETWEEN, IS DISTINCT).
+    {
+        auto res = p.parse("SELECT NULLIF(id, note) FROM users");
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 1);
+        CHECK(!a.has_errors());  // a warning, not an error
+    }
+    // Same-category operands: no warning.
+    {
+        auto res = p.parse("SELECT NULLIF(id, id) FROM users");
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::ImplicitCoercion) == 0);
+    }
 }
 
 void test_in_value_list_coercion_warns() {
@@ -4662,6 +4726,7 @@ int main() {
     test_integer_literal_width_by_magnitude();
     test_coercion_numeric_comparison_clean();
     test_coercion_text_int_comparison_warns();
+    test_nullif_cross_category_warns();
     test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();
 

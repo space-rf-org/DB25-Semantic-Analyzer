@@ -2638,6 +2638,42 @@ void test_nullif_cross_category_warns() {
     }
 }
 
+// A constant division / modulo by zero in a REACHABLE position warns (accepted,
+// not rejected); inside a CASE arm that constant-fold analysis proves dead it is
+// suppressed. Mirrors PostgreSQL's plan-time CASE arm elimination + constant
+// folding (which errors on a reachable 1/0 but not on one in a dead arm).
+void test_case_constant_div_by_zero() {
+    std::printf("test_case_constant_div_by_zero\n");
+    InMemoryCatalog cat;
+    cat.add_table("case_tbl", {ColumnInfo{"i", DataType::Integer, /*nullable=*/true}});
+    parser::Parser p;
+    auto div0 = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        CHECK(!a.has_errors());  // always accepted; the diagnostic is a warning
+        return count_code(a, DiagnosticCode::DivisionByZero);
+    };
+    // Reachable constant div/mod by zero warns.
+    CHECK(div0("SELECT 1/0") == 1);
+    CHECK(div0("SELECT 10 % 0") == 1);
+    // A non-zero (or non-constant) divisor does not warn.
+    CHECK(div0("SELECT i / 2 FROM case_tbl") == 0);
+    CHECK(div0("SELECT 1 / i FROM case_tbl") == 0);
+    // Searched CASE: the 1/0 branch is reachable (i is not constant) -> warns;
+    // constant-guarded dead branches do not.
+    CHECK(div0("SELECT CASE WHEN i > 100 THEN 1/0 ELSE 0 END FROM case_tbl") == 1);
+    CHECK(div0("SELECT CASE WHEN 1=0 THEN 1/0 WHEN 1=1 THEN 1 ELSE 2/0 END") == 0);
+    // Simple CASE: operand=value comparison eliminates the dead arms.
+    CHECK(div0("SELECT CASE 1 WHEN 0 THEN 1/0 WHEN 1 THEN 1 ELSE 2/0 END") == 0);
+    // Two independently-reachable dead-by-nothing arms each warn.
+    CHECK(div0("SELECT CASE WHEN i>5 THEN 1/0 WHEN i>10 THEN 2/0 ELSE 3 END "
+               "FROM case_tbl") == 2);
+    // An ELSE after a constant-true arm is dead.
+    CHECK(div0("SELECT CASE WHEN 1=1 THEN 1 ELSE 1/0 END") == 0);
+}
+
 void test_in_value_list_coercion_warns() {
     std::printf("test_in_value_list_coercion_warns\n");
     // `x IN (value-list)` must apply the SAME cross-type comparison check as
@@ -4727,6 +4763,7 @@ int main() {
     test_coercion_numeric_comparison_clean();
     test_coercion_text_int_comparison_warns();
     test_nullif_cross_category_warns();
+    test_case_constant_div_by_zero();
     test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();
 

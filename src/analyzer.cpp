@@ -12,7 +12,10 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cstdint>
 #include <deque>
+#include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -845,6 +848,86 @@ namespace {
         default:
             return false;  // ColumnRef, Identifier, FunctionCall, subquery, ...
     }
+}
+
+// Fold an integer-valued constant subtree to its value, or nullopt if it is not
+// a compile-time integer constant. Deliberately small: literals, unary +/-, and
+// +/-/* of constants (NOT / or %, to avoid re-introducing the division-by-zero
+// and overflow concerns this feeds). Used only to reason about CASE guards and
+// zero divisors, so it need not cover the whole grammar. Overflow-safe (returns
+// nullopt rather than invoking signed-overflow UB).
+[[nodiscard]] std::optional<std::int64_t> eval_const_int(const ASTNode* n) {
+    if (n == nullptr) {
+        return std::nullopt;
+    }
+    switch (n->node_type) {
+        case NodeType::IntegerLiteral: {
+            std::int64_t v = 0;
+            const std::string_view t = n->primary_text;
+            const auto [ptr, ec] = std::from_chars(t.data(), t.data() + t.size(), v);
+            if (ec == std::errc() && ptr == t.data() + t.size()) {
+                return v;
+            }
+            return std::nullopt;
+        }
+        case NodeType::UnaryExpr: {
+            const auto cv = eval_const_int(first_child(n));
+            if (!cv) return std::nullopt;
+            if (n->primary_text == "-") {
+                if (*cv == std::numeric_limits<std::int64_t>::min()) return std::nullopt;
+                return -*cv;
+            }
+            if (n->primary_text == "+") return *cv;
+            return std::nullopt;
+        }
+        case NodeType::BinaryExpr: {
+            const ASTNode* l = first_child(n);
+            const ASTNode* r = l != nullptr ? l->next_sibling : nullptr;
+            const auto lv = eval_const_int(l);
+            const auto rv = eval_const_int(r);
+            if (!lv || !rv) return std::nullopt;
+            std::int64_t out = 0;
+            const std::string_view op = n->primary_text;
+            if (op == "+" && !__builtin_add_overflow(*lv, *rv, &out)) return out;
+            if (op == "-" && !__builtin_sub_overflow(*lv, *rv, &out)) return out;
+            if (op == "*" && !__builtin_mul_overflow(*lv, *rv, &out)) return out;
+            return std::nullopt;
+        }
+        default:
+            return std::nullopt;
+    }
+}
+
+// Fold a boolean-valued constant subtree (a BooleanLiteral, or a comparison of
+// two integer constants) to true/false, or nullopt if it is not a compile-time
+// constant boolean. Used to decide whether a CASE guard is constant-true /
+// constant-false (and hence which arms are dead). `2020` etc. that are not
+// constants (a column comparison) correctly return nullopt.
+[[nodiscard]] std::optional<bool> eval_const_bool(const ASTNode* n) {
+    if (n == nullptr) {
+        return std::nullopt;
+    }
+    if (n->node_type == NodeType::BooleanLiteral) {
+        const std::string u = to_upper(n->primary_text);
+        if (u == "TRUE") return true;
+        if (u == "FALSE") return false;
+        return std::nullopt;
+    }
+    if (n->node_type == NodeType::BinaryExpr) {
+        const ASTNode* l = first_child(n);
+        const ASTNode* r = l != nullptr ? l->next_sibling : nullptr;
+        const auto lv = eval_const_int(l);
+        const auto rv = eval_const_int(r);
+        if (!lv || !rv) return std::nullopt;
+        const std::string_view op = n->primary_text;
+        if (op == "=" || op == "==") return *lv == *rv;
+        if (op == "<>" || op == "!=") return *lv != *rv;
+        if (op == "<") return *lv < *rv;
+        if (op == "<=") return *lv <= *rv;
+        if (op == ">") return *lv > *rv;
+        if (op == ">=") return *lv >= *rv;
+    }
+    return std::nullopt;
 }
 
 [[nodiscard]] const ColumnInfo* column_by_id(const TableInfo& t, std::uint32_t id) {
@@ -2338,6 +2421,19 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                     }
                     result = c.type;
                 }
+                // A constant division / modulo by a zero divisor is a definite
+                // error PostgreSQL folds and rejects at plan time; DB25 accepts
+                // but warns. Suppressed inside a provably-dead CASE arm (see the
+                // CaseExpr handler), so `CASE WHEN 1=0 THEN 1/0 ...` stays clean
+                // while a reachable `1/0` warns.
+                if (div0_suppress_ == 0 && (op == "/" || op == "%")) {
+                    if (const auto d = eval_const_int(rhs); d.has_value() && *d == 0) {
+                        add_diagnostic(DiagnosticCode::DivisionByZero,
+                                       std::string{"division by zero in constant '"} +
+                                           std::string{op} + "' expression",
+                                       expr, Severity::Warning);
+                    }
+                }
             }
             record_type(expr, result);
             // A binary result is nullable if either operand can be NULL - except a
@@ -2421,6 +2517,15 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             std::vector<DataType> branch_types;
             std::vector<int> branch_nulls;
             bool has_else = false;
+            // Constant-fold analysis for the division-by-zero warning: an arm
+            // whose guard is a constant FALSE is dead, and once an arm's guard is
+            // a constant TRUE every later arm (and the ELSE) is dead. A dead arm's
+            // body is still analyzed (for type reconciliation) but with div0
+            // warnings suppressed, matching PostgreSQL's plan-time CASE arm
+            // elimination.
+            ASTNode* const case_operand =
+                (simple && !children.empty()) ? children.front() : nullptr;
+            bool prior_taken = false;
             for (std::size_t i = 0; i < children.size(); ++i) {
                 ASTNode* c = children[i];
                 if (simple && i == 0) {
@@ -2440,13 +2545,32 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                            c, Severity::Warning);
                         }
                     }
+                    // Is this arm's guard a compile-time constant? For a simple
+                    // CASE the guard is `operand = value`; for a searched CASE it
+                    // is the condition itself.
+                    std::optional<bool> guard;
+                    if (simple) {
+                        const auto ov = eval_const_int(case_operand);
+                        const auto vv = eval_const_int(cond);
+                        if (ov && vv) guard = (*ov == *vv);
+                    } else {
+                        guard = eval_const_bool(cond);
+                    }
+                    const bool arm_dead =
+                        prior_taken || (guard.has_value() && !*guard);
+                    if (arm_dead) ++div0_suppress_;
                     const DataType tt = infer_expr(then_res, scope);
+                    if (arm_dead) --div0_suppress_;
                     branch_types.push_back(tt);
                     branch_nulls.push_back(null_of(then_res));
+                    if (guard.has_value() && *guard) prior_taken = true;
                 } else {
-                    // Trailing bare expression: the ELSE result.
+                    // Trailing bare expression: the ELSE result (dead once a prior
+                    // arm's guard was constant-true).
                     has_else = true;
+                    if (prior_taken) ++div0_suppress_;
                     const DataType et = infer_expr(c, scope);
+                    if (prior_taken) --div0_suppress_;
                     branch_types.push_back(et);
                     branch_nulls.push_back(null_of(c));
                 }

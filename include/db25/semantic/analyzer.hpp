@@ -245,6 +245,11 @@ private:
 
     const Catalog& catalog_;
     std::vector<Diagnostic> diagnostics_;
+    // Suppression depth for the constant division/modulo-by-zero warning: raised
+    // while analyzing a CASE arm that constant-fold analysis proves unreachable
+    // (a constant-false guard, or an arm after a constant-true guard), so a
+    // provably-dead `1/0` does not warn. See the CaseExpr / BinaryExpr handlers.
+    int div0_suppress_ = 0;
     std::unordered_map<const ASTNode*, DataType> inferred_;
     // Inferred nullability per node (parser 2-bit encoding); side mirror of
     // context.analysis.nullability.

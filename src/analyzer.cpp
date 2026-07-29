@@ -12,7 +12,10 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cstdint>
 #include <deque>
+#include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>

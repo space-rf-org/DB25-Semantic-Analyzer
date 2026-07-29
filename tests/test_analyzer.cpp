@@ -695,6 +695,66 @@ void test_cte_column_alias_count_mismatch() {
     CHECK(mismatches("WITH t(a) AS (SELECT id, name FROM users) SELECT a FROM t") == 0);
 }
 
+// A WITH RECURSIVE CTE references itself inside its own body. The analyzer
+// pre-registers the CTE (with its anchor term's column types) before analyzing
+// the body, so the recursive self-reference resolves. Regression: the CTE name
+// was registered only AFTER its body was analyzed, so `FROM t` in the recursive
+// term was a false UnresolvedTable and each recursive column a false
+// UnresolvedColumn.
+void test_recursive_cte() {
+    std::printf("test_recursive_cte\n");
+    // emp(id INT NOT NULL, name TEXT, manager_id INT) for a hierarchy walk.
+    InMemoryCatalog cat;
+    cat.add_table("emp", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                          ColumnInfo{"name", DataType::Text, /*nullable=*/true},
+                          ColumnInfo{"manager_id", DataType::Integer, /*nullable=*/true}});
+    parser::Parser p;
+
+    auto analyze = [&](const char* sql) -> Analyzer {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        return a;
+    };
+
+    // Canonical counter: valid, no diagnostics; the recursive column types from
+    // the anchor (SELECT 1 -> Integer).
+    {
+        auto res = p.parse(
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<10) "
+            "SELECT n FROM t");
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        CHECK(!a.has_errors());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* n = list != nullptr ? first_child(list) : nullptr;
+        CHECK(n != nullptr && a.type_of(n) == DataType::Integer);
+    }
+
+    // Hierarchy walk: the recursive term JOINs a base table against the CTE.
+    CHECK(!analyze(
+        "WITH RECURSIVE anc(id, manager_id) AS ("
+        "  SELECT id, manager_id FROM emp WHERE manager_id IS NULL "
+        "  UNION ALL "
+        "  SELECT e.id, e.manager_id FROM emp e JOIN anc a ON e.manager_id = a.id) "
+        "SELECT id FROM anc").has_errors());
+
+    // A recursive CTE is still union-reconciled: an anchor/recursive-term arity
+    // mismatch is reported (SetOpArityMismatch), not silently accepted.
+    CHECK(count_code(
+        analyze("WITH RECURSIVE t(a, b) AS (SELECT 1, 2 UNION ALL SELECT a FROM t) "
+                "SELECT a FROM t"),
+        DiagnosticCode::SetOpArityMismatch) == 1);
+
+    // The column-alias arity check still applies to a recursive CTE.
+    CHECK(count_code(
+        analyze("WITH RECURSIVE t(a, b, c) AS (SELECT 1 UNION ALL SELECT a+1 FROM t) "
+                "SELECT a FROM t"),
+        DiagnosticCode::ColumnAliasCountMismatch) == 1);
+}
+
 void test_unresolved_table() {
     std::printf("test_unresolved_table\n");
     auto cat = make_catalog();
@@ -4516,6 +4576,7 @@ int main() {
     test_cte_resolution();
     test_cte_setop_body();
     test_cte_column_alias_count_mismatch();
+    test_recursive_cte();
     test_unresolved_table();
 
     // SELECT * / table.* expansion

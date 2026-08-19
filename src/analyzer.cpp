@@ -101,6 +101,16 @@ constexpr std::array<std::string_view, 15> kAggregateNames = {
     if (!is_numeric(a) || !is_numeric(b)) {
         return DataType::Unknown;
     }
+    // Real (float4) has an exact operator only with itself; mixed with ANY other
+    // numeric type PostgreSQL promotes to double precision (float8) - the numeric
+    // category's preferred type - never to real. So `real + real` -> real, but
+    // `real + {int, bigint, decimal, double}` -> double. Ranking Real between
+    // Decimal and Double (as before) wrongly made `numeric + real` -> real, a
+    // narrower/lossier type than the reference.
+    if (a == DataType::Real || b == DataType::Real) {
+        return (a == b) ? DataType::Real : DataType::Double;
+    }
+    // The remaining exact/inexact numerics widen along a single ladder.
     auto rank = [](DataType t) -> int {
         switch (t) {
             case DataType::TinyInt: return 1;
@@ -108,8 +118,7 @@ constexpr std::array<std::string_view, 15> kAggregateNames = {
             case DataType::Integer: return 3;
             case DataType::BigInt: return 4;
             case DataType::Decimal: return 5;
-            case DataType::Real: return 6;
-            case DataType::Double: return 7;
+            case DataType::Double: return 6;
             default: return 0;
         }
     };
@@ -273,6 +282,22 @@ struct Coercion {
 };
 
 [[nodiscard]] Coercion coerce(DataType a, DataType b, CoercionKind kind) {
+    // Arithmetic unifies ONLY numeric operands (or NULL/Unknown). Two operands
+    // of the same non-numeric type - text + text, boolean + boolean - are a hard
+    // type error in PostgreSQL ("operator does not exist: text + text"), not a
+    // clean unification; without this guard the identical-type shortcut and the
+    // same-category (string/string) branch below would wrongly return Ok and hand
+    // a bogus result type to the binder. Temporal/interval arithmetic is resolved
+    // by temporal_arith() before coerce() is ever consulted for those operands.
+    if (kind == CoercionKind::Arithmetic) {
+        const auto arith_ok = [](DataType t) {
+            return category_of(t) == TypeCategory::Numeric ||
+                   category_of(t) == TypeCategory::Wildcard;
+        };
+        if (!arith_ok(a) || !arith_ok(b)) {
+            return {CoercionStatus::Incompatible, DataType::Unknown};
+        }
+    }
     // Identical types: trivially compatible.
     if (a == b) {
         return {CoercionStatus::Ok, a};
@@ -3142,7 +3167,35 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
     // Collect the grouping keys (their resolved identity + text).
     std::vector<GroupKey> keys;
     if (group_by != nullptr) {
+        // Flatten the GROUP BY list into its effective grouping columns. A
+        // GroupingElement (ROLLUP / CUBE / GROUPING SETS) is not itself a key -
+        // its ARGUMENT columns are the grouping columns (Postgres makes the
+        // arguments of ROLLUP()/CUBE()/GROUPING SETS() grouping columns), so
+        // descend into it (recursively, for nested GROUPING SETS) and register
+        // each argument. Without this the GroupingElement's own empty identity
+        // was taken as the key and the real columns never registered, so e.g.
+        // `SELECT dept, SUM(sal) FROM emp GROUP BY ROLLUP(dept)` wrongly flagged
+        // dept as "must appear in the GROUP BY clause".
+        std::vector<ASTNode*> effective_keys;
         for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
+            if (key->node_type == NodeType::GroupingElement) {
+                std::vector<ASTNode*> stack{key};
+                while (!stack.empty()) {
+                    ASTNode* g = stack.back();
+                    stack.pop_back();
+                    for (ASTNode* arg = first_child(g); arg != nullptr; arg = arg->next_sibling) {
+                        if (arg->node_type == NodeType::GroupingElement) {
+                            stack.push_back(arg);
+                        } else {
+                            effective_keys.push_back(arg);
+                        }
+                    }
+                }
+            } else {
+                effective_keys.push_back(key);
+            }
+        }
+        for (ASTNode* key : effective_keys) {
             // A GROUP BY key may not be (or contain) a non-windowed aggregate or
             // a window function: grouping is what PRODUCES aggregates and runs
             // before windowing, so `GROUP BY MAX(age)` / `GROUP BY RANK() OVER

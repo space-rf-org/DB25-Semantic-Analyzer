@@ -27,11 +27,17 @@ jobs:
       - name: Checkout analyzer
         uses: actions/checkout@v4
 
-      # 2. Install the compiler.
+      # 2. Install the compiler only if it is missing. ubuntu-24.04 already
+      #    ships both g++-13 and g++-14, so the blanket `apt-get update` +
+      #    install was a slow, redundant network round-trip on every run.
       - name: Install ${{ matrix.cxx }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.cxx }}
+          if command -v ${{ matrix.cxx }} >/dev/null 2>&1; then
+            echo "${{ matrix.cxx }} already present: $(${{ matrix.cxx }} --version | head -1)"
+          else
+            sudo apt-get update
+            sudo apt-get install -y ${{ matrix.cxx }}
+          fi
 
       # 3. Build + install the parser dependency (portable / non-native build:
       #    ENABLE_NATIVE is intentionally NOT passed so the binaries run on any
@@ -86,9 +92,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install g++-14
+        # Only install if missing (ubuntu-24.04 already ships g++-14); avoids a
+        # redundant apt refresh on every run.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-14
+          if command -v g++-14 >/dev/null 2>&1; then
+            echo "g++-14 already present: $(g++-14 --version | head -1)"
+          else
+            sudo apt-get update
+            sudo apt-get install -y g++-14
+          fi
 
       # Parser install stays a plain Release build (no sanitizers needed).
       - name: Build and install DB25 SQL parser

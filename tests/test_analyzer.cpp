@@ -2714,6 +2714,116 @@ void test_array_concat_typing() {
     CHECK(errs("SELECT CASE WHEN true THEN 1 ELSE 'x' END"));
 }
 
+// F2: arithmetic on two operands of the SAME non-numeric type (text, boolean)
+// is a hard type error, not a silent bogus result type. Postgres: "operator
+// does not exist: text + text". coerce()'s identical-type / same-category
+// shortcuts wrongly returned Ok under Arithmetic; only numeric (or NULL)
+// operands may unify there.
+void test_arithmetic_same_type_nonnumeric_errors() {
+    std::printf("test_arithmetic_same_type_nonnumeric_errors\n");
+    InMemoryCatalog cat;
+    cat.add_table("t", {
+        ColumnInfo{"txt", DataType::Text, /*nullable=*/false},
+        ColumnInfo{"flag", DataType::Boolean, /*nullable=*/false},
+        ColumnInfo{"n", DataType::Integer, /*nullable=*/false},
+        ColumnInfo{"d", DataType::Double, /*nullable=*/false},
+    });
+    parser::Parser p;
+    auto errs = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        return a.has_errors();
+    };
+    // Same-type non-numeric arithmetic: every operator, text and boolean.
+    CHECK(errs("SELECT txt + txt FROM t"));
+    CHECK(errs("SELECT txt - txt FROM t"));
+    CHECK(errs("SELECT txt * txt FROM t"));
+    CHECK(errs("SELECT txt / txt FROM t"));
+    CHECK(errs("SELECT txt % txt FROM t"));
+    CHECK(errs("SELECT flag + flag FROM t"));
+    CHECK(errs("SELECT flag * flag FROM t"));
+    // The diagnostic is a TypeMismatch specifically.
+    {
+        auto res = p.parse("SELECT txt + txt FROM t");
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::TypeMismatch) >= 1);
+    }
+    // Cross-category arithmetic (already an error) stays an error.
+    CHECK(errs("SELECT txt + n FROM t"));
+    // Legal numeric arithmetic stays clean, including NULL (wildcard) operands.
+    CHECK(!errs("SELECT n + n FROM t"));
+    CHECK(!errs("SELECT d + d FROM t"));
+    CHECK(!errs("SELECT n + d FROM t"));
+    CHECK(!errs("SELECT n + NULL FROM t"));
+    // `||` is string concatenation, NOT arithmetic - it must stay clean.
+    CHECK(!errs("SELECT txt || txt FROM t"));
+}
+
+// F4: numeric(Decimal) + real promotes to DOUBLE PRECISION (float8), not real.
+// real unifies exactly only with itself; mixed with any other numeric type
+// Postgres widens to double, the numeric category's preferred type.
+void test_numeric_real_promotes_double() {
+    std::printf("test_numeric_real_promotes_double\n");
+    InMemoryCatalog cat;
+    cat.add_table("nums", {
+        ColumnInfo{"dec", DataType::Decimal, /*nullable=*/false},
+        ColumnInfo{"re",  DataType::Real, /*nullable=*/false},
+        ColumnInfo{"i",   DataType::Integer, /*nullable=*/false},
+        ColumnInfo{"d",   DataType::Double, /*nullable=*/false},
+    });
+    parser::Parser p;
+    auto type1 = [&](const char* sql) -> DataType {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* it = list != nullptr ? first_child(list) : nullptr;
+        return it != nullptr ? a.type_of(it) : DataType::Unknown;
+    };
+    // numeric + real -> double (both orders).
+    CHECK(type1("SELECT dec + re FROM nums") == DataType::Double);
+    CHECK(type1("SELECT re + dec FROM nums") == DataType::Double);
+    // real mixed with integer / double -> double.
+    CHECK(type1("SELECT re + i FROM nums") == DataType::Double);
+    CHECK(type1("SELECT re + d FROM nums") == DataType::Double);
+    // real + real stays real (exact self-operator).
+    CHECK(type1("SELECT re + re FROM nums") == DataType::Real);
+    // The non-real ladder is unchanged: decimal + integer -> decimal, int -> int.
+    CHECK(type1("SELECT dec + i FROM nums") == DataType::Decimal);
+    CHECK(type1("SELECT i + i FROM nums") == DataType::Integer);
+}
+
+// F3: a grouping column nested in ROLLUP()/CUBE()/GROUPING SETS() is a real
+// grouping column, so a SELECT of it must be legal. The group-key collector
+// must descend into the GroupingElement node (Postgres makes the arguments of
+// ROLLUP/CUBE/GROUPING SETS grouping columns).
+void test_group_by_grouping_element_columns() {
+    std::printf("test_group_by_grouping_element_columns\n");
+    auto cat = make_catalog_emp();  // emp(id,name,dept,region,salary,age)
+    parser::Parser p;
+    auto ngc = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return static_cast<int>(count_code(a, DiagnosticCode::NonGroupedColumn));
+    };
+    // ROLLUP / CUBE make their argument columns grouping columns: SELECT of them
+    // is legal (was wrongly flagged "must appear in the GROUP BY clause").
+    CHECK(ngc("SELECT dept, SUM(salary) FROM emp GROUP BY ROLLUP(dept)") == 0);
+    CHECK(ngc("SELECT dept, SUM(salary) FROM emp GROUP BY CUBE(dept)") == 0);
+    CHECK(ngc("SELECT dept, region, SUM(salary) FROM emp "
+              "GROUP BY ROLLUP(dept, region)") == 0);
+    // Guard: a column NOT inside the grouping element is still non-grouped.
+    CHECK(ngc("SELECT dept, name, SUM(salary) FROM emp GROUP BY ROLLUP(dept)") == 1);
+}
+
 void test_in_value_list_coercion_warns() {
     std::printf("test_in_value_list_coercion_warns\n");
     // `x IN (value-list)` must apply the SAME cross-type comparison check as
@@ -4805,6 +4915,9 @@ int main() {
     test_nullif_cross_category_warns();
     test_case_constant_div_by_zero();
     test_array_concat_typing();
+    test_arithmetic_same_type_nonnumeric_errors();
+    test_numeric_real_promotes_double();
+    test_group_by_grouping_element_columns();
     test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();
 

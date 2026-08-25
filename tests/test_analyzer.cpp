@@ -1294,6 +1294,41 @@ void test_setop_numeric_compatible() {
     }
 }
 
+// Set-op result nullability is per-kind, not a blanket OR across branches:
+//   UNION / UNION ALL: a row can come from ANY branch -> OR.
+//   INTERSECT: a row is in EVERY branch (NULL matches NULL) -> AND.
+//   EXCEPT: rows are drawn only from the LEFT input -> the left's nullability.
+// The blanket OR wrongly marked EXCEPT/INTERSECT of a NOT-NULL left nullable.
+void test_setop_except_intersect_nullability() {
+    std::printf("test_setop_except_intersect_nullability\n");
+    InMemoryCatalog cat;
+    cat.add_table("nn", {ColumnInfo{"a", DataType::Integer, /*nullable=*/false}});
+    cat.add_table("nl", {ColumnInfo{"b", DataType::Integer, /*nullable=*/true}});
+    parser::Parser p;
+
+    auto proj0_nullable = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        const auto* proj = a.projection_of(res.value());
+        if (proj == nullptr || proj->empty()) return -1;
+        return (*proj)[0].nullable ? 1 : 0;
+    };
+
+    // EXCEPT: NOT-NULL left -> NOT NULL (was wrongly nullable via blanket OR).
+    CHECK(proj0_nullable("SELECT a FROM nn EXCEPT SELECT b FROM nl") == 0);
+    // INTERSECT: NOT-NULL left AND nullable right -> NOT NULL.
+    CHECK(proj0_nullable("SELECT a FROM nn INTERSECT SELECT b FROM nl") == 0);
+    // UNION: a row can come from either side -> nullable (unchanged).
+    CHECK(proj0_nullable("SELECT a FROM nn UNION SELECT b FROM nl") == 1);
+    // Guard: EXCEPT with a NULLABLE left stays nullable (left's nullability).
+    CHECK(proj0_nullable("SELECT b FROM nl EXCEPT SELECT a FROM nn") == 1);
+    // Guard: INTERSECT of two nullable sides stays nullable (AND).
+    CHECK(proj0_nullable("SELECT b FROM nl INTERSECT SELECT b FROM nl") == 1);
+}
+
 // Find the first FunctionCall descendant with the given name (or nullptr).
 ASTNode* find_function(ASTNode* n, std::string_view name) {
     if (n == nullptr) return nullptr;
@@ -2975,6 +3010,63 @@ void test_group_by_grouping_set_expression_nullable() {
         CHECK(r.ok);
         CHECK(r.col_null == 1);      // 1 + 2 does not read id -> stays NOT NULL
         CHECK(r.proj_null == 1);
+    }
+}
+
+// A window function's result nullability is intrinsic (RANK / ROW_NUMBER /
+// COUNT(*) OVER are never NULL). A grouping-set key appearing only in the OVER
+// clause (PARTITION BY / ORDER BY) does NOT flow into the window value, so it
+// must not be nulled by the ROLLUP/CUBE/GROUPING SETS pass - even though the
+// same key in a plain expression IS nulled.
+void test_group_by_grouping_set_window_not_nulled() {
+    std::printf("test_group_by_grouping_set_window_not_nulled\n");
+    auto cat = make_catalog_emp();  // emp(id INT NOT NULL, ..., salary DOUBLE)
+    parser::Parser p;
+
+    struct R { int col_null; int proj_null; bool ok; };
+    auto probe = [&](const char* sql, std::size_t idx) -> R {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return {-1, -1, false};
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* item = list ? first_child(list) : nullptr;
+        for (std::size_t i = 0; i < idx && item != nullptr; ++i) {
+            item = item->next_sibling;
+        }
+        const auto* proj = a.projection_of(res.value());
+        const bool have = item != nullptr && proj != nullptr && proj->size() > idx;
+        return {have ? a.nullability_of(item) : -1,
+                have ? ((*proj)[idx].nullable ? 2 : 1) : -1, have};
+    };
+
+    // A window function partitioned/ordered by the ROLLUP key stays NOT NULL.
+    const char* not_null_windows[] = {
+        "SELECT id, RANK() OVER (PARTITION BY id) FROM emp GROUP BY ROLLUP(id)",
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY id) FROM emp GROUP BY ROLLUP(id)",
+        "SELECT id, COUNT(*) OVER (PARTITION BY id) FROM emp GROUP BY CUBE(id)",
+        "SELECT id, RANK() OVER (ORDER BY id) FROM emp GROUP BY ROLLUP(id)",
+    };
+    for (const char* sql : not_null_windows) {
+        R w = probe(sql, 1);   // the window column
+        CHECK(w.ok);
+        CHECK(w.col_null == 1);   // never NULL - not nulled by the grouping set
+        CHECK(w.proj_null == 1);
+        // Guard: the bare grouping-set key column is STILL nulled (A-EXPR-NULL).
+        R k = probe(sql, 0);
+        CHECK(k.ok);
+        CHECK(k.col_null == 2);
+        CHECK(k.proj_null == 2);
+    }
+
+    // Guard: a plain expression over the key is still nulled (F3 fix is scoped to
+    // window functions, not all functions).
+    {
+        R e = probe("SELECT id, id + 0 FROM emp GROUP BY ROLLUP(id)", 1);
+        CHECK(e.ok);
+        CHECK(e.col_null == 2);
+        CHECK(e.proj_null == 2);
     }
 }
 
@@ -5124,6 +5216,7 @@ int main() {
     test_setop_arity_mismatch();
     test_setop_type_mismatch();
     test_setop_numeric_compatible();
+    test_setop_except_intersect_nullability();
 
     // GROUP BY / HAVING legality & function typing
     test_groupby_clean_count_star();
@@ -5185,6 +5278,7 @@ int main() {
     test_group_by_grouping_element_columns();
     test_group_by_grouping_set_key_nullable();
     test_group_by_grouping_set_expression_nullable();
+    test_group_by_grouping_set_window_not_nulled();
     test_quantified_comparison_boolean();
     test_row_in_subquery();
     test_in_value_list_coercion_warns();

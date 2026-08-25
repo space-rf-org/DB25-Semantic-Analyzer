@@ -3136,7 +3136,7 @@ ASTNode* Analyzer::group_key_alias_item(ASTNode* key, ASTNode* select_list,
 }
 
 void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
-                                const std::vector<ResolvedColumn>& output) {
+                                std::vector<ResolvedColumn>& output) {
 
     // An aggregate in the WHERE clause is illegal regardless of grouping:
     // aggregates are computed after the WHERE filter has selected rows, so they
@@ -3211,19 +3211,35 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                    t == NodeType::RowConstructor;
         };
         std::vector<ASTNode*> effective_keys;
-        std::vector<ASTNode*> stack;
+        // Keys reached THROUGH a GroupingElement (ROLLUP / CUBE / GROUPING SETS)
+        // are nullable in the result - see the projection re-marking below.
+        std::vector<ASTNode*> grouping_set_keys;
+        struct WorkItem {
+            ASTNode* node;
+            bool in_grouping_set;
+        };
+        std::vector<WorkItem> stack;
         for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
-            stack.push_back(key);
+            stack.push_back({key, false});
         }
         while (!stack.empty()) {
-            ASTNode* n = stack.back();
+            const WorkItem it = stack.back();
             stack.pop_back();
-            if (is_group_wrapper(n->node_type)) {
-                for (ASTNode* arg = first_child(n); arg != nullptr; arg = arg->next_sibling) {
-                    stack.push_back(arg);
+            if (is_group_wrapper(it.node->node_type)) {
+                // Only a GroupingElement introduces the super-aggregate NULL rows;
+                // a bare ColumnList / RowConstructor parenthesization (e.g.
+                // `GROUP BY (a, b)`) is just several ordinary grouping columns.
+                const bool child_in_gs =
+                    it.in_grouping_set || it.node->node_type == NodeType::GroupingElement;
+                for (ASTNode* arg = first_child(it.node); arg != nullptr;
+                     arg = arg->next_sibling) {
+                    stack.push_back({arg, child_in_gs});
                 }
             } else {
-                effective_keys.push_back(n);
+                effective_keys.push_back(it.node);
+                if (it.in_grouping_set) {
+                    grouping_set_keys.push_back(it.node);
+                }
             }
         }
         for (ASTNode* key : effective_keys) {
@@ -3297,6 +3313,37 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
             k.text = identity->primary_text;
             k.node = identity;
             keys.push_back(k);
+        }
+
+        // A grouping column that appears inside ROLLUP / CUBE / GROUPING SETS is
+        // NULL in the super-aggregate (subtotal / grand-total) rows, so it is
+        // nullable in the result even when its base column is NOT NULL (Postgres).
+        // The projection nullability was already set from the base column before
+        // analyze_grouping runs, so re-mark each grouping-set key's projection
+        // column - and its SELECT-list ColumnRef node, for nullability_of()
+        // consumers - as nullable. A plain GROUP BY key, or a bare parenthesized
+        // GROUP BY list, is NOT nulled: only a GroupingElement wrapper.
+        for (const ASTNode* gk : grouping_set_keys) {
+            const std::uint32_t tid = gk->context.analysis.table_id;
+            const std::uint32_t cid = gk->context.analysis.column_id;
+            if (tid == 0 && cid == 0) {
+                continue;  // unresolved (e.g. an expression key): nothing to mark
+            }
+            for (ResolvedColumn& oc : output) {
+                if (oc.table_id == tid && oc.column_id == cid) {
+                    oc.nullable = true;
+                }
+            }
+            if (select_list != nullptr) {
+                for (ASTNode* item = first_child(select_list); item != nullptr;
+                     item = item->next_sibling) {
+                    if (item->node_type == NodeType::ColumnRef &&
+                        item->context.analysis.table_id == tid &&
+                        item->context.analysis.column_id == cid) {
+                        record_nullability(item, 2);
+                    }
+                }
+            }
         }
     }
 

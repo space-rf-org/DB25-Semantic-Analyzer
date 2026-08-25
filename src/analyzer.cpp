@@ -2649,28 +2649,48 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             std::vector<int> nulls{null_of(left)};
             if (right != nullptr && (right->node_type == NodeType::Subquery ||
                                      right->node_type == NodeType::SubqueryExpr)) {
-                // `expr IN (subquery)`: the subquery must project exactly one
-                // column, type-compatible with the left operand.
+                // `expr IN (subquery)` (scalar) or `(a, b, ...) IN (subquery)`
+                // (row): the subquery must project as many columns as the left
+                // operand is WIDE - one for a scalar left, N for an N-element
+                // RowConstructor - and be pairwise type-compatible. Requiring
+                // exactly one column here wrongly rejected the legal row form
+                // `(a, b) IN (SELECT x, y FROM t)` (Postgres accepts it).
                 const std::vector<ResolvedColumn> proj = analyze_subquery(right, scope);
-                if (proj.size() != 1) {
+                std::vector<ASTNode*> row_elems;
+                if (left != nullptr && left->node_type == NodeType::RowConstructor) {
+                    for (ASTNode* c = first_child(left); c != nullptr; c = c->next_sibling) {
+                        row_elems.push_back(c);
+                    }
+                }
+                const std::size_t lhs_width = row_elems.empty() ? 1 : row_elems.size();
+                if (proj.size() != lhs_width) {
                     add_diagnostic(DiagnosticCode::InSubqueryColumns,
                                    "subquery on the right of IN projects " +
-                                       std::to_string(proj.size()) +
-                                       " columns; exactly one is required",
+                                       std::to_string(proj.size()) + " columns; " +
+                                       std::to_string(lhs_width) + " required",
                                    expr);
-                    nulls.push_back(2);  // shape unknown: conservatively nullable
+                    nulls.push_back(2);  // shape mismatch: conservatively nullable
                 } else {
-                    const Coercion c = coerce(lt, proj.front().type,
-                                              CoercionKind::Comparison);
-                    if (c.status != CoercionStatus::Ok) {
-                        add_diagnostic(DiagnosticCode::ImplicitCoercion,
-                                       "implicit coercion between IN operand and "
-                                       "subquery column of a different type category",
-                                       expr, Severity::Warning);
+                    // Pairwise type compatibility (one warning per IN, matching
+                    // the sibling comparison paths). For a scalar left the single
+                    // element type is `lt`; for a row it is each element's type.
+                    bool coercion_warned = false;
+                    for (std::size_t i = 0; i < proj.size(); ++i) {
+                        const DataType et =
+                            row_elems.empty() ? lt : infer_expr(row_elems[i], scope);
+                        if (!coercion_warned &&
+                            coerce(et, proj[i].type, CoercionKind::Comparison).status !=
+                                CoercionStatus::Ok) {
+                            add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                                           "implicit coercion between IN operand and "
+                                           "subquery column of a different type category",
+                                           expr, Severity::Warning);
+                            coercion_warned = true;
+                        }
+                        // A NULL in any projected column makes a non-matching row
+                        // yield NULL rather than FALSE.
+                        nulls.push_back(proj[i].nullable ? 2 : 1);
                     }
-                    // A NULL in the projected column makes a non-matching row
-                    // yield NULL rather than FALSE.
-                    nulls.push_back(proj.front().nullable ? 2 : 1);
                 }
             } else {
                 // `expr IN (list)`: infer each list element (resolves columns),

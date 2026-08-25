@@ -125,6 +125,24 @@ constexpr std::array<std::string_view, 15> kAggregateNames = {
     return rank(a) >= rank(b) ? a : b;
 }
 
+// Common type for a RECONCILIATION context - UNION/INTERSECT/EXCEPT, VALUES,
+// CASE, COALESCE/GREATEST/LEAST - which is Postgres's select_common_type(), NOT
+// arithmetic operator resolution. It differs from promote_numeric() only for
+// REAL: real coerces implicitly to double but not to an exact numeric, so real
+// reconciled with {int, bigint, smallint, tinyint, decimal} stays REAL, and only
+// real-vs-double (or real-vs-real) yields double / real. Reusing the arithmetic
+// real->double rule here wrongly typed `real UNION int` (etc.) as double.
+[[nodiscard]] DataType promote_numeric_reconcile(DataType a, DataType b) {
+    if (!is_numeric(a) || !is_numeric(b)) {
+        return DataType::Unknown;
+    }
+    if (a == DataType::Real || b == DataType::Real) {
+        const DataType other = (a == DataType::Real) ? b : a;
+        return (other == DataType::Double) ? DataType::Double : DataType::Real;
+    }
+    return promote_numeric(a, b);  // exact / double ladder is unchanged
+}
+
 [[nodiscard]] bool is_comparison_op(std::string_view op) {
     return op == "=" || op == "==" || op == "<>" || op == "!=" || op == "<" ||
            op == ">" || op == "<=" || op == ">=";
@@ -330,8 +348,14 @@ struct Coercion {
     const TypeCategory ca = category_of(a);
     const TypeCategory cb = category_of(b);
     // Numeric promotion: Integer < BigInt < Decimal < Double (see promote_numeric).
+    // Reconciliation contexts (UNION / VALUES / CASE / COALESCE / ...) use the
+    // select_common_type rule, which keeps REAL against an exact numeric rather
+    // than widening to double as arithmetic does.
     if (ca == TypeCategory::Numeric && cb == TypeCategory::Numeric) {
-        return {CoercionStatus::Ok, promote_numeric(a, b)};
+        const DataType t = (kind == CoercionKind::UnionReconcile)
+                               ? promote_numeric_reconcile(a, b)
+                               : promote_numeric(a, b);
+        return {CoercionStatus::Ok, t};
     }
     // char / varchar / text collapse to text.
     if (ca == TypeCategory::String && cb == TypeCategory::String) {

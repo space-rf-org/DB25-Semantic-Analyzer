@@ -1329,6 +1329,42 @@ void test_setop_except_intersect_nullability() {
     CHECK(proj0_nullable("SELECT b FROM nl INTERSECT SELECT b FROM nl") == 1);
 }
 
+// A reconciliation context (UNION/INTERSECT/EXCEPT, VALUES, CASE, COALESCE/
+// GREATEST/LEAST) uses Postgres's select_common_type, NOT arithmetic promotion:
+// REAL reconciled with an exact numeric (int/bigint/smallint/decimal) stays REAL,
+// widening to DOUBLE only against DOUBLE. Arithmetic still widens real+int to
+// double.
+void test_reconcile_real_keeps_real() {
+    std::printf("test_reconcile_real_keeps_real\n");
+    InMemoryCatalog cat;
+    cat.add_table("t", {ColumnInfo{"r", DataType::Real, true},
+                        ColumnInfo{"i", DataType::Integer, true},
+                        ColumnInfo{"d", DataType::Double, true},
+                        ColumnInfo{"bb", DataType::Boolean, true}});
+    parser::Parser p;
+    auto out0 = [&](const char* sql) -> DataType {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return DataType::Unknown;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        const auto* proj = a.projection_of(res.value());
+        return (proj != nullptr && !proj->empty()) ? (*proj)[0].type : DataType::Unknown;
+    };
+    // REAL reconciled with an exact numeric stays REAL (was Double), both orders.
+    CHECK(out0("SELECT r FROM t UNION SELECT i FROM t") == DataType::Real);
+    CHECK(out0("SELECT i FROM t UNION SELECT r FROM t") == DataType::Real);
+    CHECK(out0("SELECT COALESCE(r, i) FROM t") == DataType::Real);
+    CHECK(out0("SELECT GREATEST(r, i) FROM t") == DataType::Real);
+    CHECK(out0("SELECT CASE WHEN bb THEN r ELSE i END FROM t") == DataType::Real);
+    // REAL vs DOUBLE still widens to DOUBLE (real coerces to double).
+    CHECK(out0("SELECT r FROM t UNION SELECT d FROM t") == DataType::Double);
+    // Guard: ARITHMETIC is unchanged - real + int -> double.
+    CHECK(out0("SELECT r + i FROM t") == DataType::Double);
+    // Guard: exact-only reconcile unchanged - int UNION decimal ladder still widens.
+    CHECK(out0("SELECT i FROM t UNION SELECT d FROM t") == DataType::Double);
+}
+
 // Find the first FunctionCall descendant with the given name (or nullptr).
 ASTNode* find_function(ASTNode* n, std::string_view name) {
     if (n == nullptr) return nullptr;
@@ -5287,6 +5323,7 @@ int main() {
     test_setop_type_mismatch();
     test_setop_numeric_compatible();
     test_setop_except_intersect_nullability();
+    test_reconcile_real_keeps_real();
 
     // GROUP BY / HAVING legality & function typing
     test_groupby_clean_count_star();

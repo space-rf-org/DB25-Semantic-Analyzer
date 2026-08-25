@@ -1777,7 +1777,20 @@ std::vector<ResolvedColumn> Analyzer::analyze_setop(ASTNode* setop, Scope* paren
                                setop);
             }
             result[j].type = r.type;      // reconciled output type
-            result[j].nullable = result[j].nullable || branch[j].nullable;
+            // Nullability depends on the set-op kind:
+            //   UNION / UNION ALL: a result row comes from ANY branch, so the
+            //     column is nullable if ANY branch's is (OR).
+            //   INTERSECT: a result row is present in EVERY branch (NULL matches
+            //     NULL), so the column is NULL only when NULL is in all branches
+            //     (AND) - a NOT-NULL branch makes the result NOT NULL.
+            //   EXCEPT: result rows are drawn only from the LEFT input, so the
+            //     column keeps the LEFT (accumulated) branch's nullability; the
+            //     right branches do not contribute.
+            if (setop->node_type == NodeType::IntersectStmt) {
+                result[j].nullable = result[j].nullable && branch[j].nullable;
+            } else if (setop->node_type != NodeType::ExceptStmt) {
+                result[j].nullable = result[j].nullable || branch[j].nullable;
+            }
         }
     }
 
@@ -3565,13 +3578,22 @@ bool Analyzer::expr_reads_grouping_key(
 
     if (expr->node_type == NodeType::FunctionCall ||
         expr->node_type == NodeType::FunctionExpr) {
+        // A window function's result nullability is INTRINSIC (set by
+        // window_function_nullability during inference): RANK / ROW_NUMBER /
+        // DENSE_RANK / COUNT(*) OVER / ... are never NULL, and the value-returning
+        // ones (LAG / FIRST_VALUE / ...) are already nullable. A grouping-set key
+        // appearing only in the window's arguments or its OVER (PARTITION BY /
+        // ORDER BY) does NOT flow into the window value in the super-aggregate
+        // rows, so it must not null the result. Stop here - do not descend into a
+        // windowed call.
+        if (has_window_spec(expr)) {
+            return false;
+        }
         // A plain aggregate reads the raw input rows, where the grouping key is
-        // present - so a key read INSIDE it is not nulled. A window function runs
-        // after grouping and a non-aggregate call is transparent, so both keep the
-        // current context (mirrors check_grouping_expr's aggregate tracking).
-        const bool windowed = has_window_spec(expr);
-        const bool is_agg = !windowed && is_aggregate_name(to_upper(expr->primary_text));
-        const bool child_in_aggregate = is_agg ? true : (windowed ? false : in_aggregate);
+        // present - so a key read INSIDE it is not nulled. A non-aggregate call is
+        // transparent and keeps the current context (mirrors check_grouping_expr).
+        const bool is_agg = is_aggregate_name(to_upper(expr->primary_text));
+        const bool child_in_aggregate = is_agg ? true : in_aggregate;
         for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
             if (expr_reads_grouping_key(c, keys, child_in_aggregate)) {
                 return true;

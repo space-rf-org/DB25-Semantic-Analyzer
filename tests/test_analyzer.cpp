@@ -2820,8 +2820,22 @@ void test_group_by_grouping_element_columns() {
     CHECK(ngc("SELECT dept, SUM(salary) FROM emp GROUP BY CUBE(dept)") == 0);
     CHECK(ngc("SELECT dept, region, SUM(salary) FROM emp "
               "GROUP BY ROLLUP(dept, region)") == 0);
-    // Guard: a column NOT inside the grouping element is still non-grouped.
+    // PARENTHESIZED grouping members: a column wrapped in a ColumnList (a
+    // GROUPING SETS member) or a RowConstructor (a parenthesized element or a
+    // bare parenthesized GROUP BY list) is still a grouping column. The flatten
+    // must descend through those wrappers, not just GroupingElement.
+    CHECK(ngc("SELECT dept, region, SUM(salary) FROM emp "
+              "GROUP BY GROUPING SETS ((dept), (region))") == 0);
+    CHECK(ngc("SELECT dept, SUM(salary) FROM emp "
+              "GROUP BY GROUPING SETS ((dept))") == 0);
+    CHECK(ngc("SELECT dept, region, SUM(salary) FROM emp "
+              "GROUP BY ROLLUP((dept, region))") == 0);
+    CHECK(ngc("SELECT dept, region FROM emp GROUP BY (dept, region)") == 0);
+    // Guard: a column NOT inside the grouping element is still non-grouped -
+    // including alongside a parenthesized member.
     CHECK(ngc("SELECT dept, name, SUM(salary) FROM emp GROUP BY ROLLUP(dept)") == 1);
+    CHECK(ngc("SELECT dept, name, SUM(salary) FROM emp "
+              "GROUP BY GROUPING SETS ((dept))") == 1);
 }
 
 void test_in_value_list_coercion_warns() {

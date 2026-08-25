@@ -3176,23 +3176,34 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
         // was taken as the key and the real columns never registered, so e.g.
         // `SELECT dept, SUM(sal) FROM emp GROUP BY ROLLUP(dept)` wrongly flagged
         // dept as "must appear in the GROUP BY clause".
+        // Flatten the GROUP BY list into its effective grouping columns. A key
+        // may be wrapped in one or more of: a GroupingElement (ROLLUP / CUBE /
+        // GROUPING SETS), a ColumnList (a parenthesized GROUPING SETS member,
+        // e.g. `GROUPING SETS ((dept), (region))`), or a RowConstructor (a
+        // parenthesized element/list, e.g. `ROLLUP((dept, region))` or a bare
+        // `GROUP BY (dept, region)`). Postgres makes every column inside any such
+        // wrapper a grouping column, so descend through all of them (recursively,
+        // via the worklist) and register the leaf argument nodes as keys. Without
+        // this a wrapper node's own empty identity was taken as the key and the
+        // real columns were never registered - a spurious NonGroupedColumn error.
+        const auto is_group_wrapper = [](NodeType t) {
+            return t == NodeType::GroupingElement || t == NodeType::ColumnList ||
+                   t == NodeType::RowConstructor;
+        };
         std::vector<ASTNode*> effective_keys;
+        std::vector<ASTNode*> stack;
         for (ASTNode* key = first_child(group_by); key != nullptr; key = key->next_sibling) {
-            if (key->node_type == NodeType::GroupingElement) {
-                std::vector<ASTNode*> stack{key};
-                while (!stack.empty()) {
-                    ASTNode* g = stack.back();
-                    stack.pop_back();
-                    for (ASTNode* arg = first_child(g); arg != nullptr; arg = arg->next_sibling) {
-                        if (arg->node_type == NodeType::GroupingElement) {
-                            stack.push_back(arg);
-                        } else {
-                            effective_keys.push_back(arg);
-                        }
-                    }
+            stack.push_back(key);
+        }
+        while (!stack.empty()) {
+            ASTNode* n = stack.back();
+            stack.pop_back();
+            if (is_group_wrapper(n->node_type)) {
+                for (ASTNode* arg = first_child(n); arg != nullptr; arg = arg->next_sibling) {
+                    stack.push_back(arg);
                 }
             } else {
-                effective_keys.push_back(key);
+                effective_keys.push_back(n);
             }
         }
         for (ASTNode* key : effective_keys) {

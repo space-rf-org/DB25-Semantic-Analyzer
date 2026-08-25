@@ -180,6 +180,21 @@ public:
         return nullptr;
     }
 
+    // Mutable lookup: used to widen a recursive CTE's column nullability with the
+    // reconciled recursive-term nullability, which is known only after the body
+    // is analyzed (and the CTE was already registered so the self-reference could
+    // resolve).
+    [[nodiscard]] NamedRelation* find_cte_mutable(std::string_view name) {
+        for (Scope* s = this; s != nullptr; s = s->parent_) {
+            for (auto& c : s->ctes_) {
+                if (iequals(c.name, name)) {
+                    return &c;
+                }
+            }
+        }
+        return nullptr;
+    }
+
     // Resolve `qualifier.column`. Only relations reachable from this scope
     // outward are considered.
     [[nodiscard]] ColumnResolution resolve_qualified(std::string_view qualifier,

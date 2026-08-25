@@ -1552,6 +1552,23 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
                             def);
                     }
                 }
+                // The recursive CTE's output column is the UNION of the anchor and
+                // the recursive term, so its NULLABILITY is the OR of both (rows
+                // are drawn from both terms; a NULL-producing recursive term makes
+                // the column nullable). The CTE was registered with anchor-only
+                // nullability BEFORE the body could be analyzed (the self-reference
+                // must resolve against it first), so widen the registered columns
+                // now with the reconciled body nullability - otherwise an outer
+                // reference sees NOT NULL for a value that can be NULL. Types /
+                // names stay anchor-fixed; only nullability widens.
+                if (NamedRelation* reg = scope.find_cte_mutable(cte_name)) {
+                    for (std::size_t i = 0;
+                         i < reg->columns.size() && i < body_cols.size(); ++i) {
+                        if (body_cols[i].nullable) {
+                            reg->columns[i].nullable = true;
+                        }
+                    }
+                }
                 continue;
             }
 

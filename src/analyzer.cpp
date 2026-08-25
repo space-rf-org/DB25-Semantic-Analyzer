@@ -1540,12 +1540,18 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     // 3. SELECT list: resolve/ infer each projected item and build the output
     //    column list (used when this block is a derived table or CTE body).
     std::vector<ResolvedColumn> output;
+    // The SELECT-list node that produced each output column, aligned 1:1 with
+    // `output` (nullptr for `*`-expanded columns, which have no single source
+    // expression). analyze_grouping uses this to re-mark expression columns that
+    // read a ROLLUP/CUBE/GROUPING SETS key as nullable.
+    std::vector<ASTNode*> output_sources;
     if (ASTNode* select_list = find_child(select_stmt, NodeType::SelectList)) {
         for (ASTNode* item = first_child(select_list); item != nullptr;
              item = item->next_sibling) {
             if (item->node_type == NodeType::Star) {
                 // `*` / `table.*` -> concrete columns in FROM/JOIN order.
                 expand_star(item, scope, output);
+                output_sources.resize(output.size(), nullptr);
                 continue;
             }
             const DataType type = infer_expr(item, scope);
@@ -1572,6 +1578,7 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
                 out.column_id = item->context.analysis.column_id;
             }
             output.push_back(std::move(out));
+            output_sources.push_back(item);
         }
     }
 
@@ -1653,7 +1660,7 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     }
 
     // 9. Aggregate / GROUP BY / HAVING legality (validation pass).
-    analyze_grouping(select_stmt, group_by, scope, output);
+    analyze_grouping(select_stmt, group_by, scope, output, output_sources);
 
     projections_[select_stmt] = output;
     return output;
@@ -3136,7 +3143,8 @@ ASTNode* Analyzer::group_key_alias_item(ASTNode* key, ASTNode* select_list,
 }
 
 void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
-                                std::vector<ResolvedColumn>& output) {
+                                std::vector<ResolvedColumn>& output,
+                                const std::vector<ASTNode*>& output_sources) {
 
     // An aggregate in the WHERE clause is illegal regardless of grouping:
     // aggregates are computed after the WHERE filter has selected rows, so they
@@ -3316,32 +3324,43 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
         }
 
         // A grouping column that appears inside ROLLUP / CUBE / GROUPING SETS is
-        // NULL in the super-aggregate (subtotal / grand-total) rows, so it is
-        // nullable in the result even when its base column is NOT NULL (Postgres).
-        // The projection nullability was already set from the base column before
-        // analyze_grouping runs, so re-mark each grouping-set key's projection
-        // column - and its SELECT-list ColumnRef node, for nullability_of()
-        // consumers - as nullable. A plain GROUP BY key, or a bare parenthesized
-        // GROUP BY list, is NOT nulled: only a GroupingElement wrapper.
-        for (const ASTNode* gk : grouping_set_keys) {
-            const std::uint32_t tid = gk->context.analysis.table_id;
-            const std::uint32_t cid = gk->context.analysis.column_id;
-            if (tid == 0 && cid == 0) {
-                continue;  // unresolved (e.g. an expression key): nothing to mark
-            }
-            for (ResolvedColumn& oc : output) {
-                if (oc.table_id == tid && oc.column_id == cid) {
-                    oc.nullable = true;
+        // NULL in the super-aggregate (subtotal / grand-total) rows, so it - and
+        // any SELECT-list expression that READS it outside an aggregate - is
+        // nullable in the result even when the base column is NOT NULL (Postgres).
+        // The projection / node nullability was set from the base column before
+        // analyze_grouping runs, so re-mark here. A plain GROUP BY key, or a bare
+        // parenthesized GROUP BY list, is NOT nulled: only a GroupingElement.
+        if (!grouping_set_keys.empty()) {
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> gs_ids;
+            for (const ASTNode* gk : grouping_set_keys) {
+                const std::uint32_t tid = gk->context.analysis.table_id;
+                const std::uint32_t cid = gk->context.analysis.column_id;
+                if (tid == 0 && cid == 0) {
+                    continue;  // unresolved / expression key: no column identity
+                }
+                gs_ids.emplace_back(tid, cid);
+                // (a) A `*`-expanded output column of the key (which has no single
+                //     source node) is nulled by base-column identity; the
+                //     expression pass below covers every column with a source node.
+                for (ResolvedColumn& oc : output) {
+                    if (oc.table_id == tid && oc.column_id == cid) {
+                        oc.nullable = true;
+                    }
                 }
             }
-            if (select_list != nullptr) {
-                for (ASTNode* item = first_child(select_list); item != nullptr;
-                     item = item->next_sibling) {
-                    if (item->node_type == NodeType::ColumnRef &&
-                        item->context.analysis.table_id == tid &&
-                        item->context.analysis.column_id == cid) {
-                        record_nullability(item, 2);
-                    }
+            // (b) Any SELECT-list column whose source expression reads a
+            //     grouping-set key outside an aggregate - a bare `key`, `key + 0`,
+            //     `key || 'x'`, `CASE key ...` - is nullable. Aggregates over the
+            //     key (`SUM(key)`) are NOT: they read the present raw value.
+            for (std::size_t i = 0; i < output.size() && i < output_sources.size();
+                 ++i) {
+                ASTNode* src = output_sources[i];
+                if (src == nullptr) {
+                    continue;  // `*`-expanded: handled by identity match in (a)
+                }
+                if (expr_reads_grouping_key(src, gs_ids, /*in_aggregate=*/false)) {
+                    output[i].nullable = true;
+                    record_nullability(src, 2);
                 }
             }
         }
@@ -3481,6 +3500,65 @@ void Analyzer::check_grouping_expr(ASTNode* expr, const std::vector<GroupKey>& k
     for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
         check_grouping_expr(c, keys, grouping_exempt, in_aggregate);
     }
+}
+
+bool Analyzer::expr_reads_grouping_key(
+    ASTNode* expr,
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>>& keys,
+    bool in_aggregate) {
+    if (expr == nullptr || keys.empty()) {
+        return false;
+    }
+    if (expr_depth_ >= kMaxExprDepth) {
+        return false;  // over-deep: infer_expr already reported it.
+    }
+    const DepthGuard depth_guard{expr_depth_};
+
+    // A nested subquery is its own query block; a correlated reference to this
+    // block's grouping key inside it is that block's concern, not this column's
+    // nullability. (Mirrors check_grouping_expr's boundary.)
+    if (expr->node_type == NodeType::Subquery ||
+        expr->node_type == NodeType::SubqueryExpr) {
+        return false;
+    }
+
+    if (expr->node_type == NodeType::FunctionCall ||
+        expr->node_type == NodeType::FunctionExpr) {
+        // A plain aggregate reads the raw input rows, where the grouping key is
+        // present - so a key read INSIDE it is not nulled. A window function runs
+        // after grouping and a non-aggregate call is transparent, so both keep the
+        // current context (mirrors check_grouping_expr's aggregate tracking).
+        const bool windowed = has_window_spec(expr);
+        const bool is_agg = !windowed && is_aggregate_name(to_upper(expr->primary_text));
+        const bool child_in_aggregate = is_agg ? true : (windowed ? false : in_aggregate);
+        for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
+            if (expr_reads_grouping_key(c, keys, child_in_aggregate)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (is_column_ref_node(expr->node_type)) {
+        if (in_aggregate) {
+            return false;
+        }
+        const std::uint32_t tid = expr->context.analysis.table_id;
+        const std::uint32_t cid = expr->context.analysis.column_id;
+        for (const auto& [ktid, kcid] : keys) {
+            if (ktid == tid && kcid == cid) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
+        if (expr_reads_grouping_key(c, keys, in_aggregate)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace db25::semantic

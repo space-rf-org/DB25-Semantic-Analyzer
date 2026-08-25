@@ -2319,6 +2319,26 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             record_nullability(expr, 2);
             return DataType::Null;
 
+        case NodeType::IntervalLiteral:
+            // `INTERVAL '1 day'` - a non-null Interval constant. (Was left
+            // Unknown, which could mis-reconcile in set-ops / CASE / arithmetic.)
+            record_type(expr, DataType::Interval);
+            record_nullability(expr, 1);
+            return DataType::Interval;
+
+        case NodeType::DateTimeLiteral: {
+            // `DATE '...'` / `TIME '...'` / `TIMESTAMP '...'` - a non-null temporal
+            // constant. The parser tags the node with its concrete type; default
+            // to Timestamp if it is somehow unset.
+            DataType t = expr->data_type;
+            if (t != DataType::Date && t != DataType::Time && t != DataType::Timestamp) {
+                t = DataType::Timestamp;
+            }
+            record_type(expr, t);
+            record_nullability(expr, 1);
+            return t;
+        }
+
         case NodeType::ColumnRef:
         // A bare column that is the direct argument of a function call is emitted
         // as an Identifier; resolve it the same way as a ColumnRef.

@@ -2838,6 +2838,50 @@ void test_group_by_grouping_element_columns() {
               "GROUP BY GROUPING SETS ((dept))") == 1);
 }
 
+// A row-valued `IN (subquery)` - `(a, b) IN (SELECT x, y FROM t)` - is legal
+// when the subquery's arity matches the row width; the arity check must compare
+// against the LHS row width, not a hard-coded 1.
+void test_row_in_subquery() {
+    std::printf("test_row_in_subquery\n");
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"name", DataType::Text, /*nullable=*/true}});
+    cat.add_table("sessions", {ColumnInfo{"user_id", DataType::Integer, /*nullable=*/false},
+                               ColumnInfo{"token", DataType::Text, /*nullable=*/true}});
+    parser::Parser p;
+    auto errs = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        return a.has_errors();
+    };
+    auto ncode = [&](const char* sql, DiagnosticCode code) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        return count_code(a, code);
+    };
+    // Row-valued IN over a matching-arity, type-compatible subquery is legal.
+    CHECK(!errs("SELECT id FROM users WHERE (id, name) IN "
+                "(SELECT user_id, token FROM sessions)"));
+    // Scalar IN is unaffected.
+    CHECK(!errs("SELECT id FROM users WHERE id IN (SELECT user_id FROM sessions)"));
+    // Arity mismatch still errors, both directions.
+    CHECK(ncode("SELECT id FROM users WHERE (id, name) IN "
+                "(SELECT user_id FROM sessions)", DiagnosticCode::InSubqueryColumns) == 1);
+    CHECK(ncode("SELECT id FROM users WHERE id IN "
+                "(SELECT user_id, token FROM sessions)", DiagnosticCode::InSubqueryColumns) == 1);
+    // A pairwise type mismatch is a soft ImplicitCoercion warning, not a hard
+    // error (id INT vs token TEXT).
+    CHECK(!errs("SELECT id FROM users WHERE (id, name) IN "
+                "(SELECT token, user_id FROM sessions)"));
+    CHECK(ncode("SELECT id FROM users WHERE (id, name) IN "
+                "(SELECT token, user_id FROM sessions)",
+                DiagnosticCode::ImplicitCoercion) == 1);
+}
+
 void test_in_value_list_coercion_warns() {
     std::printf("test_in_value_list_coercion_warns\n");
     // `x IN (value-list)` must apply the SAME cross-type comparison check as
@@ -4932,6 +4976,7 @@ int main() {
     test_arithmetic_same_type_nonnumeric_errors();
     test_numeric_real_promotes_double();
     test_group_by_grouping_element_columns();
+    test_row_in_subquery();
     test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();
 

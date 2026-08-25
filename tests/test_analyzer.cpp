@@ -795,6 +795,43 @@ void test_recursive_cte() {
         DiagnosticCode::UnresolvedColumn) == 1);
 }
 
+// A recursive CTE's output nullability is the UNION (OR) of the anchor and the
+// recursive term. The CTE is registered with anchor-only nullability so the
+// self-reference can resolve; the recursive term's nullability must then be
+// widened back in - else a NULL-producing recursive term is reported NOT NULL
+// (the unsafe direction: a consumer could drop a needed NULL check).
+void test_recursive_cte_nullability() {
+    std::printf("test_recursive_cte_nullability\n");
+    InMemoryCatalog cat;
+    cat.add_table("nums", {ColumnInfo{"i", DataType::Integer, /*nullable=*/false},
+                           ColumnInfo{"ni", DataType::Integer, /*nullable=*/true}});
+    parser::Parser p;
+    auto proj0_nullable = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        const auto* proj = a.projection_of(res.value());
+        if (proj == nullptr || proj->empty()) return -1;
+        return (*proj)[0].nullable ? 1 : 0;
+    };
+    // Recursive term projects the nullable column -> CTE column is nullable
+    // (was wrongly reported NOT NULL).
+    CHECK(proj0_nullable(
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL "
+        "SELECT ni FROM nums JOIN t ON t.n = nums.i) SELECT n FROM t") == 1);
+    // Guard: both terms NOT NULL -> NOT NULL.
+    CHECK(proj0_nullable(
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL "
+        "SELECT i FROM nums JOIN t ON t.n = nums.i) SELECT n FROM t") == 0);
+    // Guard: a nullable ANCHOR still makes it nullable (the anchor path already
+    // worked; this pins that the widening does not regress it).
+    CHECK(proj0_nullable(
+        "WITH RECURSIVE t(n) AS (SELECT ni FROM nums UNION ALL "
+        "SELECT 1 FROM t WHERE t.n < 10) SELECT n FROM t") == 1);
+}
+
 void test_unresolved_table() {
     std::printf("test_unresolved_table\n");
     auto cat = make_catalog();
@@ -5290,6 +5327,7 @@ int main() {
     test_cte_setop_body();
     test_cte_column_alias_count_mismatch();
     test_recursive_cte();
+    test_recursive_cte_nullability();
     test_unresolved_table();
 
     // SELECT * / table.* expansion

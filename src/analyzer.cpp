@@ -138,6 +138,24 @@ constexpr std::array<std::string_view, 15> kAggregateNames = {
     return op == "IS DISTINCT FROM" || op == "IS NOT DISTINCT FROM";
 }
 
+// A quantified comparison `x <cmp> ALL|ANY|SOME (subquery|array)`. The parser
+// packs the quantifier into the operator text - "> ALL", ">= ALL", "= ANY",
+// "<> ALL", "= SOME", ... - as a single BinaryExpr op (see parser
+// test_subqueries.cpp AnyOperator). It is boolean-valued in SQL / PostgreSQL
+// (SOME is a synonym for ANY). The leading token before the quantifier must be
+// an ordinary comparison operator.
+[[nodiscard]] bool is_quantified_comparison_op(std::string_view op) {
+    const std::size_t sp = op.rfind(' ');
+    if (sp == std::string_view::npos) {
+        return false;
+    }
+    const std::string_view quant = op.substr(sp + 1);
+    if (quant != "ALL" && quant != "ANY" && quant != "SOME") {
+        return false;
+    }
+    return is_comparison_op(op.substr(0, sp));
+}
+
 [[nodiscard]] bool is_logical_op(std::string_view op) {
     return op == "AND" || op == "OR" || op == "and" || op == "or";
 }
@@ -2418,6 +2436,29 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                    "implicit coercion in IS [NOT] DISTINCT FROM between "
                                    "operands of different type categories",
                                    expr, Severity::Warning);
+                }
+                result = DataType::Boolean;
+            } else if (is_quantified_comparison_op(op)) {
+                // `x <cmp> ALL|ANY|SOME (subquery|array)` is boolean. The right
+                // operand was already analyzed above: a single-column subquery
+                // yields its column type via the scalar-subquery path (which also
+                // flags a multi-column subquery - ALL/ANY require one column); an
+                // ARRAY / array constructor yields Array/Unknown. Apply the same
+                // cross-category coercion warning as a plain comparison when the
+                // right side has a concrete scalar type, and skip it for an
+                // array/unknown RHS where there is no single element type to
+                // compare against. Typing this Boolean (it was left Unknown with
+                // NO diagnostic) stops the analyzer handing the binder an
+                // analyze-clean but mis-typed predicate.
+                if (rt != DataType::Array && rt != DataType::Unknown &&
+                    lt != DataType::Unknown) {
+                    const Coercion c = coerce(lt, rt, CoercionKind::Comparison);
+                    if (c.status != CoercionStatus::Ok) {
+                        add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                                       "implicit coercion in quantified comparison "
+                                       "between operands of different type categories",
+                                       expr, Severity::Warning);
+                    }
                 }
                 result = DataType::Boolean;
             } else if (is_logical_op(op)) {

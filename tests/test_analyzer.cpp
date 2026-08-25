@@ -2978,6 +2978,73 @@ void test_group_by_grouping_set_expression_nullable() {
     }
 }
 
+// A quantified comparison `x <cmp> ALL|ANY|SOME (subquery)` is boolean-valued.
+// The parser packs the quantifier into the operator text ("> ALL", "= ANY",
+// ...); the analyzer once had no branch for it, so it typed the predicate
+// Unknown with NO diagnostic (analyze-clean) and the binder then rejected the
+// whole legal query. It must type Boolean, run the single-column subquery check,
+// and warn on a cross-category comparison.
+void test_quantified_comparison_boolean() {
+    std::printf("test_quantified_comparison_boolean\n");
+    auto cat = make_catalog_emp();  // emp(id INT NOT NULL, name TEXT, ..., salary DOUBLE)
+    parser::Parser p;
+
+    // Type of the WHERE predicate, or Unknown if it could not be located.
+    auto pred_type = [&](const char* sql) -> DataType {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return DataType::Unknown;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* where = find_child(res.value(), NodeType::WhereClause);
+        ASTNode* pred = where ? first_child(where) : nullptr;
+        return pred ? a.type_of(pred) : DataType::Unknown;
+    };
+    auto clean = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return false;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return !a.has_errors();
+    };
+    auto ncode = [&](const char* sql, DiagnosticCode code) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return static_cast<int>(count_code(a, code));
+    };
+
+    // Every quantifier / comparison combination types Boolean and analyzes clean
+    // (same-type, same-category operands -> no coercion warning).
+    const char* boolean_forms[] = {
+        "SELECT id FROM emp WHERE salary > ALL (SELECT salary FROM emp)",
+        "SELECT id FROM emp WHERE salary > ANY (SELECT salary FROM emp)",
+        "SELECT id FROM emp WHERE salary = SOME (SELECT salary FROM emp)",
+        "SELECT id FROM emp WHERE salary >= ALL (SELECT salary FROM emp)",
+        "SELECT id FROM emp WHERE salary <> ANY (SELECT salary FROM emp)",
+        "SELECT id FROM emp e WHERE id < ALL (SELECT age FROM emp)",
+    };
+    for (const char* sql : boolean_forms) {
+        CHECK(pred_type(sql) == DataType::Boolean);
+        CHECK(clean(sql));
+    }
+
+    // Single-column enforcement: a multi-column subquery on the right of a
+    // quantified comparison is rejected (ALL/ANY require exactly one column).
+    CHECK(ncode("SELECT id FROM emp WHERE salary > ALL (SELECT id, salary FROM emp)",
+                DiagnosticCode::ScalarSubqueryColumns) == 1);
+
+    // A cross-category comparison (TEXT vs INTEGER) is still typed Boolean but
+    // warns - matching the plain-comparison path.
+    CHECK(pred_type("SELECT id FROM emp WHERE name > ALL (SELECT id FROM emp)") ==
+          DataType::Boolean);
+    CHECK(ncode("SELECT id FROM emp WHERE name > ALL (SELECT id FROM emp)",
+                DiagnosticCode::ImplicitCoercion) == 1);
+}
+
 // A row-valued `IN (subquery)` - `(a, b) IN (SELECT x, y FROM t)` - is legal
 // when the subquery's arity matches the row width; the arity check must compare
 // against the LHS row width, not a hard-coded 1.
@@ -5118,6 +5185,7 @@ int main() {
     test_group_by_grouping_element_columns();
     test_group_by_grouping_set_key_nullable();
     test_group_by_grouping_set_expression_nullable();
+    test_quantified_comparison_boolean();
     test_row_in_subquery();
     test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();

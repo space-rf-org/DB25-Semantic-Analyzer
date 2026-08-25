@@ -4903,6 +4903,47 @@ void test_interval_scaling_typed() {
     }
 }
 
+// A temporal literal is a non-null constant of its temporal type: an
+// `INTERVAL '1 day'` is Interval (was left Unknown, which could mis-reconcile in
+// set-ops / CASE / arithmetic), and a DATE/TIME/TIMESTAMP literal carries its
+// concrete type. The DateTimeLiteral node is exercised via a synthetic node
+// because the pinned parser predates the `DATE '...'` literal (it is produced
+// end-to-end once the parser pin bumps).
+void test_temporal_literal_types() {
+    std::printf("test_temporal_literal_types\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // INTERVAL literal, end-to-end through the parser.
+    auto res = p.parse("SELECT INTERVAL '1 day'");
+    CHECK(res.has_value());
+    if (res) {
+        Analyzer a(cat);
+        a.analyze(res.value());
+        const auto* proj = a.projection_of(res.value());
+        CHECK(proj != nullptr && proj->size() == 1);
+        if (proj != nullptr && proj->size() == 1) {
+            CHECK((*proj)[0].type == DataType::Interval);
+            CHECK(!(*proj)[0].nullable);  // a literal is never NULL
+        }
+    }
+    // DateTimeLiteral typing (synthetic node -> infer_scalar).
+    {
+        Analyzer a(cat);
+        Scope scope;
+        for (DataType dt : {DataType::Date, DataType::Time, DataType::Timestamp}) {
+            ASTNode node;
+            node.node_type = NodeType::DateTimeLiteral;
+            node.data_type = dt;
+            CHECK(a.infer_scalar(&node, scope) == dt);
+            CHECK(a.nullability_of(&node) == 1);
+        }
+        // An unset data_type defaults to Timestamp (never Unknown).
+        ASTNode node;
+        node.node_type = NodeType::DateTimeLiteral;
+        CHECK(a.infer_scalar(&node, scope) == DataType::Timestamp);
+    }
+}
+
 // A whole-expression GROUP BY key covers the same expression in the projection,
 // so its inner column is not flagged non-grouped; function-name case is folded;
 // and an unrelated non-grouped column is still flagged (folding is not a wildcard).
@@ -5393,6 +5434,7 @@ int main() {
     test_temporal_date_minus_date();
     test_temporal_nullable_operand();
     test_interval_scaling_typed();
+    test_temporal_literal_types();
     test_assign_string_to_temporal_boolean();
     test_groupby_expression_key();
     test_temporal_invalid_date_plus_timestamp();

@@ -3232,6 +3232,26 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
         }
     }
 
+    // A window function may not appear in WHERE or HAVING: windows are computed
+    // AFTER the WHERE filter and AFTER grouping / HAVING, so a window call can
+    // never be a WHERE or HAVING predicate term (Postgres: "window functions are
+    // not allowed in WHERE" / "... in HAVING"). Without this the binder lowers the
+    // window into a Filter predicate with no window operator to compute it - a
+    // structurally invalid plan. contains_window stops at subquery boundaries, so
+    // a window legitimately inside a WHERE/HAVING subquery is not flagged here.
+    if (ASTNode* where = find_child(select_stmt, NodeType::WhereClause)) {
+        if (ASTNode* pred = first_child(where); pred != nullptr && contains_window(pred)) {
+            add_diagnostic(DiagnosticCode::WindowNotAllowed,
+                           "window functions are not allowed in WHERE", pred);
+        }
+    }
+    if (ASTNode* having = find_child(select_stmt, NodeType::HavingClause)) {
+        if (ASTNode* pred = first_child(having); pred != nullptr && contains_window(pred)) {
+            add_diagnostic(DiagnosticCode::WindowNotAllowed,
+                           "window functions are not allowed in HAVING", pred);
+        }
+    }
+
     ASTNode* select_list = find_child(select_stmt, NodeType::SelectList);
 
     // The query is "grouped" (subject to the legality rules) if it has a GROUP BY

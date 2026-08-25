@@ -3070,6 +3070,35 @@ void test_group_by_grouping_set_window_not_nulled() {
     }
 }
 
+// A window function may not appear in WHERE or HAVING (it is computed after both);
+// the analyzer must reject it, exactly as it rejects an aggregate in WHERE - else
+// the binder lowers the window into a Filter predicate with nothing to compute it.
+void test_window_in_where_having_rejected() {
+    std::printf("test_window_in_where_having_rejected\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto nwin = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return static_cast<int>(count_code(a, DiagnosticCode::WindowNotAllowed));
+    };
+    // Window in WHERE / HAVING is rejected.
+    CHECK(nwin("SELECT id FROM emp WHERE ROW_NUMBER() OVER () > 1") == 1);
+    CHECK(nwin("SELECT dept, COUNT(*) FROM emp GROUP BY dept "
+               "HAVING RANK() OVER (ORDER BY dept) > 1") == 1);
+    // Guards: a window in the SELECT list or ORDER BY is legal (not flagged); an
+    // aggregate (not a window) in WHERE is a DIFFERENT diagnostic; and a window
+    // inside a WHERE subquery is that block's own business, not flagged here.
+    CHECK(nwin("SELECT id, ROW_NUMBER() OVER () FROM emp") == 0);
+    CHECK(nwin("SELECT id FROM emp ORDER BY ROW_NUMBER() OVER ()") == 0);
+    CHECK(nwin("SELECT id FROM emp WHERE salary > 1") == 0);
+    CHECK(nwin("SELECT id FROM emp WHERE id IN "
+               "(SELECT ROW_NUMBER() OVER () FROM emp)") == 0);
+}
+
 // A quantified comparison `x <cmp> ALL|ANY|SOME (subquery)` is boolean-valued.
 // The parser packs the quantifier into the operator text ("> ALL", "= ANY",
 // ...); the analyzer once had no branch for it, so it typed the predicate
@@ -5320,6 +5349,7 @@ int main() {
     test_group_by_grouping_set_key_nullable();
     test_group_by_grouping_set_expression_nullable();
     test_group_by_grouping_set_window_not_nulled();
+    test_window_in_where_having_rejected();
     test_quantified_comparison_boolean();
     test_row_in_subquery();
     test_in_value_list_coercion_warns();

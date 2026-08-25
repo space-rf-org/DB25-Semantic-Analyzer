@@ -62,6 +62,11 @@ enum class DiagnosticCode : std::uint16_t {
     // cannot itself be a grouping key (Postgres: "aggregate functions are not
     // allowed in GROUP BY").
     AggregateInGroupBy,
+    // A window function appears where it is not allowed: a WHERE or HAVING
+    // predicate. Windows are computed AFTER the WHERE filter and AFTER grouping /
+    // HAVING, so a window call can never be a WHERE or HAVING term (Postgres:
+    // "window functions are not allowed in WHERE" / "... in HAVING").
+    WindowNotAllowed,
     // The same correlation name (table alias, or table name when unaliased) is
     // specified more than once in a single FROM clause.
     DuplicateRelation,

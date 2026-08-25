@@ -2838,6 +2838,71 @@ void test_group_by_grouping_element_columns() {
               "GROUP BY GROUPING SETS ((dept))") == 1);
 }
 
+// M2: a NOT NULL column used as a ROLLUP/CUBE/GROUPING SETS grouping key is NULL
+// in the super-aggregate (subtotal / grand-total) rows, so it becomes nullable in
+// the result even though its base column is NOT NULL - matching Postgres. A plain
+// GROUP BY key, and a bare parenthesized GROUP BY list, are NOT nulled (they add
+// no super-aggregate rows). The re-marking flows into both the projection
+// (projection_of) and the SELECT-list ColumnRef (nullability_of).
+void test_group_by_grouping_set_key_nullable() {
+    std::printf("test_group_by_grouping_set_key_nullable\n");
+    auto cat = make_catalog_emp();  // emp(id INT NOT NULL, ..., salary DOUBLE, ...)
+    parser::Parser p;
+
+    // (id, ColumnRef-nullability, projection-nullability) for the leading column.
+    struct R { int col_null; bool proj_null; bool ok; };
+    auto probe = [&](const char* sql) -> R {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return {-1, false, false};
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* first = list ? first_child(list) : nullptr;
+        const auto* proj = a.projection_of(res.value());
+        const bool have = first != nullptr && proj != nullptr && !proj->empty();
+        return {have ? a.nullability_of(first) : -1,
+                have ? (*proj)[0].nullable : false, have};
+    };
+
+    // ROLLUP over the NOT NULL column `id` -> id becomes nullable (2 / true).
+    {
+        R r = probe("SELECT id, SUM(salary) FROM emp GROUP BY ROLLUP(id)");
+        CHECK(r.ok);
+        CHECK(r.col_null == 2);
+        CHECK(r.proj_null == true);
+    }
+    // CUBE likewise nulls its NOT NULL argument column.
+    {
+        R r = probe("SELECT id, SUM(salary) FROM emp GROUP BY CUBE(id)");
+        CHECK(r.ok);
+        CHECK(r.col_null == 2);
+        CHECK(r.proj_null == true);
+    }
+    // GROUPING SETS member -> nullable too (the member column is grouped-set).
+    {
+        R r = probe("SELECT id, SUM(salary) FROM emp GROUP BY GROUPING SETS ((id))");
+        CHECK(r.ok);
+        CHECK(r.col_null == 2);
+        CHECK(r.proj_null == true);
+    }
+    // Guard: a PLAIN GROUP BY of the NOT NULL column keeps it NOT NULL (1 / false).
+    {
+        R r = probe("SELECT id, SUM(salary) FROM emp GROUP BY id");
+        CHECK(r.ok);
+        CHECK(r.col_null == 1);
+        CHECK(r.proj_null == false);
+    }
+    // Guard: a bare parenthesized GROUP BY list is NOT a grouping set - the
+    // column stays NOT NULL (no super-aggregate rows are introduced).
+    {
+        R r = probe("SELECT id, region FROM emp GROUP BY (id, region)");
+        CHECK(r.ok);
+        CHECK(r.col_null == 1);
+        CHECK(r.proj_null == false);
+    }
+}
+
 // A row-valued `IN (subquery)` - `(a, b) IN (SELECT x, y FROM t)` - is legal
 // when the subquery's arity matches the row width; the arity check must compare
 // against the LHS row width, not a hard-coded 1.
@@ -4976,6 +5041,7 @@ int main() {
     test_arithmetic_same_type_nonnumeric_errors();
     test_numeric_real_promotes_double();
     test_group_by_grouping_element_columns();
+    test_group_by_grouping_set_key_nullable();
     test_row_in_subquery();
     test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();

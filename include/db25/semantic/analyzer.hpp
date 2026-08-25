@@ -203,7 +203,7 @@ private:
     // aggregate in the SELECT list / ORDER BY / HAVING is a grouping key and
     // that no aggregate is nested directly inside another aggregate.
     void analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
-                          const std::vector<ResolvedColumn>& output);
+                          std::vector<ResolvedColumn>& output);
 
     // A GROUP BY key may name a SELECT-list output alias (a Postgres extension):
     // `SELECT id AS x FROM t GROUP BY x` groups by `id`. If `key` is an

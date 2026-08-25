@@ -2903,6 +2903,81 @@ void test_group_by_grouping_set_key_nullable() {
     }
 }
 
+// M2 follow-up: a SELECT-list EXPRESSION that reads a ROLLUP/CUBE/GROUPING SETS
+// grouping key (outside an aggregate) is also NULL in the super-aggregate rows,
+// so it is nullable - not only the bare key column. A read INSIDE an aggregate
+// (SUM(key)) does NOT null the aggregate: it sees the present raw value. An
+// expression that does not reference the key is unaffected.
+void test_group_by_grouping_set_expression_nullable() {
+    std::printf("test_group_by_grouping_set_expression_nullable\n");
+    auto cat = make_catalog_emp();  // emp(id INT NOT NULL, ..., salary DOUBLE, ...)
+    parser::Parser p;
+
+    // Return (nullability_of, projection.nullable) for the select-list item at
+    // index `idx`.
+    struct R { int col_null; int proj_null; bool ok; };
+    auto probe = [&](const char* sql, std::size_t idx) -> R {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return {-1, -1, false};
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* item = list ? first_child(list) : nullptr;
+        for (std::size_t i = 0; i < idx && item != nullptr; ++i) {
+            item = item->next_sibling;
+        }
+        const auto* proj = a.projection_of(res.value());
+        const bool have = item != nullptr && proj != nullptr && proj->size() > idx;
+        return {have ? a.nullability_of(item) : -1,
+                have ? ((*proj)[idx].nullable ? 2 : 1) : -1, have};
+    };
+
+    // `id + 0` over a ROLLUP key: the expression is nullable (was wrongly NOT NULL).
+    {
+        R r = probe("SELECT id + 0 FROM emp GROUP BY ROLLUP(id)", 0);
+        CHECK(r.ok);
+        CHECK(r.col_null == 2);
+        CHECK(r.proj_null == 2);
+    }
+    // GROUPING SETS member, expression form.
+    {
+        R r = probe("SELECT id * 2 FROM emp GROUP BY GROUPING SETS ((id))", 0);
+        CHECK(r.ok);
+        CHECK(r.col_null == 2);
+        CHECK(r.proj_null == 2);
+    }
+    // Mixed list: expression over the key is nulled; an aggregate that reads the
+    // key (SUM(id)) and COUNT(*) are governed by their own nullability, NOT the
+    // grouping-set nulling - COUNT(*) stays NOT NULL.
+    {
+        R expr = probe("SELECT id + 0, SUM(id), COUNT(*) FROM emp GROUP BY CUBE(id)", 0);
+        CHECK(expr.ok);
+        CHECK(expr.col_null == 2);   // id + 0 -> nullable
+        CHECK(expr.proj_null == 2);
+        R cnt = probe("SELECT id + 0, SUM(id), COUNT(*) FROM emp GROUP BY CUBE(id)", 2);
+        CHECK(cnt.ok);
+        CHECK(cnt.col_null == 1);    // COUNT(*) stays NOT NULL (does not read the key)
+        CHECK(cnt.proj_null == 1);
+    }
+    // Guard: with a PLAIN GROUP BY (no grouping set), an expression over the
+    // NOT NULL key stays NOT NULL - no super-aggregate rows are introduced.
+    {
+        R r = probe("SELECT id + 0 FROM emp GROUP BY id", 0);
+        CHECK(r.ok);
+        CHECK(r.col_null == 1);
+        CHECK(r.proj_null == 1);
+    }
+    // Guard: an expression that does NOT read the grouping-set key keeps its own
+    // nullability - a literal expression stays NOT NULL under ROLLUP(id).
+    {
+        R r = probe("SELECT id, 1 + 2 FROM emp GROUP BY ROLLUP(id)", 1);
+        CHECK(r.ok);
+        CHECK(r.col_null == 1);      // 1 + 2 does not read id -> stays NOT NULL
+        CHECK(r.proj_null == 1);
+    }
+}
+
 // A row-valued `IN (subquery)` - `(a, b) IN (SELECT x, y FROM t)` - is legal
 // when the subquery's arity matches the row width; the arity check must compare
 // against the LHS row width, not a hard-coded 1.
@@ -5042,6 +5117,7 @@ int main() {
     test_numeric_real_promotes_double();
     test_group_by_grouping_element_columns();
     test_group_by_grouping_set_key_nullable();
+    test_group_by_grouping_set_expression_nullable();
     test_row_in_subquery();
     test_in_value_list_coercion_warns();
     test_coercion_arithmetic_text_int_error();

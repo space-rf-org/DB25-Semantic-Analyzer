@@ -202,8 +202,23 @@ private:
     // aggregate), and, if so, verifies that every column reference outside an
     // aggregate in the SELECT list / ORDER BY / HAVING is a grouping key and
     // that no aggregate is nested directly inside another aggregate.
+    // `output_sources` is aligned 1:1 with `output`: the SELECT-list node that
+    // produced each column, or nullptr for a `*`-expanded column. Used to null
+    // expression columns that read a ROLLUP/CUBE/GROUPING SETS key.
     void analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& scope,
-                          std::vector<ResolvedColumn>& output);
+                          std::vector<ResolvedColumn>& output,
+                          const std::vector<ASTNode*>& output_sources);
+
+    // Does `expr` reference - OUTSIDE any aggregate call - a column whose
+    // (table_id, column_id) is in `keys`? A reference inside an aggregate does
+    // NOT count: the aggregate reads the raw input rows, where a grouping-set
+    // key still holds its real value; only a bare read of the key is NULL in the
+    // super-aggregate (subtotal / grand-total) rows. Used to decide which result
+    // columns a ROLLUP/CUBE/GROUPING SETS makes nullable.
+    [[nodiscard]] bool expr_reads_grouping_key(
+        ASTNode* expr,
+        const std::vector<std::pair<std::uint32_t, std::uint32_t>>& keys,
+        bool in_aggregate);
 
     // A GROUP BY key may name a SELECT-list output alias (a Postgres extension):
     // `SELECT id AS x FROM t GROUP BY x` groups by `id`. If `key` is an

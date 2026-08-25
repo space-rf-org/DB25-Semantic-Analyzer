@@ -2239,7 +2239,13 @@ namespace {
 // chain would overflow the stack during analysis. Real expressions nest only a
 // few levels; this cap is far above any genuine query yet well below the stack
 // limit. Shared by infer_expr, check_grouping_expr, and contains_aggregate.
-constexpr int kMaxExprDepth = 1000;
+//
+// The cap must hold under the ASan/UBSan CI job (the one that validates this
+// guard), where instrumentation inflates each infer_expr frame with redzones: at
+// 1000 the guarded recursion itself overflowed the default 8 MB stack ~30% of
+// runs before the guard fired. 400 keeps peak recursion stack comfortably under
+// 8 MB while staying orders of magnitude above any real query's nesting.
+constexpr int kMaxExprDepth = 400;
 
 // RAII: increment a depth counter for the current recursion level, decrement on
 // any exit (including the many early returns in infer_expr).

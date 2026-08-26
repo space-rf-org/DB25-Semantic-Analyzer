@@ -5269,7 +5269,10 @@ void test_temporal_timestamp_minus_timestamp() {
     CHECK(e != nullptr && a.type_of(e) == DataType::Interval);
 }
 
-// date - date -> Interval (not Date).
+// date - date -> Integer (whole elapsed days), per PostgreSQL - NOT Interval and
+// NOT Date. Only time-time / timestamp-timestamp yield Interval. This must agree
+// with the wildcard rule ($1 - date -> Integer) and lets a date difference
+// reconcile with a real INTEGER in UNION / COALESCE / CASE.
 void test_temporal_date_minus_date() {
     std::printf("test_temporal_date_minus_date\n");
     auto cat = make_catalog_temporal();
@@ -5278,7 +5281,26 @@ void test_temporal_date_minus_date() {
     Analyzer a(cat);
     ASTNode* e = analyze_temporal(a, p, h, "SELECT d - d FROM events");
     CHECK(count_code(a, DiagnosticCode::TypeMismatch) == 0);
-    CHECK(e != nullptr && a.type_of(e) == DataType::Interval);
+    CHECK(e != nullptr && a.type_of(e) == DataType::Integer);
+}
+
+// The date difference (INTEGER) reconciles with a real INTEGER downstream. When
+// `d - d` mis-typed INTERVAL these legal queries were wrongly rejected with a
+// SetOpTypeMismatch / COALESCE TypeMismatch.
+void test_temporal_date_diff_reconciles() {
+    std::printf("test_temporal_date_diff_reconciles\n");
+    auto cat = make_catalog_temporal();  // events(..., d2 DATE, n INTEGER NN)
+    parser::Parser p;
+    for (const char* sql : {
+            "SELECT d2 - d FROM events UNION SELECT n FROM events",
+            "SELECT COALESCE(d2 - d, n) FROM events"}) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(!a.has_errors());
+    }
 }
 
 // A nullable temporal operand makes the temporal result nullable.
@@ -5676,6 +5698,7 @@ int main() {
     test_temporal_date_plus_integer();
     test_temporal_timestamp_minus_timestamp();
     test_temporal_date_minus_date();
+    test_temporal_date_diff_reconciles();
     test_temporal_nullable_operand();
     test_interval_scaling_typed();
     test_temporal_wildcard_arith();

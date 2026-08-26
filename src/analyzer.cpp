@@ -471,9 +471,17 @@ struct TemporalArith {
     if (is_integer_type(a) && b == DataType::Date && is_plus) {
         return {TemporalArithStatus::Ok, DataType::Date};
     }
-    // temporal - temporal of the *same* kind -> interval (elapsed span).
+    // temporal - temporal of the *same* kind: the elapsed span. PostgreSQL types
+    // `date - date` as INTEGER (whole elapsed days), while `time - time` and
+    // `timestamp - timestamp` (and `interval - interval`) yield INTERVAL. This
+    // must match the `wildcard - temporal` branch below, which already resolves
+    // the untyped operand to the same temporal and so returns INTEGER for the
+    // Date case - otherwise `d - d` and `$1 - d` type differently, and a Date
+    // difference mis-typed INTERVAL fails to reconcile with a real INTEGER in
+    // UNION / COALESCE / CASE (a legal query wrongly rejected).
     if (is_minus && a_temporal && b_temporal && a == b) {
-        return {TemporalArithStatus::Ok, DataType::Interval};
+        return {TemporalArithStatus::Ok,
+                a == DataType::Date ? DataType::Integer : DataType::Interval};
     }
     // A WILDCARD operand - an untyped NULL literal or a bind parameter ($1 / ?),
     // whose category_of() is Wildcard - unifies with a temporal under + / -,

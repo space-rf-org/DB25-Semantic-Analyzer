@@ -832,6 +832,29 @@ void test_recursive_cte_nullability() {
         "SELECT 1 FROM t WHERE t.n < 10) SELECT n FROM t") == 1);
 }
 
+// A derived table that exposes the same output alias twice (SELECT id AS a,
+// name AS a) makes a reference to that name AMBIGUOUS - it must not silently
+// resolve to the first column.
+void test_duplicate_derived_alias_ambiguous() {
+    std::printf("test_duplicate_derived_alias_ambiguous\n");
+    auto cat = make_catalog();  // users(id INT NOT NULL, name TEXT)
+    parser::Parser p;
+    auto namb = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return static_cast<int>(count_code(a, DiagnosticCode::AmbiguousColumn));
+    };
+    // Qualified and bare references to the duplicated alias are ambiguous.
+    CHECK(namb("SELECT t.a FROM (SELECT id AS a, name AS a FROM users) t") == 1);
+    CHECK(namb("SELECT a FROM (SELECT id AS a, name AS a FROM users) t") == 1);
+    // Guard: distinct aliases resolve cleanly (no false ambiguity).
+    CHECK(namb("SELECT t.a FROM (SELECT id AS a, name AS b FROM users) t") == 0);
+    CHECK(namb("SELECT a, b FROM (SELECT id AS a, name AS b FROM users) t") == 0);
+}
+
 void test_unresolved_table() {
     std::printf("test_unresolved_table\n");
     auto cat = make_catalog();
@@ -1262,6 +1285,52 @@ void test_star_over_natural_coalesces() {
 }
 
 // --- Set-operation reconciliation --------------------------------------
+
+// A WITH clause above a top-level set operation is in scope for EVERY branch
+// (the parser attaches the CTEClause to the set-op node). analyze_setop must
+// register those CTEs before analyzing branches - else both arms fail to resolve
+// the CTE (false UnresolvedTable / UnresolvedColumn).
+void test_cte_above_setop() {
+    std::printf("test_cte_above_setop\n");
+    auto cat = make_catalog_joins();  // users(id INT NOT NULL, name TEXT)
+    parser::Parser p;
+    auto clean = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return false;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return !a.has_errors();
+    };
+    // CTE referenced in the 1st arm / 2nd arm / both; INTERSECT / EXCEPT; and
+    // WITH RECURSIVE above a UNION - all must analyze clean.
+    CHECK(clean("WITH t AS (SELECT id FROM users) "
+                "SELECT id FROM t UNION SELECT id FROM users"));
+    CHECK(clean("WITH t AS (SELECT id FROM users) "
+                "SELECT id FROM users UNION SELECT id FROM t"));
+    CHECK(clean("WITH t AS (SELECT id FROM users) "
+                "SELECT id FROM t INTERSECT SELECT id FROM t"));
+    CHECK(clean("WITH t AS (SELECT id FROM users) "
+                "SELECT id FROM users EXCEPT SELECT id FROM t"));
+    CHECK(clean("WITH RECURSIVE r(n) AS "
+                "(SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 10) "
+                "SELECT n FROM r UNION SELECT id FROM users"));
+    // The output schema is the single reconciled column {id, Integer}.
+    {
+        auto res = p.parse("WITH t AS (SELECT id FROM users) "
+                           "SELECT id FROM t UNION SELECT id FROM users");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            const auto* proj = a.projection_of(res.value());
+            CHECK(proj != nullptr && proj->size() == 1);
+            if (proj != nullptr && proj->size() == 1) {
+                CHECK((*proj)[0].type == DataType::Integer);
+            }
+        }
+    }
+}
 
 void test_setop_union_clean() {
     std::printf("test_setop_union_clean\n");
@@ -5005,6 +5074,53 @@ void test_interval_scaling_typed() {
     }
 }
 
+// Temporal arithmetic with a WILDCARD operand - an untyped NULL literal or a
+// bind parameter ($1) - is legal (Postgres infers the untyped operand, typically
+// INTERVAL): `timestamp + $1`, `timestamp - $1`, `date + NULL` all yield the
+// temporal's type, nullable. It was wrongly a hard TypeMismatch (temporal_arith
+// had no wildcard guard, unlike coerce()).
+void test_temporal_wildcard_arith() {
+    std::printf("test_temporal_wildcard_arith\n");
+    auto cat = make_catalog_temporal();  // events(d DATE, ts TIMESTAMP NN, iv INTERVAL NN, ...)
+    parser::Parser p;
+    // (projected type, analyze-clean).
+    auto probe = [&](const char* sql) -> std::pair<DataType, bool> {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return {DataType::Unknown, false};
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* item = list ? first_child(list) : nullptr;
+        return {item ? a.type_of(item) : DataType::Unknown, !a.has_errors()};
+    };
+    // timestamp +/- wildcard -> timestamp, clean (both NULL and a bind parameter).
+    for (const char* sql : {"SELECT ts + NULL FROM events",
+                            "SELECT ts + $1 FROM events",
+                            "SELECT ts - $1 FROM events"}) {
+        auto [t, clean] = probe(sql);
+        CHECK(clean);
+        CHECK(t == DataType::Timestamp);
+    }
+    // date + wildcard -> date; wildcard + timestamp -> timestamp.
+    {
+        auto [t, c] = probe("SELECT d + $1 FROM events");
+        CHECK(c);
+        CHECK(t == DataType::Date);
+    }
+    {
+        auto [t, c] = probe("SELECT NULL + ts FROM events");
+        CHECK(c);
+        CHECK(t == DataType::Timestamp);
+    }
+    // Guard: a genuinely invalid temporal mix is STILL rejected (not swallowed by
+    // the wildcard path) - timestamp + timestamp has no operator.
+    {
+        auto [t, c] = probe("SELECT ts + ts FROM events");
+        CHECK(!c);
+    }
+}
+
 // A temporal literal is a non-null constant of its temporal type: an
 // `INTERVAL '1 day'` is Interval (was left Unknown, which could mis-reconcile in
 // set-ops / CASE / arithmetic), and a DATE/TIME/TIMESTAMP literal carries its
@@ -5328,6 +5444,7 @@ int main() {
     test_cte_column_alias_count_mismatch();
     test_recursive_cte();
     test_recursive_cte_nullability();
+    test_duplicate_derived_alias_ambiguous();
     test_unresolved_table();
 
     // SELECT * / table.* expansion
@@ -5356,6 +5473,7 @@ int main() {
     test_star_over_natural_coalesces();
 
     // Set-operation reconciliation
+    test_cte_above_setop();
     test_setop_union_clean();
     test_setop_arity_mismatch();
     test_setop_type_mismatch();
@@ -5539,6 +5657,7 @@ int main() {
     test_temporal_date_minus_date();
     test_temporal_nullable_operand();
     test_interval_scaling_typed();
+    test_temporal_wildcard_arith();
     test_temporal_literal_types();
     test_assign_string_to_temporal_boolean();
     test_groupby_expression_key();

@@ -5113,6 +5113,27 @@ void test_temporal_wildcard_arith() {
         CHECK(c);
         CHECK(t == DataType::Timestamp);
     }
+    // `wildcard - temporal` is asymmetric with `temporal - wildcard`: the untyped
+    // left operand infers as the SAME temporal, so the result is the difference
+    // type. `$1 - timestamp` / `NULL - timestamp` -> Interval (timestamp minus
+    // timestamp), and `$1 - interval` -> Interval, but `$1 - date` -> Integer
+    // (date minus date is whole days). All must analyze clean.
+    for (const char* sql : {"SELECT $1 - ts FROM events",
+                            "SELECT NULL - ts FROM events"}) {
+        auto [t, c] = probe(sql);
+        CHECK(c);
+        CHECK(t == DataType::Interval);
+    }
+    {
+        auto [t, c] = probe("SELECT $1 - iv FROM events");
+        CHECK(c);
+        CHECK(t == DataType::Interval);
+    }
+    {
+        auto [t, c] = probe("SELECT $1 - d FROM events");
+        CHECK(c);
+        CHECK(t == DataType::Integer);
+    }
     // Guard: a genuinely invalid temporal mix is STILL rejected (not swallowed by
     // the wildcard path) - timestamp + timestamp has no operator.
     {

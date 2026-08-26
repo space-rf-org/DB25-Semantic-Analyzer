@@ -491,6 +491,18 @@ struct TemporalArith {
     if (a_wild && b_temporal && is_plus) {
         return {TemporalArithStatus::Ok, b};
     }
+    // `wild - temporal` is asymmetric with the two cases above and is NOT the
+    // temporal's own type. PostgreSQL infers the untyped left operand as the same
+    // temporal, so the result is the DIFFERENCE type: `unknown - date` resolves to
+    // `date - date` -> INTEGER (whole days), while `unknown - {time,timestamp,...}`
+    // resolves to `t - t` -> INTERVAL. (Contrast `temporal - wild`, where the
+    // wildcard infers as INTERVAL and the result is the temporal itself.) Without
+    // this branch a legal `$1 - ts` / `NULL - date` fell through to a spurious
+    // TypeMismatch with an Unknown result type.
+    if (a_wild && b_temporal && is_minus) {
+        return {TemporalArithStatus::Ok,
+                b == DataType::Date ? DataType::Integer : DataType::Interval};
+    }
     // Any other combination involving a temporal has no defined meaning.
     return {TemporalArithStatus::Invalid, DataType::Unknown};
 }

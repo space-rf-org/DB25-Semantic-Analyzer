@@ -2904,6 +2904,8 @@ void test_arithmetic_same_type_nonnumeric_errors() {
         ColumnInfo{"flag", DataType::Boolean, /*nullable=*/false},
         ColumnInfo{"n", DataType::Integer, /*nullable=*/false},
         ColumnInfo{"d", DataType::Double, /*nullable=*/false},
+        ColumnInfo{"r", DataType::Real, /*nullable=*/false},
+        ColumnInfo{"dec", DataType::Decimal, /*nullable=*/false},
     });
     parser::Parser p;
     auto errs = [&](const char* sql) -> bool {
@@ -2938,6 +2940,26 @@ void test_arithmetic_same_type_nonnumeric_errors() {
     CHECK(!errs("SELECT n + NULL FROM t"));
     // `||` is string concatenation, NOT arithmetic - it must stay clean.
     CHECK(!errs("SELECT txt || txt FROM t"));
+
+    // Modulo '%' has no operator for approximate floats (float4/float8) in
+    // PostgreSQL - only the exact numeric types (int*/NUMERIC) support it. A REAL
+    // or DOUBLE operand must be a TypeMismatch, not silently typed Double.
+    CHECK(errs("SELECT d % n FROM t"));
+    CHECK(errs("SELECT n % d FROM t"));
+    CHECK(errs("SELECT r % n FROM t"));
+    CHECK(errs("SELECT d % r FROM t"));
+    {
+        auto res = p.parse("SELECT d % n FROM t");
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::TypeMismatch) >= 1);
+    }
+    // But '%' on EXACT numerics stays clean, and float is fine for +-*/.
+    CHECK(!errs("SELECT n % n FROM t"));
+    CHECK(!errs("SELECT dec % n FROM t"));
+    CHECK(!errs("SELECT d / n FROM t"));
+    CHECK(!errs("SELECT d * r FROM t"));
 }
 
 // F4: numeric(Decimal) + real promotes to DOUBLE PRECISION (float8), not real.

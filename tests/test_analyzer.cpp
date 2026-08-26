@@ -5051,6 +5051,53 @@ void test_interval_scaling_typed() {
     }
 }
 
+// Temporal arithmetic with a WILDCARD operand - an untyped NULL literal or a
+// bind parameter ($1) - is legal (Postgres infers the untyped operand, typically
+// INTERVAL): `timestamp + $1`, `timestamp - $1`, `date + NULL` all yield the
+// temporal's type, nullable. It was wrongly a hard TypeMismatch (temporal_arith
+// had no wildcard guard, unlike coerce()).
+void test_temporal_wildcard_arith() {
+    std::printf("test_temporal_wildcard_arith\n");
+    auto cat = make_catalog_temporal();  // events(d DATE, ts TIMESTAMP NN, iv INTERVAL NN, ...)
+    parser::Parser p;
+    // (projected type, analyze-clean).
+    auto probe = [&](const char* sql) -> std::pair<DataType, bool> {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return {DataType::Unknown, false};
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* list = find_child(res.value(), NodeType::SelectList);
+        ASTNode* item = list ? first_child(list) : nullptr;
+        return {item ? a.type_of(item) : DataType::Unknown, !a.has_errors()};
+    };
+    // timestamp +/- wildcard -> timestamp, clean (both NULL and a bind parameter).
+    for (const char* sql : {"SELECT ts + NULL FROM events",
+                            "SELECT ts + $1 FROM events",
+                            "SELECT ts - $1 FROM events"}) {
+        auto [t, clean] = probe(sql);
+        CHECK(clean);
+        CHECK(t == DataType::Timestamp);
+    }
+    // date + wildcard -> date; wildcard + timestamp -> timestamp.
+    {
+        auto [t, c] = probe("SELECT d + $1 FROM events");
+        CHECK(c);
+        CHECK(t == DataType::Date);
+    }
+    {
+        auto [t, c] = probe("SELECT NULL + ts FROM events");
+        CHECK(c);
+        CHECK(t == DataType::Timestamp);
+    }
+    // Guard: a genuinely invalid temporal mix is STILL rejected (not swallowed by
+    // the wildcard path) - timestamp + timestamp has no operator.
+    {
+        auto [t, c] = probe("SELECT ts + ts FROM events");
+        CHECK(!c);
+    }
+}
+
 // A temporal literal is a non-null constant of its temporal type: an
 // `INTERVAL '1 day'` is Interval (was left Unknown, which could mis-reconcile in
 // set-ops / CASE / arithmetic), and a DATE/TIME/TIMESTAMP literal carries its
@@ -5586,6 +5633,7 @@ int main() {
     test_temporal_date_minus_date();
     test_temporal_nullable_operand();
     test_interval_scaling_typed();
+    test_temporal_wildcard_arith();
     test_temporal_literal_types();
     test_assign_string_to_temporal_boolean();
     test_groupby_expression_key();

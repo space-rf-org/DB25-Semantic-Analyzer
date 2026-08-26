@@ -475,6 +475,22 @@ struct TemporalArith {
     if (is_minus && a_temporal && b_temporal && a == b) {
         return {TemporalArithStatus::Ok, DataType::Interval};
     }
+    // A WILDCARD operand - an untyped NULL literal or a bind parameter ($1 / ?),
+    // whose category_of() is Wildcard - unifies with a temporal under + / -,
+    // mirroring how coerce() lets a wildcard unify in numeric arithmetic and in
+    // comparison. PostgreSQL infers the untyped operand (typically INTERVAL) so
+    // `timestamp + ?`, `timestamp - ?`, `date + NULL`, `? + timestamp` are legal;
+    // the result takes the temporal operand's type (the caller makes it nullable).
+    // Without this, a legal query was a hard TypeMismatch and its type degraded to
+    // Unknown.
+    const bool a_wild = category_of(a) == TypeCategory::Wildcard;
+    const bool b_wild = category_of(b) == TypeCategory::Wildcard;
+    if (a_temporal && b_wild) {
+        return {TemporalArithStatus::Ok, a};
+    }
+    if (a_wild && b_temporal && is_plus) {
+        return {TemporalArithStatus::Ok, b};
+    }
     // Any other combination involving a temporal has no defined meaning.
     return {TemporalArithStatus::Invalid, DataType::Unknown};
 }

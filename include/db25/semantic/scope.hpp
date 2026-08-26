@@ -85,6 +85,22 @@ struct RelationBinding {
         return nullptr;
     }
 
+    // How many columns this relation exposes under `col`, ignoring the hidden
+    // right-hand copy of a USING / NATURAL coalesced column (which is not a
+    // distinct output column). >1 means the relation itself exposes the name
+    // twice - a derived table `SELECT id AS a, name AS a` - so a reference to it
+    // is AMBIGUOUS, not silently the first match. Linear (used only on the
+    // resolution path where find_column already matched).
+    [[nodiscard]] std::size_t count_column(std::string_view col) const {
+        std::size_t n = 0;
+        for (const auto& c : columns) {
+            if (!c.coalesced && iequals(c.name, col)) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
 private:
     // Relations with more than this many columns build a name index; below it the
     // linear scan above is used (cheaper than hashing for a handful of columns).
@@ -207,6 +223,15 @@ public:
                 }
                 qualifier_seen = true;
                 if (const auto* col = rel.find_column(column)) {
+                    // The relation exposes this name more than once (a derived
+                    // table with a duplicated output alias): the reference is
+                    // ambiguous, not silently the first column.
+                    if (rel.count_column(column) > 1) {
+                        ColumnResolution amb;
+                        amb.ambiguous = true;
+                        amb.owner = s;
+                        return amb;
+                    }
                     ColumnResolution res;
                     res.found = true;
                     res.from_outer = (s != this);
@@ -239,6 +264,14 @@ public:
                     // into the left copy - so it must not trigger ambiguity.
                     if (col->coalesced) {
                         continue;
+                    }
+                    // A single relation exposing the name twice (a derived table
+                    // with a duplicated output alias) is itself ambiguous.
+                    if (rel.count_column(column) > 1) {
+                        ColumnResolution amb;
+                        amb.ambiguous = true;
+                        amb.owner = s;
+                        return amb;
                     }
                     ++matches;
                     hit = col;

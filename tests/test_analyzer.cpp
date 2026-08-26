@@ -832,6 +832,29 @@ void test_recursive_cte_nullability() {
         "SELECT 1 FROM t WHERE t.n < 10) SELECT n FROM t") == 1);
 }
 
+// A derived table that exposes the same output alias twice (SELECT id AS a,
+// name AS a) makes a reference to that name AMBIGUOUS - it must not silently
+// resolve to the first column.
+void test_duplicate_derived_alias_ambiguous() {
+    std::printf("test_duplicate_derived_alias_ambiguous\n");
+    auto cat = make_catalog();  // users(id INT NOT NULL, name TEXT)
+    parser::Parser p;
+    auto namb = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return static_cast<int>(count_code(a, DiagnosticCode::AmbiguousColumn));
+    };
+    // Qualified and bare references to the duplicated alias are ambiguous.
+    CHECK(namb("SELECT t.a FROM (SELECT id AS a, name AS a FROM users) t") == 1);
+    CHECK(namb("SELECT a FROM (SELECT id AS a, name AS a FROM users) t") == 1);
+    // Guard: distinct aliases resolve cleanly (no false ambiguity).
+    CHECK(namb("SELECT t.a FROM (SELECT id AS a, name AS b FROM users) t") == 0);
+    CHECK(namb("SELECT a, b FROM (SELECT id AS a, name AS b FROM users) t") == 0);
+}
+
 void test_unresolved_table() {
     std::printf("test_unresolved_table\n");
     auto cat = make_catalog();
@@ -5421,6 +5444,7 @@ int main() {
     test_cte_column_alias_count_mismatch();
     test_recursive_cte();
     test_recursive_cte_nullability();
+    test_duplicate_derived_alias_ambiguous();
     test_unresolved_table();
 
     // SELECT * / table.* expansion

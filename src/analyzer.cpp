@@ -1442,12 +1442,11 @@ int count_table_refs(const ASTNode* node, std::string_view name) {
 
 }  // namespace
 
-std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope* parent) {
-    Scope scope(parent);
-
-    // 1. CTEs: register each definition as a named relation before resolving
-    //    FROM, so the body can reference the current scope and earlier CTEs.
-    if (ASTNode* cte_clause = find_child(select_stmt, NodeType::CTEClause)) {
+// Register every CTE in a WITH clause as a named relation in `scope` so the
+// query - or set operation - that follows, and later CTEs, can reference them.
+// Shared by analyze_query and analyze_setop: a WITH clause may sit above a
+// top-level UNION/INTERSECT/EXCEPT and is then in scope for every branch.
+void Analyzer::register_ctes(ASTNode* cte_clause, Scope& scope) {
         // `WITH RECURSIVE` (parser sets NodeFlags::IsRecursive on the clause) lets
         // a CTE reference itself inside its own body.
         const bool clause_recursive = cte_clause->has_flag(ast::NodeFlags::IsRecursive);
@@ -1589,6 +1588,15 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
             }
             scope.add_cte(std::move(cte));
         }
+}
+
+std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope* parent) {
+    Scope scope(parent);
+
+    // 1. CTEs: register each WITH definition before resolving FROM, so the body
+    //    can reference the current scope and earlier CTEs.
+    if (ASTNode* cte_clause = find_child(select_stmt, NodeType::CTEClause)) {
+        register_ctes(cte_clause, scope);
     }
 
     // 2. FROM: populate the scope with visible relations.
@@ -1782,13 +1790,23 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
 }
 
 std::vector<ResolvedColumn> Analyzer::analyze_setop(ASTNode* setop, Scope* parent) {
+    // A WITH clause may sit ABOVE a top-level set operation
+    // (`WITH t AS (...) SELECT ... UNION SELECT ...`); the parser attaches it as a
+    // CTEClause child of the set-op node. Such a CTE is in scope for EVERY branch,
+    // so register it into a fresh scope before analyzing the branches - otherwise
+    // both arms fail to resolve the CTE (false UnresolvedTable / UnresolvedColumn).
+    Scope scope(parent);
+    if (ASTNode* cte_clause = find_child(setop, NodeType::CTEClause)) {
+        register_ctes(cte_clause, scope);
+    }
+
     // Analyze every branch (each a SELECT block or a nested set operation) and
     // collect its projected columns.
     std::vector<std::vector<ResolvedColumn>> branches;
     for (ASTNode* child = first_child(setop); child != nullptr;
          child = child->next_sibling) {
         if (child->node_type == NodeType::SelectStmt || is_setop(child->node_type)) {
-            branches.push_back(analyze_stmt(child, parent));
+            branches.push_back(analyze_stmt(child, &scope));
         }
     }
 

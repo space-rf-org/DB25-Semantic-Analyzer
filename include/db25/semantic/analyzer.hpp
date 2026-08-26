@@ -139,6 +139,12 @@ private:
     // Non-literal operands are skipped.
     void check_limit(ASTNode* limit_clause);
 
+    // Register every CTE in a WITH clause (`cte_clause`) into `scope`, so the
+    // following query - or set operation - and later CTEs can reference them.
+    // Shared by analyze_query and analyze_setop (a WITH clause may sit above a
+    // top-level set operation and is then in scope for every branch).
+    void register_ctes(ASTNode* cte_clause, Scope& scope);
+
     // Analyze a SELECT query block under `parent` scope and return the list of
     // columns it projects (used when the block is a derived table or CTE body).
     std::vector<ResolvedColumn> analyze_query(ASTNode* select_stmt, Scope* parent);

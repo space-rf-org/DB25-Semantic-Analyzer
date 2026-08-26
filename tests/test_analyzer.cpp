@@ -1263,6 +1263,52 @@ void test_star_over_natural_coalesces() {
 
 // --- Set-operation reconciliation --------------------------------------
 
+// A WITH clause above a top-level set operation is in scope for EVERY branch
+// (the parser attaches the CTEClause to the set-op node). analyze_setop must
+// register those CTEs before analyzing branches - else both arms fail to resolve
+// the CTE (false UnresolvedTable / UnresolvedColumn).
+void test_cte_above_setop() {
+    std::printf("test_cte_above_setop\n");
+    auto cat = make_catalog_joins();  // users(id INT NOT NULL, name TEXT)
+    parser::Parser p;
+    auto clean = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return false;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return !a.has_errors();
+    };
+    // CTE referenced in the 1st arm / 2nd arm / both; INTERSECT / EXCEPT; and
+    // WITH RECURSIVE above a UNION - all must analyze clean.
+    CHECK(clean("WITH t AS (SELECT id FROM users) "
+                "SELECT id FROM t UNION SELECT id FROM users"));
+    CHECK(clean("WITH t AS (SELECT id FROM users) "
+                "SELECT id FROM users UNION SELECT id FROM t"));
+    CHECK(clean("WITH t AS (SELECT id FROM users) "
+                "SELECT id FROM t INTERSECT SELECT id FROM t"));
+    CHECK(clean("WITH t AS (SELECT id FROM users) "
+                "SELECT id FROM users EXCEPT SELECT id FROM t"));
+    CHECK(clean("WITH RECURSIVE r(n) AS "
+                "(SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 10) "
+                "SELECT n FROM r UNION SELECT id FROM users"));
+    // The output schema is the single reconciled column {id, Integer}.
+    {
+        auto res = p.parse("WITH t AS (SELECT id FROM users) "
+                           "SELECT id FROM t UNION SELECT id FROM users");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            const auto* proj = a.projection_of(res.value());
+            CHECK(proj != nullptr && proj->size() == 1);
+            if (proj != nullptr && proj->size() == 1) {
+                CHECK((*proj)[0].type == DataType::Integer);
+            }
+        }
+    }
+}
+
 void test_setop_union_clean() {
     std::printf("test_setop_union_clean\n");
     auto cat = make_catalog_joins();
@@ -5356,6 +5402,7 @@ int main() {
     test_star_over_natural_coalesces();
 
     // Set-operation reconciliation
+    test_cte_above_setop();
     test_setop_union_clean();
     test_setop_arity_mismatch();
     test_setop_type_mismatch();

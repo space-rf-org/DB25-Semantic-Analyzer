@@ -2329,6 +2329,19 @@ void test_setop_order_by_validated() {
                 DiagnosticCode::InvalidOrderByPosition) == 1);
     CHECK(codes("SELECT id FROM users EXCEPT SELECT id FROM users ORDER BY nope",
                 DiagnosticCode::UnresolvedColumn) == 1);
+    // A compound-expression key is illegal in a set-op ORDER BY (Postgres allows
+    // only result column names or positions): `id + 1`, `UPPER(name)` are
+    // rejected, not silently accepted and left unanalyzed.
+    CHECK(codes("SELECT id FROM users UNION SELECT id FROM users ORDER BY id + 1",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    CHECK(codes("SELECT id FROM users UNION SELECT id FROM users ORDER BY UPPER(name)",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    CHECK(codes("SELECT id FROM users INTERSECT SELECT id FROM users ORDER BY id * 2",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    // A legal position / output-name key alongside is still clean (no
+    // over-reporting on the valid form).
+    CHECK(codes("SELECT id FROM users UNION SELECT id FROM users ORDER BY id",
+                DiagnosticCode::UnresolvedColumn) == 0);
 }
 
 void test_groupby_positional_single() {

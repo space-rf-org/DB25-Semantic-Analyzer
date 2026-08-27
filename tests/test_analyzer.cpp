@@ -2594,6 +2594,36 @@ void test_aggregate_makes_query_grouped() {
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
+// `GROUP BY ()` is the empty grouping set (grand total): the query groups every
+// row into ONE group, so a bare non-aggregated column is illegal exactly as
+// under an aggregate. The parser now emits a childless GroupByClause for `()`
+// (it used to drop the clause, leaving the query looking ungrouped and the bare
+// column silently accepted). The analyzer treats any GroupByClause as grouped
+// with zero keys and flags the column - no analyzer change was needed, this
+// pins the end-to-end behavior across the parser-pin bump.
+void test_empty_grouping_set_grand_total() {
+    std::printf("test_empty_grouping_set_grand_total\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto ngc = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::NonGroupedColumn);
+    };
+    // A bare column over the grand total is non-grouped (illegal). Before the
+    // parser fix the clause was dropped and this was silently accepted (0).
+    CHECK(ngc("SELECT dept FROM emp GROUP BY ()") == 1);
+    // Two bare columns -> two diagnostics.
+    CHECK(ngc("SELECT dept, name FROM emp GROUP BY ()") == 2);
+    // An aggregate-only select list over `GROUP BY ()` is clean (grand total).
+    CHECK(ngc("SELECT COUNT(*) FROM emp GROUP BY ()") == 0);
+    // A constant is not a column reference, so it is fine under the grand total.
+    CHECK(ngc("SELECT 1 FROM emp GROUP BY ()") == 0);
+}
+
 // --- Extended built-in function catalog --------------------------------
 
 // A representative subset of the scalar catalog: string, numeric and
@@ -5894,6 +5924,7 @@ int main() {
     test_scalar_function_type();
     test_unknown_function_degrades();
     test_aggregate_makes_query_grouped();
+    test_empty_grouping_set_grand_total();
 
     // Extended built-in function catalog
     test_scalar_catalog_string_numeric_types();

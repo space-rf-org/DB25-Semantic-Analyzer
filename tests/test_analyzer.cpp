@@ -2284,6 +2284,11 @@ void test_order_by_positional_validated() {
     CHECK(bad("SELECT id FROM users ORDER BY 0") == 1);
     CHECK(bad("SELECT id FROM users ORDER BY -1") == 1);
     CHECK(bad("SELECT id, name FROM users ORDER BY 3") == 1);
+    // A literal >= 2^64 must not wrap modulo 2^64 back into a valid ordinal:
+    // 18446744073709551617 == 2^64 + 1 would wrap to 1 without the clamp, so
+    // it must still be flagged out of range.
+    CHECK(bad("SELECT id, name FROM users ORDER BY 18446744073709551617") == 1);
+    CHECK(bad("SELECT id, name FROM users ORDER BY 18446744073709551618") == 1);
     // Valid positions and a name reference stay clean.
     CHECK(bad("SELECT id, name FROM users ORDER BY 1") == 0);
     CHECK(bad("SELECT id, name FROM users ORDER BY 2") == 0);
@@ -2334,6 +2339,24 @@ void test_groupby_positional_still_flags_non_grouped() {
 
     Analyzer a(cat);
     a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+}
+
+// A GROUP BY position literal >= 2^64 must not wrap modulo 2^64 back into a
+// small in-range ordinal. `18446744073709551617` == 2^64 + 1 would wrap to 1
+// without the clamp, silently regrouping by the 1st output column; with the
+// clamp the ordinal matches no SELECT item, so `dept` stays non-grouped.
+void test_groupby_positional_overflow() {
+    std::printf("test_groupby_positional_overflow\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    auto res = p.parse("SELECT dept, COUNT(*) FROM emp GROUP BY 18446744073709551617");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    // dept is not grouped by the (out-of-range) position, so it is flagged.
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
 }
 
@@ -5643,6 +5666,7 @@ int main() {
     test_groupby_positional_single();
     test_groupby_positional_multi();
     test_groupby_positional_still_flags_non_grouped();
+    test_groupby_positional_overflow();
     test_avg_result_type();
     test_scalar_function_type();
     test_unknown_function_degrades();

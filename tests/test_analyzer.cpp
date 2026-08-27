@@ -2209,17 +2209,85 @@ void test_deep_expression_does_not_crash() {
     std::printf("test_deep_expression_does_not_crash\n");
     auto cat = make_catalog();  // users(id, name)
     parser::Parser p;
-    std::string sql = "SELECT * FROM users WHERE id > 0";
-    for (int i = 0; i < 5000; ++i) {
-        sql += " AND id > 0";
-    }
-    auto res = p.parse(sql);
-    CHECK(res.has_value());
-    if (!res) return;
 
-    Analyzer a(cat);
-    a.analyze(res.value());  // must return, not overflow the stack
-    CHECK(count_code(a, DiagnosticCode::ExpressionTooComplex) == 1);
+    // A chain far past the parser's flat-operator-chain cap is rejected AT PARSE
+    // (the producer-owned AST-depth gate), so no unbounded tree ever reaches the
+    // analyzer.
+    {
+        std::string sql = "SELECT * FROM users WHERE id > 0";
+        for (int i = 0; i < 5000; ++i) {
+            sql += " AND id > 0";
+        }
+        CHECK(!p.parse(sql).has_value());  // rejected by the parser's chain cap
+    }
+
+    // A chain that PARSES (under the parser cap) but exceeds the analyzer's own
+    // expression-depth guard (kMaxExprDepth) must be analyzed without a stack
+    // overflow and flagged ExpressionTooComplex - the analyzer's defense-in-depth.
+    {
+        std::string sql = "SELECT * FROM users WHERE id > 0";
+        for (int i = 0; i < 700; ++i) {
+            sql += " AND id > 0";
+        }
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return;
+        Analyzer a(cat);
+        a.analyze(res.value());  // must return, not overflow the stack
+        CHECK(count_code(a, DiagnosticCode::ExpressionTooComplex) == 1);
+    }
+}
+
+// A non-boolean value used in a boolean context - a WHERE / HAVING predicate or
+// an AND / OR / NOT operand - is flagged with a soft ImplicitCoercion (matching
+// the CASE WHEN condition check), not silently accepted.
+void test_boolean_context_non_boolean_flagged() {
+    std::printf("test_boolean_context_non_boolean_flagged\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT)
+    parser::Parser p;
+    auto coerce = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::ImplicitCoercion);
+    };
+    // Non-boolean in a boolean context is flagged (one per non-boolean operand).
+    CHECK(coerce("SELECT id FROM users WHERE id") == 1);
+    CHECK(coerce("SELECT id FROM users WHERE id AND id") == 2);
+    CHECK(coerce("SELECT id OR id FROM users") == 2);
+    CHECK(coerce("SELECT NOT id FROM users") == 1);
+    CHECK(coerce("SELECT NOT name FROM users") == 1);
+    // A boolean context with boolean operands stays clean.
+    CHECK(coerce("SELECT id FROM users WHERE id = 1") == 0);
+    CHECK(coerce("SELECT id FROM users WHERE id = 1 AND name IS NOT NULL") == 0);
+    CHECK(coerce("SELECT id FROM users WHERE NOT (id = 1)") == 0);
+}
+
+// A positional ORDER BY (`ORDER BY n`) must reference an existing output column
+// (1..N); a <= 0 or out-of-range ordinal is an error, exactly as GROUP BY
+// positions are validated.
+void test_order_by_positional_validated() {
+    std::printf("test_order_by_positional_validated\n");
+    auto cat = make_catalog();  // users(id, name)
+    parser::Parser p;
+    auto bad = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::InvalidOrderByPosition);
+    };
+    CHECK(bad("SELECT id FROM users ORDER BY 2") == 1);   // only 1 output column
+    CHECK(bad("SELECT id FROM users ORDER BY 0") == 1);
+    CHECK(bad("SELECT id FROM users ORDER BY -1") == 1);
+    CHECK(bad("SELECT id, name FROM users ORDER BY 3") == 1);
+    // Valid positions and a name reference stay clean.
+    CHECK(bad("SELECT id, name FROM users ORDER BY 1") == 0);
+    CHECK(bad("SELECT id, name FROM users ORDER BY 2") == 0);
+    CHECK(bad("SELECT id FROM users ORDER BY id") == 0);
 }
 
 void test_groupby_positional_single() {
@@ -5569,6 +5637,8 @@ int main() {
     test_order_by_output_alias_in_grouped_clean();
     test_aggregate_in_over_clause_not_nested();
     test_deep_expression_does_not_crash();
+    test_boolean_context_non_boolean_flagged();
+    test_order_by_positional_validated();
     test_wide_relation_resolution();
     test_groupby_positional_single();
     test_groupby_positional_multi();

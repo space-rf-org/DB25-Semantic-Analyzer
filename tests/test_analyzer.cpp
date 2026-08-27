@@ -2474,6 +2474,17 @@ void test_groupby_star_validated() {
     // Guard: `*` over an all-aggregate-free ungrouped query is unaffected (no
     // GROUP BY, no aggregate -> analyze_grouping not entered).
     CHECK(ngc("SELECT * FROM emp") == 0);
+    // A positional key pointing at an ALIASED item (`id AS foo` is output
+    // column 7) must be identified by the SOURCE column's name (`id`), NOT the
+    // output alias (`foo`). Otherwise the star's `id` column is compared against
+    // key text `foo`, fails same_column_name, and is spuriously flagged. Here
+    // GROUP BY 7 groups id (via the alias), and 2..6 group the rest, so every
+    // star column is a key: 0 non-grouped. (Before the fix: 1 - phantom `id`.)
+    CHECK(ngc("SELECT *, id AS foo FROM emp GROUP BY 7, 2, 3, 4, 5, 6") == 0);
+    // GROUP BY 7 alone groups only id (via the aliased item); name, dept,
+    // region, salary, age remain non-grouped (5). Before the fix the aliased
+    // key text `foo` also failed to group the star's `id`, giving 6.
+    CHECK(ngc("SELECT *, id AS foo FROM emp GROUP BY 7") == 5);
 }
 
 void test_avg_result_type() {

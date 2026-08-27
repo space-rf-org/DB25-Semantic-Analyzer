@@ -863,6 +863,72 @@ void test_exists_requires_subquery() {
     CHECK(has_err("SELECT * FROM users WHERE NOT EXISTS (SELECT 1)") == 0);
 }
 
+// EVERY is the SQL-standard synonym of BOOL_AND, so it must be treated as an
+// aggregate: a bare non-grouped column alongside EVERY() is illegal (implicit
+// single-group aggregate), its result type is BOOLEAN, and there is no
+// UnknownFunction warning -- exactly as BOOL_AND already behaves.
+void test_every_is_bool_and_synonym() {
+    std::printf("test_every_is_bool_and_synonym\n");
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"name", DataType::Text, /*nullable=*/true}});
+    parser::Parser p;
+    // A bare non-grouped column alongside EVERY() -> NonGroupedColumn (aggregate
+    // query), and NO UnknownFunction warning; identical to BOOL_AND.
+    for (const char* fn : {"EVERY", "BOOL_AND"}) {
+        const std::string sql = std::string{"SELECT name, "} + fn + "(id > 0) FROM users";
+        auto res = p.parse(sql.c_str());
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+        CHECK(count_code(a, DiagnosticCode::UnknownFunction) == 0);
+        const auto* proj = a.projection_of(res.value());
+        CHECK(proj != nullptr && proj->size() == 2);
+        if (proj != nullptr && proj->size() == 2) {
+            CHECK((*proj)[1].type == DataType::Boolean);  // EVERY(...) is BOOLEAN
+        }
+    }
+    // A grouped EVERY over an empty group is nullable (like BOOL_AND).
+    {
+        auto res = p.parse("SELECT EVERY(id > 0) FROM users");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(!a.has_errors());
+            const auto* proj = a.projection_of(res.value());
+            CHECK(proj != nullptr && !proj->empty() && (*proj)[0].nullable);
+        }
+    }
+}
+
+// FILTER (WHERE ...) is only permitted on an aggregate. Applying it to a scalar
+// function must be rejected; an aggregate with FILTER stays clean.
+void test_filter_requires_aggregate() {
+    std::printf("test_filter_requires_aggregate\n");
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"name", DataType::Text, /*nullable=*/true}});
+    parser::Parser p;
+    auto count_filter_err = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::FilterOnNonAggregate);
+    };
+    // Scalar function with FILTER -> rejected.
+    CHECK(count_filter_err("SELECT abs(id) FILTER (WHERE id > 1) FROM users") == 1);
+    CHECK(count_filter_err("SELECT upper(name) FILTER (WHERE id > 1) FROM users") == 1);
+    // Aggregate with FILTER -> clean.
+    CHECK(count_filter_err("SELECT count(*) FILTER (WHERE id > 1) FROM users") == 0);
+    CHECK(count_filter_err("SELECT sum(id) FILTER (WHERE id > 1) FROM users") == 0);
+    CHECK(count_filter_err("SELECT every(id > 0) FILTER (WHERE id > 1) FROM users") == 0);
+}
+
 void test_recursive_cte_nullability() {
     std::printf("test_recursive_cte_nullability\n");
     InMemoryCatalog cat;
@@ -5942,6 +6008,8 @@ int main() {
     test_recursive_cte();
     test_unknown_function_nullability();
     test_exists_requires_subquery();
+    test_every_is_bool_and_synonym();
+    test_filter_requires_aggregate();
     test_recursive_cte_nullability();
     test_duplicate_derived_alias_ambiguous();
     test_unresolved_table();

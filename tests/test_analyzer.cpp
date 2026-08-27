@@ -3242,6 +3242,39 @@ void test_group_by_grouping_set_key_nullable() {
     }
 }
 
+// M2 (pass 13): an ORDER BY key that references a ROLLUP/CUBE/GROUPING SETS
+// output column must carry the SAME nullability the SELECT-list column and the
+// projection do - nullable - because the key is NULL in the super-aggregate
+// rows. The ORDER BY key was resolved BEFORE the grouping-set nullability
+// re-mark, so it was left stale NOT NULL; the binder consumes that annotation.
+void test_order_by_grouping_set_key_nullable() {
+    std::printf("test_order_by_grouping_set_key_nullable\n");
+    auto cat = make_catalog_emp();  // emp(id INT NOT NULL, ...)
+    parser::Parser p;
+    // Return the ORDER BY key's recorded nullability (2 = nullable, 1 = not).
+    auto ob_null = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        ASTNode* ob = find_child(res.value(), NodeType::OrderByClause);
+        ASTNode* key = ob ? first_child(ob) : nullptr;
+        return key ? a.nullability_of(key) : -1;
+    };
+    // ROLLUP/CUBE/GROUPING SETS: the ORDER BY key `id` is nullable (2), matching
+    // the SELECT-list column, whether referenced by name or by position.
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY ROLLUP(id) ORDER BY id") == 2);
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY CUBE(id) ORDER BY id") == 2);
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp "
+                  "GROUP BY GROUPING SETS ((id)) ORDER BY id") == 2);
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY ROLLUP(id) ORDER BY 1") == 2);
+    // Guard: a PLAIN GROUP BY key is NOT nulled, so its ORDER BY key stays NOT
+    // NULL (1) - the refresh must not over-null a non-grouping-set key.
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY id ORDER BY id") == 1);
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY id ORDER BY 1") == 1);
+}
+
 // M2 follow-up: a SELECT-list EXPRESSION that reads a ROLLUP/CUBE/GROUPING SETS
 // grouping key (outside an aggregate) is also NULL in the super-aggregate rows,
 // so it is nullable - not only the bare key column. A read INSIDE an aggregate
@@ -5749,6 +5782,7 @@ int main() {
     test_numeric_real_promotes_double();
     test_group_by_grouping_element_columns();
     test_group_by_grouping_set_key_nullable();
+    test_order_by_grouping_set_key_nullable();
     test_group_by_grouping_set_expression_nullable();
     test_group_by_grouping_set_window_not_nulled();
     test_window_in_where_having_rejected();

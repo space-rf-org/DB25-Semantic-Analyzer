@@ -223,6 +223,19 @@ private:
                           std::vector<ResolvedColumn>& output,
                           const std::vector<ASTNode*>& output_sources);
 
+    // Validate and type an ORDER BY clause that hangs off `container` (a
+    // SelectStmt or a set-operation node). Shared by analyze_query and
+    // analyze_setop so a set-op's ORDER BY is validated the same way a plain
+    // SELECT's is (positional range check, output-name resolution, type /
+    // nullability recording). `output` is the statement's projected columns.
+    // `from_scope` is the FROM scope an unresolved key falls back to for a plain
+    // SELECT (a column may name an input, not just an output); pass nullptr for a
+    // set operation, which has no single FROM scope - an ORDER BY key there may
+    // reference only an output column, so an unresolved one is UnresolvedColumn.
+    void analyze_order_by(ASTNode* container,
+                          const std::vector<ResolvedColumn>& output,
+                          Scope* from_scope);
+
     // Does `expr` reference - OUTSIDE any aggregate call - a column whose
     // (table_id, column_id) is in `keys`? A reference inside an aggregate does
     // NOT count: the aggregate reads the raw input rows, where a grouping-set

@@ -800,6 +800,39 @@ void test_recursive_cte() {
 // self-reference can resolve; the recursive term's nullability must then be
 // widened back in - else a NULL-producing recursive term is reported NOT NULL
 // (the unsafe direction: a consumer could drop a needed NULL check).
+// An unknown function's result nullability must degrade to nullable rather than
+// confidently inheriting NOT NULL from non-null arguments: its semantics are
+// opaque and many functions -- unknown aggregates especially (EVERY, BOOL_AND,
+// UDFs) return NULL over an empty group. A KNOWN scalar function still
+// propagates its arguments' nullability.
+void test_unknown_function_nullability() {
+    std::printf("test_unknown_function_nullability\n");
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"name", DataType::Text, /*nullable=*/true}});
+    parser::Parser p;
+    auto proj0_nullable = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        const auto* proj = a.projection_of(res.value());
+        if (proj == nullptr || proj->empty()) return -1;
+        return (*proj)[0].nullable ? 1 : 0;
+    };
+    // EVERY is the SQL-standard synonym of BOOL_AND but is not in the catalog;
+    // over non-null input it was wrongly reported NOT NULL. It returns NULL over
+    // an empty group, so its result must be nullable (the unsafe->safe fix).
+    CHECK(proj0_nullable("SELECT EVERY(id > 0) FROM users") == 1);
+    // Any unknown function of a not-null argument: result nullable, not NOT NULL.
+    CHECK(proj0_nullable("SELECT some_unknown_fn(id) FROM users") == 1);
+    // Guard: a KNOWN scalar function over a not-null argument stays NOT NULL.
+    CHECK(proj0_nullable("SELECT ABS(id) FROM users") == 0);
+    // Guard: a KNOWN scalar function over a nullable argument stays nullable.
+    CHECK(proj0_nullable("SELECT UPPER(name) FROM users") == 1);
+}
+
 void test_recursive_cte_nullability() {
     std::printf("test_recursive_cte_nullability\n");
     InMemoryCatalog cat;
@@ -5877,6 +5910,7 @@ int main() {
     test_cte_setop_body();
     test_cte_column_alias_count_mismatch();
     test_recursive_cte();
+    test_unknown_function_nullability();
     test_recursive_cte_nullability();
     test_duplicate_derived_alias_ambiguous();
     test_unresolved_table();

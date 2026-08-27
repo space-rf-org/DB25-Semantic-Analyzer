@@ -3276,12 +3276,19 @@ void test_order_by_grouping_set_key_nullable() {
     CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY CUBE(id) ORDER BY emp.id") == 2);
     CHECK(ob_null("SELECT id, SUM(salary) FROM emp e "
                   "GROUP BY ROLLUP(id) ORDER BY e.id") == 2);
+    // A COMPOUND-EXPRESSION ORDER BY key that reads the grouping-set key is
+    // nullable too - identical to the same expression in the SELECT list.
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY ROLLUP(id) ORDER BY id + 1") == 2);
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY CUBE(id) ORDER BY id * 2") == 2);
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY ROLLUP(id) "
+                  "ORDER BY id + id") == 2);
     // Guard: a PLAIN GROUP BY key is NOT nulled, so its ORDER BY key stays NOT
     // NULL (1) - the refresh must not over-null a non-grouping-set key,
-    // qualified or not.
+    // qualified, positional, or expression.
     CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY id ORDER BY id") == 1);
     CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY id ORDER BY 1") == 1);
     CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY id ORDER BY emp.id") == 1);
+    CHECK(ob_null("SELECT id, SUM(salary) FROM emp GROUP BY id ORDER BY id + 1") == 1);
 }
 
 // M2 follow-up: a SELECT-list EXPRESSION that reads a ROLLUP/CUBE/GROUPING SETS

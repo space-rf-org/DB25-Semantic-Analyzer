@@ -3606,14 +3606,32 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                                    key);
                     continue;  // out-of-range: do not register a bogus key
                 }
-                std::size_t i = 1;
-                for (ASTNode* item = first_child(select_list); item != nullptr;
-                     item = item->next_sibling, ++i) {
-                    if (i == ordinal) {
-                        identity = item;
-                        break;
+                // Resolve against the OUTPUT columns (AFTER star expansion), not
+                // the raw select-list items: `SELECT * FROM emp GROUP BY 1` groups
+                // by the 1st EXPANDED column, and counting select-list items (a
+                // single Star) could neither map an ordinal to a star column nor
+                // reach ordinals past the star. output_sources[n-1] is that output
+                // column's source node (null for a star-expanded column); use it
+                // for the aggregate/window re-check, and take the key's identity
+                // from the output column so an explicit ref OR a star-expanded
+                // column of the same (table_id, column_id) matches it.
+                const ResolvedColumn& out_col = output[ordinal - 1];
+                const ASTNode* src = (ordinal - 1 < output_sources.size())
+                                         ? output_sources[ordinal - 1]
+                                         : nullptr;
+                if (src != nullptr) {
+                    if (const char* why = nullptr; illegal_group_key(src, why)) {
+                        add_diagnostic(DiagnosticCode::AggregateInGroupBy, why, key);
+                        continue;  // grouping by an aggregate/window position
                     }
                 }
+                GroupKey k;
+                k.table_id = out_col.table_id;
+                k.column_id = out_col.column_id;
+                k.text = out_col.name;
+                k.node = src;  // may be null for a star-expanded column
+                keys.push_back(k);
+                continue;  // positional key handled; skip the shared path below
             } else if (ASTNode* alias_item =
                            group_key_alias_item(key, select_list, scope)) {
                 // GROUP BY <output-alias>: the query groups by the aliased SELECT

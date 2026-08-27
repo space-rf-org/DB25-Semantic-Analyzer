@@ -1864,14 +1864,22 @@ void Analyzer::analyze_order_by(ASTNode* container,
             // not projected (`SELECT a FROM t ORDER BY b`), so fall back to the
             // FROM scope.
             infer_expr(item, *from_scope);
-        } else if (is_column_ref_node(item->node_type)) {
+        } else {
             // Set operation: there is no single FROM scope, so an ORDER BY key may
-            // reference ONLY an output column (by name or position). A name that
-            // matched no output column is unresolved (Postgres: "ORDER BY ... must
-            // appear in the select list").
+            // reference ONLY an output column - by position (handled above) or by
+            // an output column's NAME. Anything else is illegal: a bare column
+            // name that matched no output column, OR a compound expression
+            // (`id + 1`, `UPPER(name)`). Postgres rejects both: "Only result
+            // column names can be used, not expressions or functions." Diagnose
+            // it rather than silently handing the binder an unresolved,
+            // unannotated sort key.
+            const bool is_col = is_column_ref_node(item->node_type);
             add_diagnostic(DiagnosticCode::UnresolvedColumn,
-                           "ORDER BY column '" + std::string{item->primary_text} +
-                               "' must appear in the set operation's select list",
+                           std::string{"ORDER BY "} +
+                               (is_col ? "column '" + std::string{item->primary_text} + "'"
+                                       : "expression") +
+                               " must be an output column of the set operation "
+                               "(only result column names or positions are allowed)",
                            item);
         }
     }

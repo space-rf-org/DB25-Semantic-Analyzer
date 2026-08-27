@@ -2295,6 +2295,42 @@ void test_order_by_positional_validated() {
     CHECK(bad("SELECT id FROM users ORDER BY id") == 0);
 }
 
+// A top-level ORDER BY on a set operation (UNION/INTERSECT/EXCEPT) is validated
+// the same way a plain SELECT's is: its keys reference the union's OUTPUT
+// columns only. Previously analyze_setop dropped the ORDER BY entirely, so
+// illegal keys were silently accepted.
+void test_setop_order_by_validated() {
+    std::printf("test_setop_order_by_validated\n");
+    auto cat = make_catalog();  // users(id, name)
+    parser::Parser p;
+    auto codes = [&](const char* sql, DiagnosticCode code) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, code);
+    };
+    // A one-column union: `ORDER BY 5` / `ORDER BY -1` are out of range.
+    CHECK(codes("SELECT id FROM users UNION SELECT id FROM users ORDER BY 5",
+                DiagnosticCode::InvalidOrderByPosition) == 1);
+    CHECK(codes("SELECT id FROM users UNION SELECT id FROM users ORDER BY -1",
+                DiagnosticCode::InvalidOrderByPosition) == 1);
+    // A name that is not an output column is unresolved.
+    CHECK(codes("SELECT id FROM users UNION SELECT id FROM users ORDER BY bogus_col",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    // Legal keys (an in-range position, an output-column name) stay clean.
+    CHECK(codes("SELECT id FROM users UNION SELECT id FROM users ORDER BY 1",
+                DiagnosticCode::InvalidOrderByPosition) == 0);
+    CHECK(codes("SELECT id FROM users UNION SELECT id FROM users ORDER BY id",
+                DiagnosticCode::UnresolvedColumn) == 0);
+    // INTERSECT / EXCEPT are validated identically.
+    CHECK(codes("SELECT id FROM users INTERSECT SELECT id FROM users ORDER BY 9",
+                DiagnosticCode::InvalidOrderByPosition) == 1);
+    CHECK(codes("SELECT id FROM users EXCEPT SELECT id FROM users ORDER BY nope",
+                DiagnosticCode::UnresolvedColumn) == 1);
+}
+
 void test_groupby_positional_single() {
     std::printf("test_groupby_positional_single\n");
     auto cat = make_catalog_emp();
@@ -5662,6 +5698,7 @@ int main() {
     test_deep_expression_does_not_crash();
     test_boolean_context_non_boolean_flagged();
     test_order_by_positional_validated();
+    test_setop_order_by_validated();
     test_wide_relation_resolution();
     test_groupby_positional_single();
     test_groupby_positional_multi();

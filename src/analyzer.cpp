@@ -1722,72 +1722,7 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     // 7. ORDER BY: resolve each sort expression first against the SELECT-list
     //    output names/aliases (SQL lets ORDER BY reference an output column by
     //    its alias), then, failing that, against the FROM scope.
-    if (ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
-        for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
-            // Positional ORDER BY: `ORDER BY n` sorts by the n-th (1-based) SELECT
-            // output column. n must be in 1..output.size(); a <= 0 (the parser
-            // emits `-1` / `0` as a single IntegerLiteral) or out-of-range ordinal
-            // is an error, exactly as GROUP BY positions are validated. A valid
-            // position takes the referenced output column's type/nullability.
-            if (item->node_type == NodeType::IntegerLiteral) {
-                const std::string_view text = item->primary_text;
-                std::size_t ordinal = 0;
-                bool valid = !text.empty() && text.front() != '-';
-                for (const char c : text) {
-                    if (c < '0' || c > '9') { valid = false; break; }
-                    ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
-                    // Clamp once past the output width: any larger position is out
-                    // of range, and clamping stops a huge literal (>= 2^64) from
-                    // wrapping modulo 2^64 back into a valid 1..N ordinal.
-                    if (ordinal > output.size()) {
-                        ordinal = output.size() + 1;
-                    }
-                }
-                if (!valid || ordinal < 1 || ordinal > output.size()) {
-                    add_diagnostic(DiagnosticCode::InvalidOrderByPosition,
-                                   "ORDER BY position '" + std::string{text} +
-                                       "' is not in the select list (1.." +
-                                       std::to_string(output.size()) + ")",
-                                   item);
-                } else {
-                    const ResolvedColumn& col = output[ordinal - 1];
-                    record_type(item, col.type);
-                    record_nullability(item, col.nullable ? 2 : 1);
-                }
-                continue;
-            }
-            const ResolvedColumn* out_match = nullptr;
-            if (is_column_ref_node(item->node_type)) {
-                const QualifiedRef qref = split_column_ref(item->primary_text);
-                // Only an UNQUALIFIED order-by ref may name a SELECT output column
-                // by its alias/name. A qualified `t.col` always names a base/input
-                // column - never an output alias - so it must resolve against the
-                // FROM scope (this mirrors the grouping-legality exemption below).
-                // Matching a qualified ref to an output column by bare name skipped
-                // infer_expr, leaving table_id/column_id 0: a legal `GROUP BY dept
-                // ... ORDER BY emp.dept` was then falsely NonGroupedColumn (the key
-                // match fell back to text and failed), and `SELECT sal AS id ...
-                // ORDER BY e.id` took the output column's type (Double) instead of
-                // base emp.id (Integer).
-                if (qref.qualifier.empty()) {
-                    for (const auto& col : output) {
-                        if (iequals(col.name, qref.column)) {
-                            out_match = &col;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (out_match != nullptr) {
-                // Resolved against the projection; type flows from the output
-                // column and no FROM-scope lookup (or diagnostic) is needed.
-                record_type(item, out_match->type);
-                record_nullability(item, out_match->nullable ? 2 : 1);
-            } else {
-                infer_expr(item, scope);
-            }
-        }
-    }
+    analyze_order_by(select_stmt, output, &scope);
 
     // 8. LIMIT / OFFSET: literal operands must be non-negative integers.
     if (ASTNode* limit = find_child(select_stmt, NodeType::LimitClause)) {
@@ -1857,6 +1792,91 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
     }
 }
 
+void Analyzer::analyze_order_by(ASTNode* container,
+                                const std::vector<ResolvedColumn>& output,
+                                Scope* from_scope) {
+    ASTNode* order_by = find_child(container, NodeType::OrderByClause);
+    if (order_by == nullptr) {
+        return;
+    }
+    for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
+        // Positional ORDER BY: `ORDER BY n` sorts by the n-th (1-based) SELECT
+        // output column. n must be in 1..output.size(); a <= 0 (the parser
+        // emits `-1` / `0` as a single IntegerLiteral) or out-of-range ordinal
+        // is an error, exactly as GROUP BY positions are validated. A valid
+        // position takes the referenced output column's type/nullability.
+        if (item->node_type == NodeType::IntegerLiteral) {
+            const std::string_view text = item->primary_text;
+            std::size_t ordinal = 0;
+            bool valid = !text.empty() && text.front() != '-';
+            for (const char c : text) {
+                if (c < '0' || c > '9') { valid = false; break; }
+                ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
+                // Clamp once past the output width: any larger position is out
+                // of range, and clamping stops a huge literal (>= 2^64) from
+                // wrapping modulo 2^64 back into a valid 1..N ordinal.
+                if (ordinal > output.size()) {
+                    ordinal = output.size() + 1;
+                }
+            }
+            if (!valid || ordinal < 1 || ordinal > output.size()) {
+                add_diagnostic(DiagnosticCode::InvalidOrderByPosition,
+                               "ORDER BY position '" + std::string{text} +
+                                   "' is not in the select list (1.." +
+                                   std::to_string(output.size()) + ")",
+                               item);
+            } else {
+                const ResolvedColumn& col = output[ordinal - 1];
+                record_type(item, col.type);
+                record_nullability(item, col.nullable ? 2 : 1);
+            }
+            continue;
+        }
+        const ResolvedColumn* out_match = nullptr;
+        if (is_column_ref_node(item->node_type)) {
+            const QualifiedRef qref = split_column_ref(item->primary_text);
+            // Only an UNQUALIFIED order-by ref may name a SELECT output column
+            // by its alias/name. A qualified `t.col` always names a base/input
+            // column - never an output alias - so it must resolve against the
+            // FROM scope (this mirrors the grouping-legality exemption below).
+            // Matching a qualified ref to an output column by bare name skipped
+            // infer_expr, leaving table_id/column_id 0: a legal `GROUP BY dept
+            // ... ORDER BY emp.dept` was then falsely NonGroupedColumn (the key
+            // match fell back to text and failed), and `SELECT sal AS id ...
+            // ORDER BY e.id` took the output column's type (Double) instead of
+            // base emp.id (Integer).
+            if (qref.qualifier.empty()) {
+                for (const auto& col : output) {
+                    if (iequals(col.name, qref.column)) {
+                        out_match = &col;
+                        break;
+                    }
+                }
+            }
+        }
+        if (out_match != nullptr) {
+            // Resolved against the projection; type flows from the output
+            // column and no FROM-scope lookup (or diagnostic) is needed.
+            record_type(item, out_match->type);
+            record_nullability(item, out_match->nullable ? 2 : 1);
+        } else if (from_scope != nullptr) {
+            // Plain SELECT: an ORDER BY key may reference an input column that is
+            // not projected (`SELECT a FROM t ORDER BY b`), so fall back to the
+            // FROM scope.
+            infer_expr(item, *from_scope);
+        } else if (is_column_ref_node(item->node_type)) {
+            // Set operation: there is no single FROM scope, so an ORDER BY key may
+            // reference ONLY an output column (by name or position). A name that
+            // matched no output column is unresolved (Postgres: "ORDER BY ... must
+            // appear in the select list").
+            add_diagnostic(DiagnosticCode::UnresolvedColumn,
+                           "ORDER BY column '" + std::string{item->primary_text} +
+                               "' must appear in the set operation's select list",
+                           item);
+        }
+    }
+}
+
 std::vector<ResolvedColumn> Analyzer::analyze_setop(ASTNode* setop, Scope* parent) {
     // A WITH clause may sit ABOVE a top-level set operation
     // (`WITH t AS (...) SELECT ... UNION SELECT ...`); the parser attaches it as a
@@ -1920,6 +1940,14 @@ std::vector<ResolvedColumn> Analyzer::analyze_setop(ASTNode* setop, Scope* paren
             }
         }
     }
+
+    // A top-level ORDER BY on the set operation sorts the combined result. Its
+    // keys reference the union's OUTPUT columns only (by position or name), so
+    // validate/type them against `result` with no FROM scope - an out-of-range
+    // position is InvalidOrderByPosition and an unknown name is UnresolvedColumn,
+    // exactly as a plain SELECT's ORDER BY is checked. (Previously the set-op
+    // path dropped the ORDER BY entirely, silently accepting illegal keys.)
+    analyze_order_by(setop, result, /*from_scope=*/nullptr);
 
     projections_[setop] = result;
     return result;

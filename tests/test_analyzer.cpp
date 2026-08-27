@@ -2405,8 +2405,39 @@ void test_groupby_positional_overflow() {
 
     Analyzer a(cat);
     a.analyze(res.value());
-    // dept is not grouped by the (out-of-range) position, so it is flagged.
+    // dept is not grouped by the (out-of-range) position, so it is flagged...
     CHECK(count_code(a, DiagnosticCode::NonGroupedColumn) == 1);
+    // ...and the out-of-range position itself is now reported.
+    CHECK(count_code(a, DiagnosticCode::InvalidOrderByPosition) == 1);
+}
+
+// A positional GROUP BY (`GROUP BY n`) must reference an existing output column
+// (1..N); a <= 0 or out-of-range ordinal is an error - exactly as ORDER BY
+// positions are validated - not a silently-registered phantom grouping key.
+void test_groupby_position_out_of_range() {
+    std::printf("test_groupby_position_out_of_range\n");
+    auto cat = make_catalog();  // users(id, name)
+    auto cat_emp = make_catalog_emp();  // emp(dept, age, ...)
+    parser::Parser p;
+    auto bad = [&](const InMemoryCatalog& c, const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(c);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::InvalidOrderByPosition);
+    };
+    // All-aggregate/constant select lists: previously accepted with ZERO
+    // diagnostics because the phantom key satisfied the grouping rule.
+    CHECK(bad(cat, "SELECT COUNT(*) FROM users GROUP BY 2") == 1);   // only 1 output col
+    CHECK(bad(cat, "SELECT COUNT(*) FROM users GROUP BY 0") == 1);
+    CHECK(bad(cat, "SELECT 1 FROM users GROUP BY 7") == 1);
+    CHECK(bad(cat_emp, "SELECT dept FROM emp GROUP BY dept, 99") == 1);
+    CHECK(bad(cat_emp, "SELECT MAX(salary) FROM emp GROUP BY dept, 7") == 1);
+    // Valid positions stay clean.
+    CHECK(bad(cat, "SELECT id, name FROM users GROUP BY 1") == 0);
+    CHECK(bad(cat, "SELECT id, name FROM users GROUP BY 1, 2") == 0);
+    CHECK(bad(cat_emp, "SELECT dept, COUNT(*) FROM emp GROUP BY 1") == 0);
 }
 
 void test_avg_result_type() {
@@ -5766,6 +5797,7 @@ int main() {
     test_groupby_positional_multi();
     test_groupby_positional_still_flags_non_grouped();
     test_groupby_positional_overflow();
+    test_groupby_position_out_of_range();
     test_avg_result_type();
     test_scalar_function_type();
     test_unknown_function_degrades();

@@ -3628,7 +3628,25 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                 GroupKey k;
                 k.table_id = out_col.table_id;
                 k.column_id = out_col.column_id;
-                k.text = out_col.name;
+                // Identify the key by the SOURCE column's own name, NOT the
+                // output column's name. For `SELECT *, x AS foo FROM s GROUP BY
+                // 2` the output name is the alias `foo`, but the star-grouping
+                // check compares a star column's base name (`x`) against k.text
+                // via same_column_name; using the alias would make `x` look
+                // non-grouped and raise a phantom NonGroupedColumn. The source
+                // node's primary_text is the base ref (`x` / `t.x`) - the alias
+                // lives in schema_name - so it matches the star column. Only a
+                // ColumnRef/Identifier source carries a base name; for an
+                // expression or a star-expanded column (null src) fall back to
+                // the output name.
+                // Both operands are string_views into storage that outlives
+                // `keys` (the AST's primary_text, or the output column's name in
+                // `output`) - never a temporary std::string, which would dangle.
+                k.text = (src != nullptr &&
+                          (src->node_type == NodeType::ColumnRef ||
+                           src->node_type == NodeType::Identifier))
+                             ? std::string_view{src->primary_text}
+                             : std::string_view{out_col.name};
                 k.node = src;  // may be null for a star-expanded column
                 keys.push_back(k);
                 continue;  // positional key handled; skip the shared path below

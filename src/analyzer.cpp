@@ -3495,6 +3495,12 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
 
     // Collect the grouping keys (their resolved identity + text).
     std::vector<GroupKey> keys;
+    // (table_id, column_id) of the columns reached THROUGH a ROLLUP/CUBE/GROUPING
+    // SETS element - the keys that are NULL in the super-aggregate rows. Empty for
+    // a plain GROUP BY. Populated during the projection re-mark below and reused by
+    // the ORDER BY nullability refresh (function scope so it outlives the
+    // group_by-only block where the grouping keys are flattened).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> gs_ids;
     if (group_by != nullptr) {
         // Flatten the GROUP BY list into its effective grouping columns. A
         // GroupingElement (ROLLUP / CUBE / GROUPING SETS) is not itself a key -
@@ -3640,7 +3646,6 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
         // analyze_grouping runs, so re-mark here. A plain GROUP BY key, or a bare
         // parenthesized GROUP BY list, is NOT nulled: only a GroupingElement.
         if (!grouping_set_keys.empty()) {
-            std::vector<std::pair<std::uint32_t, std::uint32_t>> gs_ids;
             for (const ASTNode* gk : grouping_set_keys) {
                 const std::uint32_t tid = gk->context.analysis.table_id;
                 const std::uint32_t cid = gk->context.analysis.column_id;
@@ -3728,27 +3733,22 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                         record_nullability(item, out_match->nullable ? 2 : 1);
                         continue;
                     }
-                } else {
-                    // A QUALIFIED key (`emp.id`, `e.id`) resolved against the FROM
-                    // scope to a base column - by (table_id, column_id) - so match
-                    // it to the output column of the same identity and refresh its
-                    // nullability from the re-marked output. This is the qualified
-                    // analog of the unqualified-name refresh above; without it a
-                    // qualified reference to a ROLLUP/CUBE/GROUPING SETS key keeps
-                    // the pre-remark not-null value. A qualified ref is NOT exempt
-                    // from the grouping rule, so DON'T continue - fall through to
-                    // check_grouping_expr below.
-                    const std::uint32_t tid = item->context.analysis.table_id;
-                    const std::uint32_t cid = item->context.analysis.column_id;
-                    if (tid != 0 || cid != 0) {
-                        for (const ResolvedColumn& col : output) {
-                            if (col.table_id == tid && col.column_id == cid) {
-                                record_nullability(item, col.nullable ? 2 : 1);
-                                break;
-                            }
-                        }
-                    }
                 }
+            }
+            // Any remaining key that READS a ROLLUP/CUBE/GROUPING SETS key outside
+            // an aggregate is NULL in the super-aggregate rows and must be nullable,
+            // exactly like the identical SELECT-list expression the pass above nulls
+            // (src/analyzer.cpp expr_reads_grouping_key). This one check covers every
+            // spelling not handled by the unqualified-output-name branch above: a
+            // qualified column (`emp.id`), a compound expression (`id + 1`,
+            // `UPPER(dept)`), and a grouping-set key that is not itself projected. A
+            // qualified/expression key is NOT exempt from the grouping rule, so it
+            // still falls through to check_grouping_expr. (Empty gs_ids - a plain
+            // GROUP BY - makes this a no-op, so a non-grouping-set key stays as
+            // analyze_order_by recorded it.)
+            if (!gs_ids.empty() &&
+                expr_reads_grouping_key(item, gs_ids, /*in_aggregate=*/false)) {
+                record_nullability(item, 2);
             }
             check_grouping_expr(item, keys, /*grouping_exempt=*/false, /*in_aggregate=*/false);
         }

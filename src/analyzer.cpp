@@ -3728,6 +3728,26 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                         record_nullability(item, out_match->nullable ? 2 : 1);
                         continue;
                     }
+                } else {
+                    // A QUALIFIED key (`emp.id`, `e.id`) resolved against the FROM
+                    // scope to a base column - by (table_id, column_id) - so match
+                    // it to the output column of the same identity and refresh its
+                    // nullability from the re-marked output. This is the qualified
+                    // analog of the unqualified-name refresh above; without it a
+                    // qualified reference to a ROLLUP/CUBE/GROUPING SETS key keeps
+                    // the pre-remark not-null value. A qualified ref is NOT exempt
+                    // from the grouping rule, so DON'T continue - fall through to
+                    // check_grouping_expr below.
+                    const std::uint32_t tid = item->context.analysis.table_id;
+                    const std::uint32_t cid = item->context.analysis.column_id;
+                    if (tid != 0 || cid != 0) {
+                        for (const ResolvedColumn& col : output) {
+                            if (col.table_id == tid && col.column_id == cid) {
+                                record_nullability(item, col.nullable ? 2 : 1);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             check_grouping_expr(item, keys, /*grouping_exempt=*/false, /*in_aggregate=*/false);

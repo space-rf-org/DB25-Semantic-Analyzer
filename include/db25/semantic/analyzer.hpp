@@ -39,6 +39,13 @@ struct GroupKey {
     std::string_view text;      // primary_text of the grouping expression
     const ASTNode* node = nullptr;  // the key expression, for whole-expression matching
                                     // (GROUP BY date_trunc(..) / a+b, not just a column)
+    // The relation-instance qualifier for a key that resolved to a `*`-expanded
+    // column (a positional `GROUP BY 1` into a star). Such a key has no AST node
+    // and its `text` is the bare base-column name, so the qualifier that would
+    // otherwise disambiguate a self-join instance is not in `text`; it is carried
+    // here instead (from the star column's ResolvedColumn::qualifier). Empty for
+    // every other key, where the qualifier is read from `text` as before.
+    std::string_view instance;
 };
 
 class Analyzer {

@@ -2783,11 +2783,23 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             // EXISTS (subquery) / NOT EXISTS (subquery): always Boolean and never
             // NULL; arity of the subquery is irrelevant, correlation is allowed.
             if (upper == "EXISTS" || upper == "NOT EXISTS") {
+                bool has_subquery = false;
                 for (ASTNode* c = first_child(expr); c != nullptr; c = c->next_sibling) {
                     if (c->node_type == NodeType::Subquery ||
                         c->node_type == NodeType::SubqueryExpr) {
                         analyze_subquery(c, scope);
+                        has_subquery = true;
                     }
+                }
+                // EXISTS requires a subquery operand. The parser is lenient about
+                // the operand shape (a scalar like `EXISTS 5` or `EXISTS ((SELECT
+                // 1) + 2)` parses), so reject a non-subquery operand here rather
+                // than type it Boolean and hand the binder a tree it cannot
+                // lower. Still typed Boolean so downstream typing is defined.
+                if (!has_subquery) {
+                    add_diagnostic(DiagnosticCode::ExistsWithoutSubquery,
+                                   "EXISTS requires a parenthesized subquery operand",
+                                   expr);
                 }
                 record_type(expr, DataType::Boolean);
                 record_nullability(expr, 1);

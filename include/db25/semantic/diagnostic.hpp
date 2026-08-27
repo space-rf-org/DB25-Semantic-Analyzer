@@ -119,6 +119,12 @@ enum class DiagnosticCode : std::uint16_t {
     // (Postgres: "ORDER BY position N is not in select list" / "ORDER BY position
     // must be > 0"). GROUP BY positions are validated the same way.
     InvalidOrderByPosition,
+    // EXISTS / NOT EXISTS applied to something other than a subquery (e.g.
+    // `EXISTS 5`, `EXISTS ((SELECT 1) + 2)`). The parser is deliberately lenient
+    // about the operand shape, so the "EXISTS requires a subquery" rule is
+    // enforced here: without it a scalar EXISTS analyzed clean but could not be
+    // lowered (Postgres: `EXISTS` takes a `(subquery)`).
+    ExistsWithoutSubquery,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

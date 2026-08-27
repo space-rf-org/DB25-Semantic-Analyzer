@@ -833,6 +833,36 @@ void test_unknown_function_nullability() {
     CHECK(proj0_nullable("SELECT UPPER(name) FROM users") == 1);
 }
 
+// EXISTS / NOT EXISTS require a subquery operand. The parser is lenient about
+// the operand shape (a scalar `EXISTS 5` or `EXISTS ((SELECT 1) + 2)` parses),
+// so the analyzer must reject a non-subquery operand -- otherwise it analyzes
+// clean and the binder is handed a tree it cannot lower (analyzer-clean =>
+// bind-ok seam). A real subquery operand still analyzes clean.
+void test_exists_requires_subquery() {
+    std::printf("test_exists_requires_subquery\n");
+    InMemoryCatalog cat;
+    cat.add_table("users", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                            ColumnInfo{"name", DataType::Text, /*nullable=*/true}});
+    parser::Parser p;
+    auto has_err = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return a.has_errors() ? 1 : 0;
+    };
+    // Scalar / expression operands are rejected.
+    CHECK(has_err("SELECT EXISTS 5 FROM users") == 1);
+    CHECK(has_err("SELECT id FROM users WHERE EXISTS 5") == 1);
+    CHECK(has_err("SELECT * FROM users WHERE EXISTS ((SELECT 1) + 2)") == 1);
+    CHECK(has_err("SELECT NOT EXISTS 5 FROM users") == 1);
+    // Guard: a real subquery operand analyzes clean.
+    CHECK(has_err("SELECT EXISTS (SELECT 1) FROM users") == 0);
+    CHECK(has_err("SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM users v WHERE v.id = u.id)") == 0);
+    CHECK(has_err("SELECT * FROM users WHERE NOT EXISTS (SELECT 1)") == 0);
+}
+
 void test_recursive_cte_nullability() {
     std::printf("test_recursive_cte_nullability\n");
     InMemoryCatalog cat;
@@ -5911,6 +5941,7 @@ int main() {
     test_cte_column_alias_count_mismatch();
     test_recursive_cte();
     test_unknown_function_nullability();
+    test_exists_requires_subquery();
     test_recursive_cte_nullability();
     test_duplicate_derived_alias_ambiguous();
     test_unresolved_table();

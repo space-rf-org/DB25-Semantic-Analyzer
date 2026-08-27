@@ -2621,7 +2621,16 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                expr, Severity::Warning);
             }
             record_type(expr, ft.type);
-            record_nullability(expr, function_nullability(upper, arg_nulls));
+            // An unknown function's semantics are opaque: its arguments being
+            // non-null says nothing about whether its result can be NULL. Many
+            // functions -- unknown aggregates especially (EVERY, BOOL_AND, and
+            // UDFs) return NULL over an empty group -- so propagating NOT NULL
+            // from non-null args (the ordinary scalar rule) is the unsafe
+            // direction for a result whose type already degraded to Unknown.
+            // Degrade nullability to nullable to match. A known function keeps
+            // its precise argument-propagated nullability.
+            record_nullability(expr,
+                               ft.known ? function_nullability(upper, arg_nulls) : 2);
             return ft.type;
         }
 

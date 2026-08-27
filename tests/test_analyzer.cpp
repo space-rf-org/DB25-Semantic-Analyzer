@@ -2622,6 +2622,16 @@ void test_empty_grouping_set_grand_total() {
     CHECK(ngc("SELECT COUNT(*) FROM emp GROUP BY ()") == 0);
     // A constant is not a column reference, so it is fine under the grand total.
     CHECK(ngc("SELECT 1 FROM emp GROUP BY ()") == 0);
+    // `GROUP BY (), dept` == `GROUP BY dept`: the empty set contributes no key,
+    // so the query is grouped by dept. `dept` is grouped (clean), a different
+    // bare column is not. Before the parser fix the `()` terminated the list and
+    // dropped `dept`, collapsing to a grand total that flagged dept (== 1).
+    CHECK(ngc("SELECT dept, COUNT(*) FROM emp GROUP BY (), dept") == 0);
+    CHECK(ngc("SELECT dept, name FROM emp GROUP BY (), dept") == 1);  // name only
+    // A trailing empty set is likewise transparent.
+    CHECK(ngc("SELECT dept, COUNT(*) FROM emp GROUP BY dept, ()") == 0);
+    // Two real keys around empty sets: both grouped, clean.
+    CHECK(ngc("SELECT dept, region FROM emp GROUP BY (), dept, (), region") == 0);
 }
 
 // --- Extended built-in function catalog --------------------------------

@@ -29,6 +29,15 @@ struct ResolvedColumn {
     bool nullable = true;
     std::uint32_t table_id = 0;
     std::uint32_t column_id = 0;
+    // The relation INSTANCE this column was projected from, as a qualifier
+    // (the correlation alias, or the relation name when unaliased). Populated
+    // by expand_star for `*` / `q.*` columns; empty for an explicitly-written
+    // SELECT item (which carries its own qualifier in the AST). A self-join
+    // (`emp a, emp b`) gives a.id and b.id the same (table_id, column_id), so a
+    // positional GROUP BY key resolved to a star-expanded column needs this to
+    // tell the two instances apart - otherwise b.id would satisfy a GROUP BY on
+    // a.id. See GroupKey::instance.
+    std::string qualifier;
     // A USING / NATURAL join coalesces the shared column into ONE output column.
     // The right-hand relation's copy is marked coalesced so a bare (unqualified)
     // reference resolves to the single left copy instead of being reported

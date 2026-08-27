@@ -2487,6 +2487,49 @@ void test_groupby_star_validated() {
     CHECK(ngc("SELECT *, id AS foo FROM emp GROUP BY 7") == 5);
 }
 
+// A positional GROUP BY key that resolves to a `*`-expanded column must retain
+// the relation INSTANCE it came from: in a self-join `emp a, emp b` the columns
+// a.id and b.id share (table_id, column_id), so a key on one does not cover the
+// other. Two paths must honour this: the SELECT-list legality check for a
+// SEPARATE column item (key_matches), and the check for a star's OWN expanded
+// columns (the star loop).
+void test_groupby_star_selfjoin_instance() {
+    std::printf("test_groupby_star_selfjoin_instance\n");
+    auto cat = make_catalog_emp();  // emp(id, name, dept, region, salary, age)
+    parser::Parser p;
+    auto ngc = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::NonGroupedColumn);
+    };
+    // `GROUP BY 1` groups a.id (the 1st star-expanded column of instance a). The
+    // separate item b.id is a DIFFERENT instance and must be flagged: a.name,
+    // a.dept, a.region, a.salary, a.age (5) + b.id (1) = 6. Before the fix the
+    // star key's bare text "id" matched b.id via same_relation_instance (one
+    // side unqualified), so b.id was silently accepted and the count was 5.
+    CHECK(ngc("SELECT a.*, b.id FROM emp a, emp b GROUP BY 1") == 6);
+    // Control: the explicit qualified key already disambiguated correctly.
+    CHECK(ngc("SELECT a.*, b.id FROM emp a, emp b GROUP BY a.id") == 6);
+    // Two star keys: GROUP BY 1,3 groups a.id and a.dept; b.dept is a distinct
+    // instance and must be flagged: a.name,a.region,a.salary,a.age (4) + b.dept
+    // (1) = 5. Before the fix: 4 (b.dept wrongly grouped by a.dept's key).
+    CHECK(ngc("SELECT a.*, b.dept FROM emp a, emp b GROUP BY 1, 3") == 5);
+    // The star's OWN columns honour the instance too: `b.*` over an explicit key
+    // on a.id must NOT treat b.id as grouped (the star loop ignored relation
+    // instance entirely). b.name,b.dept,b.region,b.salary,b.age (5) + b.id (1) =
+    // 6. Before the fix: 5 (b.id matched a.id's key by (table_id, column_id)).
+    CHECK(ngc("SELECT b.*, a.id FROM emp a, emp b GROUP BY a.id") == 6);
+    // A star fully covering its own instance is clean even though the other
+    // self-join instance is unselected: a.* grouped by 1..6 -> 0 non-grouped.
+    CHECK(ngc("SELECT a.* FROM emp a, emp b GROUP BY 1, 2, 3, 4, 5, 6") == 0);
+    // Both instances' columns selected and both fully grouped -> clean.
+    CHECK(ngc("SELECT a.*, b.* FROM emp a, emp b "
+              "GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12") == 0);
+}
+
 void test_avg_result_type() {
     std::printf("test_avg_result_type\n");
     auto cat = make_catalog_emp();
@@ -5846,6 +5889,7 @@ int main() {
     test_groupby_positional_overflow();
     test_groupby_position_out_of_range();
     test_groupby_star_validated();
+    test_groupby_star_selfjoin_instance();
     test_avg_result_type();
     test_scalar_function_type();
     test_unknown_function_degrades();

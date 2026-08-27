@@ -1764,6 +1764,10 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
                 ResolvedColumn out = col;
                 out.nullable = out.nullable || rel.nullable_from_join;
                 out.coalesced = false;
+                // Record the relation instance so a positional GROUP BY key that
+                // lands on this star column can be told apart from a same-named
+                // column of another self-join instance (see GroupKey::instance).
+                out.qualifier = rel.alias.empty() ? rel.name : rel.alias;
                 output.push_back(std::move(out));
             }
         }
@@ -1780,6 +1784,7 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
                 ResolvedColumn out = col;
                 out.nullable = out.nullable || rel.nullable_from_join;
                 out.coalesced = false;  // the projection is a fresh relation
+                out.qualifier = rel.alias.empty() ? rel.name : rel.alias;
                 output.push_back(std::move(out));
             }
         }
@@ -3283,14 +3288,17 @@ namespace {
 // separately), so it is enough to reject the case where both references are
 // qualified and their qualifiers differ; a bare reference falls through to the
 // (table_id, column_id) test, which is unambiguous outside a self-join.
-[[nodiscard]] bool same_relation_instance(std::string_view a_text,
-                                          std::string_view b_text) {
-    const std::string_view qa = split_column_ref(a_text).qualifier;
-    const std::string_view qb = split_column_ref(b_text).qualifier;
+[[nodiscard]] bool same_relation_instance_q(std::string_view qa, std::string_view qb) {
     if (!qa.empty() && !qb.empty()) {
         return iequals(qa, qb);
     }
     return true;
+}
+
+[[nodiscard]] bool same_relation_instance(std::string_view a_text,
+                                          std::string_view b_text) {
+    return same_relation_instance_q(split_column_ref(a_text).qualifier,
+                                    split_column_ref(b_text).qualifier);
 }
 
 // Two resolved column references can share a (table_id, column_id) yet denote
@@ -3313,8 +3321,14 @@ namespace {
     const std::uint32_t tid = ref->context.analysis.table_id;
     const std::uint32_t cid = ref->context.analysis.column_id;
     if (cid != 0 && k.column_id != 0) {
+        // The key's relation instance: a star-expanded key carries it in
+        // k.instance (its text is the bare base name); any other key has it in
+        // the qualifier of k.text.
+        const std::string_view k_qual =
+            k.instance.empty() ? split_column_ref(k.text).qualifier : k.instance;
         return tid == k.table_id && cid == k.column_id &&
-               same_relation_instance(ref->primary_text, k.text) &&
+               same_relation_instance_q(split_column_ref(ref->primary_text).qualifier,
+                                        k_qual) &&
                same_column_name(ref->primary_text, k.text);
     }
     return iequals(ref->primary_text, k.text);  // identifiers compare case-insensitively
@@ -3647,6 +3661,12 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                            src->node_type == NodeType::Identifier))
                              ? std::string_view{src->primary_text}
                              : std::string_view{out_col.name};
+                // For a star-expanded column (src == nullptr) k.text is the bare
+                // base name, so the relation instance is not in it; carry it
+                // separately from the star column's recorded qualifier so a
+                // self-join sibling column is not treated as this key. Empty for
+                // an explicit positional item (its qualifier is in k.text).
+                k.instance = out_col.qualifier;
                 k.node = src;  // may be null for a star-expanded column
                 keys.push_back(k);
                 continue;  // positional key handled; skip the shared path below
@@ -3743,20 +3763,30 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                     if (!qualifier.empty() && !rel.matches_qualifier(qualifier)) {
                         continue;
                     }
+                    // This star column belongs to relation instance `rel`; a key
+                    // on a DIFFERENT self-join instance of the same base table
+                    // shares (table_id, column_id) but must not cover it.
+                    const std::string_view rel_qual =
+                        rel.alias.empty() ? rel.name : rel.alias;
                     for (const auto& col : rel.columns) {
                         if (qualifier.empty() && col.coalesced) {
                             continue;  // a bare `*` shows a merged column once
                         }
                         bool grouped = false;
                         for (const GroupKey& k : keys) {
+                            const std::string_view k_qual =
+                                k.instance.empty() ? split_column_ref(k.text).qualifier
+                                                   : k.instance;
                             if (col.column_id != 0 && k.column_id != 0) {
                                 if (col.table_id == k.table_id &&
                                     col.column_id == k.column_id &&
+                                    same_relation_instance_q(rel_qual, k_qual) &&
                                     same_column_name(col.name, k.text)) {
                                     grouped = true;
                                     break;
                                 }
-                            } else if (same_column_name(col.name, k.text)) {
+                            } else if (same_relation_instance_q(rel_qual, k_qual) &&
+                                       same_column_name(col.name, k.text)) {
                                 grouped = true;  // id-less column/key: match by name
                                 break;
                             }

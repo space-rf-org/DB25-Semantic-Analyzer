@@ -3575,8 +3575,7 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
             // output column of the SELECT list (legal in Postgres / MySQL /
             // SQLite / DuckDB). The key node is an IntegerLiteral carrying the
             // ordinal in primary_text; take the identity of that SELECT item so
-            // a SELECT reference to the same column matches the key. When n is
-            // out of range we leave the literal key as-is (no crash).
+            // a SELECT reference to the same column matches the key.
             const ASTNode* identity = key;
             if (key->node_type == NodeType::IntegerLiteral && select_list != nullptr) {
                 std::size_t ordinal = 0;
@@ -3587,23 +3586,32 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                         break;
                     }
                     ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
-                    // Clamp far beyond any real select-list width so a huge literal
-                    // (>= 2^64) cannot wrap modulo 2^64 back into a small in-range
-                    // ordinal (which would silently regroup by a valid column). A
-                    // clamped ordinal matches no SELECT item, so it stays out of
-                    // range (the literal is left as-is -> NonGroupedColumn).
-                    if (ordinal > 1'000'000'000U) {
-                        ordinal = 1'000'000'000U;
+                    // Clamp past the output width so a huge literal (>= 2^64)
+                    // cannot wrap modulo 2^64 back into a small in-range ordinal.
+                    if (ordinal > output.size()) {
+                        ordinal = output.size() + 1;
                     }
                 }
-                if (valid && ordinal >= 1) {
-                    std::size_t i = 1;
-                    for (ASTNode* item = first_child(select_list); item != nullptr;
-                         item = item->next_sibling, ++i) {
-                        if (i == ordinal) {
-                            identity = item;
-                            break;
-                        }
+                // n must be in 1..output.size(). A <= 0 (the parser emits `-1` /
+                // `0` as a single IntegerLiteral) or out-of-range ordinal is an
+                // error - exactly as ORDER BY positions are validated - NOT a
+                // reason to register a phantom group key that references a
+                // non-existent output column (which was silently accepted when
+                // every SELECT item was aggregate/constant).
+                if (!valid || ordinal < 1 || ordinal > output.size()) {
+                    add_diagnostic(DiagnosticCode::InvalidOrderByPosition,
+                                   "GROUP BY position '" + std::string{key->primary_text} +
+                                       "' is not in the select list (1.." +
+                                       std::to_string(output.size()) + ")",
+                                   key);
+                    continue;  // out-of-range: do not register a bogus key
+                }
+                std::size_t i = 1;
+                for (ASTNode* item = first_child(select_list); item != nullptr;
+                     item = item->next_sibling, ++i) {
+                    if (i == ordinal) {
+                        identity = item;
+                        break;
                     }
                 }
             } else if (ASTNode* alias_item =

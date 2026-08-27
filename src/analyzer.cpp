@@ -3684,6 +3684,28 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
     }
     if (ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
         for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
+            // A grouping-set (ROLLUP/CUBE/GROUPING SETS) key is NULL in the
+            // super-aggregate rows, so the block above re-marked `output` to
+            // nullable - but analyze_order_by (step 7) recorded THIS sort key's
+            // nullability from the pre-remark (not-null) output. Refresh an
+            // ORDER BY key that references an output column (by position or by
+            // unqualified name) from the now-final output nullability, so the
+            // binder is not handed a stale not-null claim for a column that can
+            // be NULL. (A no-op when the base nullability did not change.)
+            if (item->node_type == NodeType::IntegerLiteral) {
+                const std::string_view text = item->primary_text;
+                std::size_t ordinal = 0;
+                bool valid = !text.empty() && text.front() != '-';
+                for (const char c : text) {
+                    if (c < '0' || c > '9') { valid = false; break; }
+                    ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
+                    if (ordinal > output.size()) { ordinal = output.size() + 1; }
+                }
+                if (valid && ordinal >= 1 && ordinal <= output.size()) {
+                    record_nullability(item, output[ordinal - 1].nullable ? 2 : 1);
+                }
+                continue;  // a positional key is never a non-grouped column
+            }
             // An UNQUALIFIED ORDER BY item that names a SELECT output column (by
             // name or alias) references the already-grouped projection, not an
             // input column, so it is exempt from the grouping rule. Otherwise
@@ -3698,11 +3720,12 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
             if (is_column_ref_node(item->node_type)) {
                 const QualifiedRef qref = split_column_ref(item->primary_text);
                 if (qref.qualifier.empty()) {
-                    bool is_output_ref = false;
+                    const ResolvedColumn* out_match = nullptr;
                     for (const ResolvedColumn& col : output) {
-                        if (iequals(col.name, qref.column)) { is_output_ref = true; break; }
+                        if (iequals(col.name, qref.column)) { out_match = &col; break; }
                     }
-                    if (is_output_ref) {
+                    if (out_match != nullptr) {
+                        record_nullability(item, out_match->nullable ? 2 : 1);
                         continue;
                     }
                 }

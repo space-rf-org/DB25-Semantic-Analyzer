@@ -3692,6 +3692,50 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
     if (select_list != nullptr) {
         for (ASTNode* item = first_child(select_list); item != nullptr;
              item = item->next_sibling) {
+            if (item->node_type == NodeType::Star) {
+                // `*` / `t.*` expands to concrete columns, each of which is a raw
+                // (never-aggregated) column and so must be a grouping key. Neither
+                // a Subquery, FunctionCall, nor a column-ref node, a Star falls
+                // through check_grouping_expr's default recursion and has no
+                // column-ref children, so its expanded columns were never checked
+                // (`SELECT * FROM emp GROUP BY dept` was silently accepted).
+                // Enumerate the star's columns directly - WITHOUT re-running
+                // expand_star, which would duplicate its StarWithoutFrom /
+                // UnresolvedQualifier diagnostics - and check each against `keys`.
+                const std::string_view qualifier = alias_of(item);
+                for (const auto& rel : scope.relations()) {
+                    if (!qualifier.empty() && !rel.matches_qualifier(qualifier)) {
+                        continue;
+                    }
+                    for (const auto& col : rel.columns) {
+                        if (qualifier.empty() && col.coalesced) {
+                            continue;  // a bare `*` shows a merged column once
+                        }
+                        bool grouped = false;
+                        for (const GroupKey& k : keys) {
+                            if (col.column_id != 0 && k.column_id != 0) {
+                                if (col.table_id == k.table_id &&
+                                    col.column_id == k.column_id &&
+                                    same_column_name(col.name, k.text)) {
+                                    grouped = true;
+                                    break;
+                                }
+                            } else if (same_column_name(col.name, k.text)) {
+                                grouped = true;  // id-less column/key: match by name
+                                break;
+                            }
+                        }
+                        if (!grouped) {
+                            add_diagnostic(DiagnosticCode::NonGroupedColumn,
+                                           "column '" + col.name +
+                                               "' must appear in the GROUP BY clause "
+                                               "or be used in an aggregate function",
+                                           item);
+                        }
+                    }
+                }
+                continue;
+            }
             check_grouping_expr(item, keys, /*grouping_exempt=*/false, /*in_aggregate=*/false);
         }
     }

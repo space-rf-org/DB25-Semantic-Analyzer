@@ -2440,6 +2440,35 @@ void test_groupby_position_out_of_range() {
     CHECK(bad(cat_emp, "SELECT dept, COUNT(*) FROM emp GROUP BY 1") == 0);
 }
 
+// A grouped query whose SELECT list uses `*` / `table.*` must validate every
+// star-expanded column against the GROUP BY keys - a star column is a raw,
+// never-aggregated column, so one that is not a grouping key is illegal. This
+// was silently accepted (the Star item fell through the grouping-legality check).
+void test_groupby_star_validated() {
+    std::printf("test_groupby_star_validated\n");
+    auto cat = make_catalog_emp();  // emp(id, name, dept, region, salary, age)
+    parser::Parser p;
+    auto ngc = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::NonGroupedColumn);
+    };
+    // `*` over GROUP BY dept: id, name, region, salary, age are non-grouped (5).
+    CHECK(ngc("SELECT * FROM emp GROUP BY dept") == 5);
+    // `emp.*` behaves the same as `*` over a single relation.
+    CHECK(ngc("SELECT emp.* FROM emp GROUP BY dept") == 5);
+    // `*, COUNT(*)` GROUP BY id: name, dept, region, salary, age non-grouped (5).
+    CHECK(ngc("SELECT *, COUNT(*) FROM emp GROUP BY id") == 5);
+    // Guard: `*` GROUP BY every column is clean (all star columns are keys).
+    CHECK(ngc("SELECT * FROM emp GROUP BY id, name, dept, region, salary, age") == 0);
+    // Guard: `*` over an all-aggregate-free ungrouped query is unaffected (no
+    // GROUP BY, no aggregate -> analyze_grouping not entered).
+    CHECK(ngc("SELECT * FROM emp") == 0);
+}
+
 void test_avg_result_type() {
     std::printf("test_avg_result_type\n");
     auto cat = make_catalog_emp();
@@ -5798,6 +5827,7 @@ int main() {
     test_groupby_positional_still_flags_non_grouped();
     test_groupby_positional_overflow();
     test_groupby_position_out_of_range();
+    test_groupby_star_validated();
     test_avg_result_type();
     test_scalar_function_type();
     test_unknown_function_degrades();

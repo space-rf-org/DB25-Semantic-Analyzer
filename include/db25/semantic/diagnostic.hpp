@@ -125,6 +125,11 @@ enum class DiagnosticCode : std::uint16_t {
     // enforced here: without it a scalar EXISTS analyzed clean but could not be
     // lowered (Postgres: `EXISTS` takes a `(subquery)`).
     ExistsWithoutSubquery,
+    // A FILTER (WHERE ...) clause on a non-aggregate function, e.g.
+    // `abs(x) FILTER (WHERE ...)`. FILTER is only defined for aggregates (and
+    // aggregates used as window functions) (Postgres: "FILTER specified, but X
+    // is not an aggregate function").
+    FilterOnNonAggregate,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

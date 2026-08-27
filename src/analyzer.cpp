@@ -40,13 +40,16 @@ namespace {
 // (grouping legality and result typing). Registering a name here is what makes
 // the grouping logic treat a call as an aggregate (so a bare non-grouped column
 // alongside it is flagged) and lets an empty-group result be typed as nullable.
-constexpr std::array<std::string_view, 15> kAggregateNames = {
+constexpr std::array<std::string_view, 16> kAggregateNames = {
     // Core SQL aggregates.
     "COUNT", "SUM", "AVG", "MIN", "MAX",
     // Statistical aggregates (all yield an approximate DOUBLE result).
     "STDDEV", "STDDEV_POP", "STDDEV_SAMP", "VARIANCE", "VAR_POP", "VAR_SAMP",
-    // Collection / boolean aggregates.
-    "STRING_AGG", "ARRAY_AGG", "BOOL_AND", "BOOL_OR",
+    // Collection / boolean aggregates. EVERY is the SQL-standard synonym of
+    // BOOL_AND (SQL:2003 / PostgreSQL); registering it here makes grouping
+    // legality, Boolean typing, and empty-group nullability all match BOOL_AND
+    // instead of degrading it to an unknown scalar function.
+    "STRING_AGG", "ARRAY_AGG", "BOOL_AND", "BOOL_OR", "EVERY",
 };
 
 [[nodiscard]] bool is_aggregate_name(std::string_view upper_name) {
@@ -570,8 +573,10 @@ struct FunctionType {
         if (upper_name == "ARRAY_AGG") {
             return {DataType::Array, true};
         }
-        // BOOL_AND / BOOL_OR reduce a group of booleans to one boolean.
-        if (upper_name == "BOOL_AND" || upper_name == "BOOL_OR") {
+        // BOOL_AND / BOOL_OR (and the BOOL_AND synonym EVERY) reduce a group of
+        // booleans to one boolean.
+        if (upper_name == "BOOL_AND" || upper_name == "BOOL_OR" ||
+            upper_name == "EVERY") {
             return {DataType::Boolean, true};
         }
         // MIN / MAX preserve the argument type.
@@ -2550,6 +2555,7 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             // whole EXTRACT call fails to analyze.
             const bool datepart_head = (upper == "EXTRACT" || upper == "DATE_PART");
             bool first_arg = true;
+            bool has_filter = false;
             for (ASTNode* arg = first_child(expr); arg != nullptr; arg = arg->next_sibling) {
                 if (arg->node_type == NodeType::WindowSpec) {
                     window_spec = arg;
@@ -2559,6 +2565,7 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                     // The FILTER (WHERE p) clause of an aggregate. Resolve the
                     // predicate so its column references bind, but it is not a
                     // function argument and does not contribute to arg types.
+                    has_filter = true;
                     infer_expr(first_child(arg), scope);
                     continue;
                 }
@@ -2575,6 +2582,17 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                     arg_types.push_back(t);
                     arg_nulls.push_back(null_of(arg));
                 }
+            }
+            // FILTER (WHERE ...) is only permitted on an aggregate (including an
+            // aggregate used as a window function). A scalar function carrying a
+            // FILTER -- `abs(age) FILTER (WHERE age > 1)` -- was silently accepted
+            // because the predicate was resolved without checking aggregate-ness
+            // (Postgres: "FILTER specified, but abs is not an aggregate function").
+            if (has_filter && !is_aggregate_name(upper)) {
+                add_diagnostic(DiagnosticCode::FilterOnNonAggregate,
+                               "FILTER specified, but " + upper +
+                                   " is not an aggregate function",
+                               expr);
             }
             if (window_spec != nullptr) {
                 // Resolve the OVER clause's partition/order expressions (the

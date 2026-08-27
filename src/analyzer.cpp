@@ -2622,6 +2622,21 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                        std::string{op} + "'",
                                    expr);
                     result = DataType::Unknown;
+                } else if (op == "%" &&
+                           (lt == DataType::Real || lt == DataType::Double ||
+                            rt == DataType::Real || rt == DataType::Double)) {
+                    // PostgreSQL has no modulo operator for approximate floats:
+                    // '%' is defined only for the exact numeric types
+                    // (smallint/int/bigint and NUMERIC), so `double % 2`,
+                    // `real % anything`, `double % real` are all "operator does not
+                    // exist". Reject it (the numeric-numeric coerce below is
+                    // operator-agnostic and would otherwise type it Double and hand
+                    // the binder a '%' node no downstream operator supports). The
+                    // other arithmetic operators (+ - * /) accept floats normally.
+                    add_diagnostic(DiagnosticCode::TypeMismatch,
+                                   "operator '%' does not exist for a floating-point operand",
+                                   expr);
+                    result = DataType::Unknown;
                 } else {
                     // Plain numeric arithmetic requires numerically-compatible
                     // operands; otherwise it is a hard type mismatch (e.g.

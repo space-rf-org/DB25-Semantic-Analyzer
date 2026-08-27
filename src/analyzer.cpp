@@ -1736,6 +1736,12 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
                 for (const char c : text) {
                     if (c < '0' || c > '9') { valid = false; break; }
                     ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
+                    // Clamp once past the output width: any larger position is out
+                    // of range, and clamping stops a huge literal (>= 2^64) from
+                    // wrapping modulo 2^64 back into a valid 1..N ordinal.
+                    if (ordinal > output.size()) {
+                        ordinal = output.size() + 1;
+                    }
                 }
                 if (!valid || ordinal < 1 || ordinal > output.size()) {
                     add_diagnostic(DiagnosticCode::InvalidOrderByPosition,
@@ -3539,6 +3545,14 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                         break;
                     }
                     ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
+                    // Clamp far beyond any real select-list width so a huge literal
+                    // (>= 2^64) cannot wrap modulo 2^64 back into a small in-range
+                    // ordinal (which would silently regroup by a valid column). A
+                    // clamped ordinal matches no SELECT item, so it stays out of
+                    // range (the literal is left as-is -> NonGroupedColumn).
+                    if (ordinal > 1'000'000'000U) {
+                        ordinal = 1'000'000'000U;
+                    }
                 }
                 if (valid && ordinal >= 1) {
                     std::size_t i = 1;

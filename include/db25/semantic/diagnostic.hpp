@@ -114,6 +114,11 @@ enum class DiagnosticCode : std::uint16_t {
     // `CASE WHEN 1=0 THEN 1/0 ...` is silent while `CASE WHEN i>100 THEN 1/0 ...`
     // gets the advisory warning.
     DivisionByZero,
+    // A positional ORDER BY item (`ORDER BY n`) whose ordinal is <= 0 or greater
+    // than the number of SELECT output columns. SQL numbers output columns from 1
+    // (Postgres: "ORDER BY position N is not in select list" / "ORDER BY position
+    // must be > 0"). GROUP BY positions are validated the same way.
+    InvalidOrderByPosition,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

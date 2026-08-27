@@ -1689,7 +1689,7 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     //    and column resolution inside the predicate).
     if (ASTNode* where = find_child(select_stmt, NodeType::WhereClause)) {
         if (ASTNode* pred = first_child(where)) {
-            infer_expr(pred, scope);
+            warn_boolean_context(infer_expr(pred, scope), pred, "WHERE predicate");
         }
     }
     // 5. GROUP BY: resolve each grouping expression against the FROM scope
@@ -1715,7 +1715,7 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     // 6. HAVING: resolve/infer the predicate (column refs resolve here too).
     if (ASTNode* having = find_child(select_stmt, NodeType::HavingClause)) {
         if (ASTNode* pred = first_child(having)) {
-            infer_expr(pred, scope);
+            warn_boolean_context(infer_expr(pred, scope), pred, "HAVING predicate");
         }
     }
 
@@ -1724,6 +1724,32 @@ std::vector<ResolvedColumn> Analyzer::analyze_query(ASTNode* select_stmt, Scope*
     //    its alias), then, failing that, against the FROM scope.
     if (ASTNode* order_by = find_child(select_stmt, NodeType::OrderByClause)) {
         for (ASTNode* item = first_child(order_by); item != nullptr; item = item->next_sibling) {
+            // Positional ORDER BY: `ORDER BY n` sorts by the n-th (1-based) SELECT
+            // output column. n must be in 1..output.size(); a <= 0 (the parser
+            // emits `-1` / `0` as a single IntegerLiteral) or out-of-range ordinal
+            // is an error, exactly as GROUP BY positions are validated. A valid
+            // position takes the referenced output column's type/nullability.
+            if (item->node_type == NodeType::IntegerLiteral) {
+                const std::string_view text = item->primary_text;
+                std::size_t ordinal = 0;
+                bool valid = !text.empty() && text.front() != '-';
+                for (const char c : text) {
+                    if (c < '0' || c > '9') { valid = false; break; }
+                    ordinal = ordinal * 10 + static_cast<std::size_t>(c - '0');
+                }
+                if (!valid || ordinal < 1 || ordinal > output.size()) {
+                    add_diagnostic(DiagnosticCode::InvalidOrderByPosition,
+                                   "ORDER BY position '" + std::string{text} +
+                                       "' is not in the select list (1.." +
+                                       std::to_string(output.size()) + ")",
+                                   item);
+                } else {
+                    const ResolvedColumn& col = output[ordinal - 1];
+                    record_type(item, col.type);
+                    record_nullability(item, col.nullable ? 2 : 1);
+                }
+                continue;
+            }
             const ResolvedColumn* out_match = nullptr;
             if (is_column_ref_node(item->node_type)) {
                 const QualifiedRef qref = split_column_ref(item->primary_text);
@@ -2165,8 +2191,10 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
                     resolve_using(child, scope, left_end, right_end);
                 } else if (!is_relation_node(child->node_type)) {
                     // The ON predicate: a normal expression whose column refs
-                    // resolve (and emit diagnostics) through infer_expr.
-                    infer_expr(child, scope);
+                    // resolve (and emit diagnostics) through infer_expr. Like WHERE
+                    // it is a boolean context, so a non-boolean ON is flagged.
+                    warn_boolean_context(infer_expr(child, scope), child,
+                                         "JOIN ON predicate");
                 }
             }
             // A NATURAL join (recorded in the JoinClause primary_text) has no ON
@@ -2328,6 +2356,16 @@ struct DepthGuard {
     DepthGuard& operator=(const DepthGuard&) = delete;
 };
 }  // namespace
+
+void Analyzer::warn_boolean_context(DataType t, const ASTNode* node,
+                                    std::string_view what) {
+    const TypeCategory tc = category_of(t);
+    if (tc != TypeCategory::Boolean && tc != TypeCategory::Wildcard) {
+        add_diagnostic(DiagnosticCode::ImplicitCoercion,
+                       std::string{what} + " is not a boolean expression", node,
+                       Severity::Warning);
+    }
+}
 
 DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
     if (expr == nullptr) {
@@ -2596,6 +2634,13 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                 }
                 result = DataType::Boolean;
             } else if (is_logical_op(op)) {
+                // AND / OR require boolean operands (Postgres rejects a non-boolean
+                // operand); flag a non-boolean, non-wildcard operand, consistent
+                // with the CASE WHEN condition check.
+                warn_boolean_context(lt, lhs, std::string{"operand of '"} +
+                                                  std::string{op} + "'");
+                warn_boolean_context(rt, rhs, std::string{"operand of '"} +
+                                                  std::string{op} + "'");
                 result = DataType::Boolean;
             } else if (op == "||") {
                 // `||` is overloaded: ARRAY CONCATENATION when either operand is
@@ -2694,6 +2739,10 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
             }
             ASTNode* operand = first_child(expr);
             const DataType ot = infer_expr(operand, scope);
+            if (upper == "NOT") {
+                // NOT requires a boolean operand.
+                warn_boolean_context(ot, operand, "operand of NOT");
+            }
             const DataType result =
                 (upper == "NOT") ? DataType::Boolean : ot;
             record_type(expr, result);

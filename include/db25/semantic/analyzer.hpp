@@ -196,6 +196,14 @@ private:
     // Infer and record the type of an expression subtree.
     DataType infer_expr(ASTNode* expr, Scope& scope);
 
+    // Warn (soft, like the CASE WHEN condition check) when a value used in a
+    // boolean context - a WHERE / HAVING / ON predicate, or an AND / OR / NOT
+    // operand - is neither a boolean nor an untyped wildcard. PostgreSQL rejects
+    // these outright; the DB25 dialect models a non-boolean boolean-context as an
+    // implicit coercion, but it must not be SILENT (it was, everywhere but CASE
+    // WHEN). `what` names the context for the message.
+    void warn_boolean_context(DataType t, const ASTNode* node, std::string_view what);
+
     // Analyze a subquery used in an expression position (scalar / IN / EXISTS):
     // analyze its inner query block under a child scope of `enclosing` so that
     // correlated column references resolve outward, record whether it turned out

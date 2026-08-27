@@ -2464,6 +2464,13 @@ void test_groupby_star_validated() {
     CHECK(ngc("SELECT *, COUNT(*) FROM emp GROUP BY id") == 5);
     // Guard: `*` GROUP BY every column is clean (all star columns are keys).
     CHECK(ngc("SELECT * FROM emp GROUP BY id, name, dept, region, salary, age") == 0);
+    // POSITIONAL keys over a star: `GROUP BY 1..6` groups by all six EXPANDED
+    // columns, so a fully-grouped `SELECT *` is legal (0 diagnostics) - Postgres
+    // numbers output columns AFTER star expansion. `GROUP BY 1` groups by id, so
+    // only the other five columns are non-grouped (id must NOT be flagged).
+    CHECK(ngc("SELECT * FROM emp GROUP BY 1, 2, 3, 4, 5, 6") == 0);
+    CHECK(ngc("SELECT * FROM emp GROUP BY 1") == 5);
+    CHECK(ngc("SELECT *, COUNT(*) FROM emp GROUP BY 1, 2, 3, 4, 5, 6") == 0);
     // Guard: `*` over an all-aggregate-free ungrouped query is unaffected (no
     // GROUP BY, no aggregate -> analyze_grouping not entered).
     CHECK(ngc("SELECT * FROM emp") == 0);

@@ -2634,6 +2634,25 @@ void test_empty_grouping_set_grand_total() {
     CHECK(ngc("SELECT dept, region FROM emp GROUP BY (), dept, (), region") == 0);
 }
 
+// The parser now REJECTS statements it used to silently truncate, so the
+// analyzer is never handed a mangled AST (a `SELECT *` whose FROM lost a
+// relation, or a set operation reduced to its bare left arm). Confirm these
+// no longer parse - the pin bump carries the parser fix (parser #105). A
+// comma-form `LATERAL (subq)` in particular used to drop the lateral relation
+// and make `SELECT *` silently expand to only the first relation's columns.
+void test_silently_truncated_inputs_now_rejected() {
+    std::printf("test_silently_truncated_inputs_now_rejected\n");
+    parser::Parser p;
+    auto rejected = [&](const char* sql) -> bool { return !p.parse(sql).has_value(); };
+    CHECK(rejected("SELECT * FROM emp e, LATERAL (SELECT 1) l"));
+    CHECK(rejected("SELECT id FROM emp UNION"));
+    CHECK(rejected("SELECT id FROM emp INTERSECT"));
+    CHECK(rejected("UPDATE emp SET dept = WHERE id = 1"));
+    // Guards: the well-formed forms still parse.
+    CHECK(p.parse("SELECT id FROM emp UNION SELECT id FROM emp").has_value());
+    CHECK(p.parse("UPDATE emp SET dept = 'x' WHERE id = 1").has_value());
+}
+
 // --- Extended built-in function catalog --------------------------------
 
 // A representative subset of the scalar catalog: string, numeric and
@@ -5935,6 +5954,7 @@ int main() {
     test_unknown_function_degrades();
     test_aggregate_makes_query_grouped();
     test_empty_grouping_set_grand_total();
+    test_silently_truncated_inputs_now_rejected();
 
     // Extended built-in function catalog
     test_scalar_catalog_string_numeric_types();

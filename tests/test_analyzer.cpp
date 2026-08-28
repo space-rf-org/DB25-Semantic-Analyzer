@@ -1487,6 +1487,38 @@ void test_join_on_unresolved_column() {
     CHECK(count_code(a, DiagnosticCode::UnresolvedColumn) == 1);
 }
 
+// An ordinary (non-LATERAL) derived table is evaluated independently: its body
+// may reference enclosing query scopes but NOT its own FROM-clause siblings.
+// The analyzer used to analyze the body against the current FROM scope (which
+// already holds the preceding siblings), so `SELECT * FROM t1, (SELECT t1.x) s`
+// resolved `t1.x` clean though it needs LATERAL - and the binder then failed to
+// bind it. The body is now scoped to the enclosing query, matching the binder.
+void test_non_lateral_derived_table_cannot_see_siblings() {
+    std::printf("test_non_lateral_derived_table_cannot_see_siblings\n");
+    auto cat = make_catalog_joins();  // users, orders, sessions
+    parser::Parser p;
+    auto has_err = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return false;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return a.has_errors();
+    };
+    // A derived table referencing a comma / JOIN sibling is rejected (LATERAL
+    // would be required, and the parser does not yet support it).
+    CHECK(has_err("SELECT * FROM users u, (SELECT u.id) s"));
+    CHECK(has_err("SELECT * FROM users u JOIN (SELECT u.id) s ON true"));
+    // An independent (uncorrelated) derived table stays clean.
+    CHECK(!has_err("SELECT * FROM users u, (SELECT order_id FROM orders) s"));
+    CHECK(!has_err("SELECT * FROM users u JOIN (SELECT user_id FROM orders) s "
+                   "ON u.id = s.user_id"));
+    // Correlation to an ENCLOSING query scope is still allowed (matches the
+    // binder, which resolves it through the enclosing chain).
+    CHECK(!has_err("SELECT * FROM users u WHERE u.id IN "
+                   "(SELECT v FROM (SELECT u.id AS v) s)"));
+}
+
 void test_join_using_resolves() {
     std::printf("test_join_using_resolves\n");
     auto cat = make_catalog_joins();
@@ -6283,6 +6315,7 @@ int main() {
     test_from_distinct_aliases_not_flagged();
     test_self_join_distinct_aliases_not_flagged();
     test_join_on_unresolved_column();
+    test_non_lateral_derived_table_cannot_see_siblings();
     test_join_using_resolves();
     test_join_using_missing();
     test_parenthesized_join_group_resolves();

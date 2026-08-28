@@ -2487,6 +2487,76 @@ void test_aggregate_in_having_not_flagged() {
     CHECK(count_code(a, DiagnosticCode::AggregateInWhere) == 0);
 }
 
+void test_aggregate_in_join_condition_flagged() {
+    std::printf("test_aggregate_in_join_condition_flagged\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // An aggregate in a JOIN ON condition is illegal: a join predicate is a
+    // filter evaluated before aggregation, the same position as WHERE.
+    auto res = p.parse(
+        "SELECT id FROM users u JOIN orders o ON SUM(o.total) > 0");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::AggregateInJoinCondition) == 1);
+    CHECK(a.has_errors());
+
+    // Still flagged when the query is grouped and the aggregate is nested in a
+    // CASE inside the ON expression.
+    auto res2 = p.parse(
+        "SELECT o.user_id, COUNT(*) FROM orders o JOIN sessions s "
+        "ON CASE WHEN MAX(o.total) > 0 THEN s.user_id ELSE 0 END = o.user_id "
+        "GROUP BY o.user_id");
+    CHECK(res2.has_value());
+    if (!res2) return;
+    Analyzer a2(cat);
+    a2.analyze(res2.value());
+    CHECK(count_code(a2, DiagnosticCode::AggregateInJoinCondition) == 1);
+    CHECK(a2.has_errors());
+}
+
+void test_window_in_join_condition_flagged() {
+    std::printf("test_window_in_join_condition_flagged\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // A window function in a JOIN ON condition is illegal for the same reason a
+    // window in WHERE is: it is computed after filtering and grouping.
+    auto res = p.parse(
+        "SELECT id FROM users u JOIN orders o ON ROW_NUMBER() OVER () > 0");
+    CHECK(res.has_value());
+    if (!res) return;
+
+    Analyzer a(cat);
+    a.analyze(res.value());
+    CHECK(count_code(a, DiagnosticCode::WindowNotAllowed) == 1);
+    CHECK(a.has_errors());
+}
+
+void test_normal_join_condition_not_flagged() {
+    std::printf("test_normal_join_condition_not_flagged\n");
+    auto cat = make_catalog_joins();
+    parser::Parser p;
+    // A plain equijoin predicate has no aggregate/window: nothing to flag. An
+    // aggregate legitimately inside an ON subquery is likewise not flagged
+    // (contains_aggregate stops at subquery boundaries).
+    const char* ok[] = {
+        "SELECT u.id FROM users u JOIN orders o ON u.id = o.user_id",
+        "SELECT u.id FROM users u JOIN orders o "
+        "ON u.id = (SELECT MAX(o2.user_id) FROM orders o2)",
+    };
+    for (const char* sql : ok) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::AggregateInJoinCondition) == 0);
+        CHECK(count_code(a, DiagnosticCode::WindowNotAllowed) == 0);
+    }
+}
+
 void test_order_by_non_grouped() {
     std::printf("test_order_by_non_grouped\n");
     auto cat = make_catalog_emp();

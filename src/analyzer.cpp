@@ -2294,7 +2294,7 @@ void Analyzer::apply_column_aliases(std::vector<ResolvedColumn>& cols,
 }
 
 void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
-                                 std::size_t comma_group_start) {
+                                 std::size_t comma_group_start, bool lateral) {
     if (item == nullptr) {
         return;
     }
@@ -2346,13 +2346,25 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
                     break;
                 }
             }
+            // An ordinary (non-LATERAL) derived table is evaluated independently:
+            // its body may reference ENCLOSING query scopes (via scope.parent())
+            // but NOT its own FROM-clause siblings. Analyzing it against `scope`
+            // (the current FROM, which already holds the preceding siblings) let a
+            // sibling reference resolve as if LATERAL - `SELECT * FROM t1,
+            // (SELECT t1.x) s` was accepted clean though it needs LATERAL, and the
+            // binder then failed to bind ('t1.x resolves to no input or enclosing
+            // slot'). A LATERAL RHS keeps sibling visibility (evaluated per left
+            // row).
+            Scope* body_parent = lateral ? &scope : scope.parent();
             if (query_body != nullptr) {
-                binding.columns = analyze_stmt(query_body, &scope);
+                binding.columns = analyze_stmt(query_body, body_parent);
             } else if (ASTNode* values = find_child(item, NodeType::ValuesStmt)) {
                 // A VALUES list used as a derived table: its columns are the
                 // per-position value types; they are anonymous until named by the
-                // column-alias list below.
-                binding.columns = columns_from_values(values, scope);
+                // column-alias list below. VALUES are constants, but scope them
+                // the same way so a (malformed) sibling reference cannot resolve.
+                Scope values_scope(body_parent);
+                binding.columns = columns_from_values(values, values_scope);
             }
             // Column-alias list "(a, b)" on the derived table renames its output
             // columns positionally (the parser attaches it as a ColumnList child;
@@ -2395,11 +2407,16 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
         case NodeType::CrossJoin:
         case NodeType::LateralJoin: {
             const std::size_t left_end = scope.relations().size();
-            // Pass 1: make the right-hand relation(s) visible.
+            // Pass 1: make the right-hand relation(s) visible. Only a LATERAL
+            // join's RHS derived table may reference the left side; a plain join's
+            // RHS is evaluated independently (`t1 JOIN (SELECT t1.x) s` needs
+            // LATERAL).
+            const bool rhs_lateral = item->node_type == NodeType::LateralJoin;
             for (ASTNode* child = first_child(item); child != nullptr;
                  child = child->next_sibling) {
                 if (is_relation_node(child->node_type)) {
-                    resolve_from_item(child, scope);
+                    resolve_from_item(child, scope, /*comma_group_start=*/0,
+                                      rhs_lateral);
                 }
             }
             const std::size_t right_end = scope.relations().size();

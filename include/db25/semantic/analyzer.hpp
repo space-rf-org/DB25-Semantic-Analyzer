@@ -186,8 +186,12 @@ private:
     // comma-separated table_reference began. A JOIN's left operand is that whole
     // group (comma binds looser than JOIN), so an outer join null-supplies only
     // [comma_group_start, ...) - never the relations of a preceding comma item.
+    // `lateral` is true when this item is the right-hand side of a LATERAL join,
+    // where a derived-table body MAY reference the preceding FROM relations; for
+    // an ordinary (non-LATERAL) derived table the body is evaluated independently
+    // and must NOT see its FROM-clause siblings (only enclosing query scopes).
     void resolve_from_item(ASTNode* item, Scope& scope,
-                           std::size_t comma_group_start = 0);
+                           std::size_t comma_group_start = 0, bool lateral = false);
 
     // Columns of a VALUES list used as a derived table: one per value position in
     // the first row, typed by inference (nullable, anonymous). A column-alias

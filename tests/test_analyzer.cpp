@@ -929,6 +929,102 @@ void test_filter_requires_aggregate() {
     CHECK(count_filter_err("SELECT every(id > 0) FILTER (WHERE id > 1) FROM users") == 0);
 }
 
+// An aggregate's argument may not contain a window function (Postgres:
+// "aggregate function calls cannot contain window function calls"): windowing
+// runs after aggregation, so a window result can never feed an aggregate. Both
+// analyzed clean before and reached the binder as an unlowerable set function.
+void test_window_inside_aggregate_rejected() {
+    std::printf("test_window_inside_aggregate_rejected\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT)
+    parser::Parser p;
+    auto count_wia = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::WindowInAggregate);
+    };
+    CHECK(count_wia("SELECT sum(row_number() OVER ()) FROM users") == 1);
+    CHECK(count_wia("SELECT max(rank() OVER (ORDER BY id)) FROM users") == 1);
+    // A window in the aggregate's FILTER predicate is equally illegal.
+    CHECK(count_wia("SELECT count(*) FILTER (WHERE row_number() OVER () > 1) FROM users")
+          == 1);
+    // Guards: a plain aggregate, a plain window function, and a window whose
+    // argument is a plain aggregate-over-nothing are all fine.
+    CHECK(count_wia("SELECT sum(id) FROM users") == 0);
+    CHECK(count_wia("SELECT row_number() OVER (ORDER BY id) FROM users") == 0);
+    CHECK(count_wia("SELECT sum(id) OVER () FROM users") == 0);
+}
+
+// Aggregate and window functions are not allowed in a RETURNING list (Postgres:
+// RETURNING projects the individual affected rows - there is no grouping or
+// window framing). Both analyzed clean before and could not be lowered.
+void test_aggregate_window_in_returning_rejected() {
+    std::printf("test_aggregate_window_in_returning_rejected\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT)
+    parser::Parser p;
+    auto codes = [&](const char* sql, DiagnosticCode code) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, code);
+    };
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') RETURNING count(*)",
+                DiagnosticCode::AggregateInReturning) == 1);
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') RETURNING sum(id)",
+                DiagnosticCode::AggregateInReturning) == 1);
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') RETURNING row_number() OVER ()",
+                DiagnosticCode::WindowInReturning) == 1);
+    // Guard: a plain-column / expression / star RETURNING stays clean.
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') RETURNING id, id + 1",
+                DiagnosticCode::AggregateInReturning) == 0);
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') RETURNING id, id + 1",
+                DiagnosticCode::WindowInReturning) == 0);
+}
+
+// Under SELECT DISTINCT the visible row IS the select list, so an ORDER BY item
+// must be composed of selected items: it must match an output column by
+// name/ordinal or structurally equal a whole projected select-list expression.
+// A key over a non-projected column resolves against the FROM scope but the
+// binder rejects it (it would need a hidden sort column that changes the
+// distinct key), so the analyzer must reject it too - the two stages must agree.
+void test_distinct_order_by_must_be_in_select_list() {
+    std::printf("test_distinct_order_by_must_be_in_select_list\n");
+    InMemoryCatalog cat;
+    cat.add_table("emp", {ColumnInfo{"id", DataType::Integer, /*nullable=*/false},
+                          ColumnInfo{"dept", DataType::Text, /*nullable=*/true},
+                          ColumnInfo{"sal", DataType::Integer, /*nullable=*/true}});
+    parser::Parser p;
+    auto err = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, DiagnosticCode::OrderByNotInSelectDistinct);
+    };
+    // Non-projected column under DISTINCT -> rejected.
+    CHECK(err("SELECT DISTINCT dept FROM emp ORDER BY sal") == 1);
+    CHECK(err("SELECT DISTINCT dept FROM emp ORDER BY id") == 1);
+    CHECK(err("SELECT DISTINCT dept FROM emp ORDER BY sal * 2") == 1);
+    // A projected EXPRESSION must match verbatim; a different literal is a
+    // different key.
+    CHECK(err("SELECT DISTINCT sal + 1 AS s FROM emp ORDER BY sal + 2") == 1);
+    // Projected column (bare, qualified, expression, ordinal, star) -> clean.
+    CHECK(err("SELECT DISTINCT dept FROM emp ORDER BY dept") == 0);
+    CHECK(err("SELECT DISTINCT emp.dept FROM emp ORDER BY emp.dept") == 0);
+    CHECK(err("SELECT DISTINCT dept, sal FROM emp ORDER BY sal") == 0);
+    CHECK(err("SELECT DISTINCT sal + 1 AS s FROM emp ORDER BY sal + 1") == 0);
+    CHECK(err("SELECT DISTINCT sal FROM emp ORDER BY 1") == 0);
+    CHECK(err("SELECT DISTINCT * FROM emp ORDER BY sal") == 0);
+    // Without DISTINCT a hidden sort column is allowed -> clean.
+    CHECK(err("SELECT dept FROM emp ORDER BY sal") == 0);
+    CHECK(err("SELECT dept FROM emp ORDER BY sal * 2") == 0);
+}
+
 // The ON CONFLICT DO UPDATE SET assignments and the RETURNING clause of a DML
 // statement were never analyzed, so a bad column reference, type mismatch, or
 // NOT-NULL violation in them passed silently -- unlike the identical standalone
@@ -6068,6 +6164,9 @@ int main() {
     test_every_is_bool_and_synonym();
     test_filter_requires_aggregate();
     test_dml_on_conflict_and_returning_analyzed();
+    test_window_inside_aggregate_rejected();
+    test_aggregate_window_in_returning_rejected();
+    test_distinct_order_by_must_be_in_select_list();
     test_recursive_cte_nullability();
     test_duplicate_derived_alias_ambiguous();
     test_unresolved_table();

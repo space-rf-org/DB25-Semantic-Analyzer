@@ -1055,6 +1055,47 @@ namespace {
     }
 }
 
+// The inclusive [min, max] value range of an integer type, or nullopt for a
+// non-integer type. Used to diagnose a constant arithmetic result that overflows
+// its result type (PostgreSQL does not widen intN arithmetic, so the operation
+// is out of range rather than promoted).
+[[nodiscard]] std::optional<std::pair<std::int64_t, std::int64_t>>
+integer_range(DataType t) {
+    switch (t) {
+        case DataType::TinyInt:  return std::pair{std::int64_t{-128}, std::int64_t{127}};
+        case DataType::SmallInt: return std::pair{std::int64_t{-32768}, std::int64_t{32767}};
+        case DataType::Integer:  return std::pair{static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()),
+                                                  static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())};
+        case DataType::BigInt:   return std::pair{std::numeric_limits<std::int64_t>::min(),
+                                                  std::numeric_limits<std::int64_t>::max()};
+        default:                 return std::nullopt;
+    }
+}
+
+// Does the constant integer expression `l op r` overflow the range of its result
+// integer type `result_type`? Returns true only when BOTH operands are integer
+// constants (so a child-level overflow is flagged at the child, never here) and
+// either the int64 computation overflows or the result falls outside
+// `result_type`'s range. `op` is one of + - *. A non-integer result type, or a
+// non-constant operand, is never an overflow (returns false).
+[[nodiscard]] bool constant_int_arith_overflows(const ASTNode* l, const ASTNode* r,
+                                                 std::string_view op,
+                                                 DataType result_type) {
+    const auto range = integer_range(result_type);
+    if (!range) return false;
+    const auto lv = eval_const_int(l);
+    const auto rv = eval_const_int(r);
+    if (!lv || !rv) return false;
+    std::int64_t out = 0;
+    const bool of = op == "+"   ? __builtin_add_overflow(*lv, *rv, &out)
+                    : op == "-" ? __builtin_sub_overflow(*lv, *rv, &out)
+                    : op == "*" ? __builtin_mul_overflow(*lv, *rv, &out)
+                                : true;  // not a checked op
+    if (op != "+" && op != "-" && op != "*") return false;
+    if (of) return true;                          // overflowed int64 (the widest)
+    return out < range->first || out > range->second;  // outside result type's range
+}
+
 // Fold a boolean-valued constant subtree (a BooleanLiteral, or a comparison of
 // two integer constants) to true/false, or nullopt if it is not a compile-time
 // constant boolean. Used to decide whether a CASE guard is constant-true /
@@ -3074,6 +3115,19 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                            std::string{op} + "' expression",
                                        expr, Severity::Warning);
                     }
+                }
+                // A constant integer + - * whose value overflows its result
+                // integer type is a soft advisory (same family / suppression as
+                // DivisionByZero): PostgreSQL raises out-of-range at runtime and
+                // does not widen intN arithmetic. Flagged at the exact overflowing
+                // operation (a nested child overflow is reported at the child).
+                if (div0_suppress_ == 0 &&
+                    constant_int_arith_overflows(lhs, rhs, op, result)) {
+                    add_diagnostic(DiagnosticCode::IntegerOverflow,
+                                   "integer overflow in constant '" + std::string{op} +
+                                       "' expression (result is out of range for " +
+                                       std::string{ast::data_type_to_string(result)} + ")",
+                                   expr, Severity::Warning);
                 }
             }
             record_type(expr, result);

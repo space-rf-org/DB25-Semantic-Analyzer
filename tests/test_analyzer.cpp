@@ -3694,6 +3694,42 @@ void test_case_constant_div_by_zero() {
     CHECK(div0("SELECT CASE WHEN 1=1 THEN 1 ELSE 1/0 END") == 0);
 }
 
+// A constant integer + - * whose value overflows its result integer type warns
+// (IntegerOverflow). PostgreSQL does not widen intN arithmetic and raises
+// out-of-range at runtime; DB25 diagnoses the provable constant cases as a soft
+// warning (same family / dead-arm suppression as DivisionByZero), so the
+// statement still analyzes clean (has_errors() stays false).
+void test_constant_integer_overflow() {
+    std::printf("test_constant_integer_overflow\n");
+    InMemoryCatalog cat;
+    cat.add_table("t", {ColumnInfo{"i", DataType::Integer, /*nullable=*/true}});
+    parser::Parser p;
+    auto ovf = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        Analyzer a(cat);
+        if (res) a.analyze(res.value());
+        CHECK(!a.has_errors());  // soft warning, flows through
+        return count_code(a, DiagnosticCode::IntegerOverflow);
+    };
+    // int4 out of range (int + int stays int; no implicit widening).
+    CHECK(ovf("SELECT 2147483647 + 1") == 1);
+    CHECK(ovf("SELECT 2000000000 + 2000000000") == 1);
+    CHECK(ovf("SELECT 2147483647 * 2") == 1);
+    // int8 out of range (bigint + bigint).
+    CHECK(ovf("SELECT 9223372036854775807 + 1") == 1);
+    CHECK(ovf("SELECT 9223372036854775807 * 2") == 1);
+    // In range: no warning.
+    CHECK(ovf("SELECT 2147483646 + 1") == 0);   // == int4 max
+    CHECK(ovf("SELECT 4000000000 + 1") == 0);   // operands bigint, fits int8
+    CHECK(ovf("SELECT 1 + 2 + 3") == 0);
+    CHECK(ovf("SELECT i + 1 FROM t") == 0);     // non-constant, not provable
+    // Suppressed inside a provably-dead CASE arm (like DivisionByZero).
+    CHECK(ovf("SELECT CASE WHEN 1=0 THEN 2147483647 + 1 ELSE 0 END") == 0);
+    // Reachable arm still warns.
+    CHECK(ovf("SELECT CASE WHEN i > 5 THEN 2147483647 + 1 ELSE 0 END FROM t") == 1);
+}
+
 // `||` is array concatenation when an operand is an array (yielding an array),
 // not string concatenation to Text. Without this a CASE branch `ARRAY[...] || y`
 // was typed Text and failed to reconcile with a sibling ARRAY[...] branch,
@@ -6511,6 +6547,7 @@ int main() {
     test_coercion_text_int_comparison_warns();
     test_nullif_cross_category_warns();
     test_case_constant_div_by_zero();
+    test_constant_integer_overflow();
     test_array_concat_typing();
     test_arithmetic_same_type_nonnumeric_errors();
     test_numeric_real_promotes_double();

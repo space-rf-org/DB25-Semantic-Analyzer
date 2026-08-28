@@ -120,6 +120,15 @@ enum class DiagnosticCode : std::uint16_t {
     // `CASE WHEN 1=0 THEN 1/0 ...` is silent while `CASE WHEN i>100 THEN 1/0 ...`
     // gets the advisory warning.
     DivisionByZero,
+    // A constant integer arithmetic expression (+ - *) whose value overflows the
+    // range of its result integer type, e.g. `2147483647 + 1` (int -> out of int4
+    // range) or `9223372036854775807 + 1` (bigint -> out of int8 range).
+    // PostgreSQL does NOT implicitly widen intN arithmetic and raises "integer /
+    // bigint out of range" at runtime; DB25 has no executor, so it diagnoses the
+    // provable (constant) cases. Kept a soft WARNING that flows through, exactly
+    // like DivisionByZero (the same constant-arithmetic-fault family and the same
+    // dead-CASE-arm suppression), rather than a hard error.
+    IntegerOverflow,
     // A positional ORDER BY item (`ORDER BY n`) whose ordinal is <= 0 or greater
     // than the number of SELECT output columns. SQL numbers output columns from 1
     // (Postgres: "ORDER BY position N is not in select list" / "ORDER BY position

@@ -114,6 +114,21 @@ private:
     // nullptr when the name is not a known table. Used by UPDATE / DELETE.
     const TableInfo* bind_base_table(ASTNode* table_ref, Scope& scope);
 
+    // Analyze a SetClause's `column = value` assignments against `table`: resolve
+    // each target column (UnresolvedColumn if missing), infer/type-check the
+    // value (assignment coercion + NOT NULL literal), and evaluate the table's
+    // CHECK constraints over the assigned columns. Shared by UPDATE and the
+    // INSERT ... ON CONFLICT DO UPDATE SET path. `ctx` names the clause for
+    // diagnostics.
+    void analyze_set_clause(ASTNode* set_clause, const TableInfo* table,
+                            Scope& scope, std::string_view ctx);
+
+    // Analyze a RETURNING clause (INSERT / UPDATE / DELETE): resolve each output
+    // expression against `scope` (the target-table row), which emits
+    // UnresolvedColumn for a bad reference and records output types/nullability.
+    // RETURNING * is left to expansion and needs no per-item resolution.
+    void analyze_returning(ASTNode* stmt, Scope& scope);
+
     // Type-check assigning a value of type `value` into a target column of type
     // `target` using the coercion model's assignment rules: a clean or numeric/
     // string implicit conversion is accepted (the latter as an ImplicitCoercion

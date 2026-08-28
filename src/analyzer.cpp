@@ -1142,12 +1142,22 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
         return;  // without a resolved table there is nothing to check against
     }
 
+    // A scope holding the target-table row, used to resolve the ON CONFLICT DO
+    // UPDATE SET values and the RETURNING output expressions (the value list
+    // itself is literals with no table scope).
+    Scope row_scope(nullptr);
+    bind_base_table(table_ref, row_scope);
+
     // INSERT ... DEFAULT VALUES (a DefaultClause marker child): every column
     // takes its default. A NOT NULL column with no default would be inserted as
     // NULL, so flag it - the same rule as an omitted column, but here it applies
-    // to the whole row and there is no value list to check.
-    if (ASTNode* dv = find_child(insert_stmt, NodeType::DefaultClause);
-        dv != nullptr && dv->primary_text == "DEFAULT VALUES") {
+    // to the whole row and there is no value list to check. ON CONFLICT and
+    // RETURNING (handled at the tail) still apply.
+    const bool default_values = [&] {
+        ASTNode* dv = find_child(insert_stmt, NodeType::DefaultClause);
+        return dv != nullptr && dv->primary_text == "DEFAULT VALUES";
+    }();
+    if (default_values) {
         for (const ColumnInfo& col : table->columns) {
             if (!col.nullable && !col.has_default) {
                 add_diagnostic(DiagnosticCode::NotNullViolation,
@@ -1157,9 +1167,12 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
                                table_ref != nullptr ? table_ref : insert_stmt);
             }
         }
-        return;
     }
 
+    // The target-column-list / value-source / NOT NULL checks apply only to a
+    // value-bearing INSERT; DEFAULT VALUES was fully checked above. ON CONFLICT
+    // and RETURNING (at the tail) apply either way.
+    if (!default_values) {
     // Target column list: an explicit ColumnList child, else the table's columns
     // in declaration order. `covered` tracks which table columns receive a value
     // (for the NOT NULL check).
@@ -1279,6 +1292,34 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
                            table_ref != nullptr ? table_ref : insert_stmt);
         }
     }
+    }  // end if (!default_values)
+
+    // ON CONFLICT DO UPDATE SET: the conflict action's assignments were never
+    // checked, so `... ON CONFLICT (id) DO UPDATE SET nonexistent = 5` and a
+    // type / NOT-NULL violation there passed silently -- unlike the identical
+    // standalone UPDATE SET. Analyze them against a scope holding the target
+    // row plus an `excluded` alias for the proposed row (both the target
+    // columns), matching Postgres's DO UPDATE visibility.
+    if (ASTNode* on_conflict = find_child(insert_stmt, NodeType::OnConflictClause)) {
+        if (ASTNode* set_clause = find_child(on_conflict, NodeType::SetClause)) {
+            Scope conflict_scope(nullptr);
+            bind_base_table(table_ref, conflict_scope);
+            RelationBinding excluded;
+            excluded.name = "excluded";
+            excluded.alias = "excluded";
+            excluded.table_id = table->table_id;
+            for (const auto& c : table->columns) {
+                excluded.columns.push_back(ResolvedColumn{c.name, c.type, c.nullable,
+                                                          table->table_id, c.column_id});
+            }
+            conflict_scope.add_relation(std::move(excluded));
+            analyze_set_clause(set_clause, table, conflict_scope,
+                               "ON CONFLICT DO UPDATE SET clause");
+        }
+    }
+
+    // RETURNING output expressions resolve against the target-table row.
+    analyze_returning(insert_stmt, row_scope);
 }
 
 void Analyzer::analyze_update(ASTNode* update_stmt) {
@@ -1297,40 +1338,7 @@ void Analyzer::analyze_update(ASTNode* update_stmt) {
     // SET assignments: each is a BinaryExpr whose primary_text is the target
     // column name and whose (first) child is the value expression.
     if (ASTNode* set_clause = find_child(update_stmt, NodeType::SetClause)) {
-        // The columns this UPDATE assigns and their value nodes, gathered so the
-        // table's CHECK constraints can be evaluated against the post-update row.
-        std::vector<const ColumnInfo*> set_cols;
-        std::vector<ASTNode*> set_vals;
-        for (ASTNode* asgn = first_child(set_clause); asgn != nullptr;
-             asgn = asgn->next_sibling) {
-            const std::string_view col_name = split_column_ref(asgn->primary_text).column;
-            const ColumnInfo* info =
-                table != nullptr ? table->find_column(col_name) : nullptr;
-            if (table != nullptr && info == nullptr) {
-                add_diagnostic(DiagnosticCode::UnresolvedColumn,
-                               "unresolved column '" + std::string{col_name} +
-                                   "' in SET clause",
-                               asgn);
-            }
-            ASTNode* value = first_child(asgn);
-            const DataType vt = infer_expr(value, scope);
-            if (info != nullptr && value != nullptr) {
-                check_assignment(info->type, vt, value);
-                check_not_null_literal(info, value);
-                set_cols.push_back(info);
-                set_vals.push_back(value);
-            }
-        }
-
-        // Evaluate CHECK constraints over the assigned columns. Defaults are NOT
-        // substituted for unset columns: an UPDATE leaves them at their existing
-        // values, which are unknown here, so a CHECK that references any unset
-        // column stays Unknown. Only a CHECK whose every column is SET to a
-        // constant is decided - e.g. UPDATE t SET age = -1 vs CHECK (age >= 0).
-        if (table != nullptr && !set_cols.empty()) {
-            check_row_against_checks(*table, set_cols, set_vals, set_clause,
-                                     /*apply_defaults=*/false);
-        }
+        analyze_set_clause(set_clause, table, scope, "SET clause");
     }
 
     // WHERE predicate: resolve against the target-table scope.
@@ -1338,6 +1346,67 @@ void Analyzer::analyze_update(ASTNode* update_stmt) {
         if (ASTNode* pred = first_child(where)) {
             infer_expr(pred, scope);
         }
+    }
+
+    // RETURNING output expressions resolve against the target-table row.
+    analyze_returning(update_stmt, scope);
+}
+
+void Analyzer::analyze_set_clause(ASTNode* set_clause, const TableInfo* table,
+                                  Scope& scope, std::string_view ctx) {
+    if (set_clause == nullptr) {
+        return;
+    }
+    // The columns this assigns and their value nodes, gathered so the table's
+    // CHECK constraints can be evaluated against the post-update row.
+    std::vector<const ColumnInfo*> set_cols;
+    std::vector<ASTNode*> set_vals;
+    for (ASTNode* asgn = first_child(set_clause); asgn != nullptr;
+         asgn = asgn->next_sibling) {
+        const std::string_view col_name = split_column_ref(asgn->primary_text).column;
+        const ColumnInfo* info =
+            table != nullptr ? table->find_column(col_name) : nullptr;
+        if (table != nullptr && info == nullptr) {
+            add_diagnostic(DiagnosticCode::UnresolvedColumn,
+                           "unresolved column '" + std::string{col_name} + "' in " +
+                               std::string{ctx},
+                           asgn);
+        }
+        ASTNode* value = first_child(asgn);
+        const DataType vt = infer_expr(value, scope);
+        if (info != nullptr && value != nullptr) {
+            check_assignment(info->type, vt, value);
+            check_not_null_literal(info, value);
+            set_cols.push_back(info);
+            set_vals.push_back(value);
+        }
+    }
+
+    // Evaluate CHECK constraints over the assigned columns. Defaults are NOT
+    // substituted for unset columns: an UPDATE leaves them at their existing
+    // values, which are unknown here, so a CHECK that references any unset column
+    // stays Unknown. Only a CHECK whose every column is SET to a constant is
+    // decided - e.g. UPDATE t SET age = -1 vs CHECK (age >= 0).
+    if (table != nullptr && !set_cols.empty()) {
+        check_row_against_checks(*table, set_cols, set_vals, set_clause,
+                                 /*apply_defaults=*/false);
+    }
+}
+
+void Analyzer::analyze_returning(ASTNode* stmt, Scope& scope) {
+    ASTNode* ret = find_child(stmt, NodeType::ReturningClause);
+    if (ret == nullptr) {
+        return;
+    }
+    for (ASTNode* item = first_child(ret); item != nullptr; item = item->next_sibling) {
+        // RETURNING * expands to the whole target row; there is nothing to
+        // resolve for the Star itself.
+        if (item->node_type == NodeType::Star) {
+            continue;
+        }
+        // Resolving the item emits UnresolvedColumn for a bad reference and
+        // records the output column's type / nullability.
+        infer_expr(item, scope);
     }
 }
 
@@ -1358,6 +1427,9 @@ void Analyzer::analyze_delete(ASTNode* delete_stmt) {
             infer_expr(pred, scope);
         }
     }
+
+    // RETURNING output expressions resolve against the target-table row.
+    analyze_returning(delete_stmt, scope);
 }
 
 void Analyzer::check_limit(ASTNode* limit_clause) {

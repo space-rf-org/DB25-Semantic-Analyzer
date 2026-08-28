@@ -885,7 +885,8 @@ void Analyzer::analyze(ASTNode* root) {
     }
     expr_depth_ = 0;
     expr_depth_reported_ = false;
-    if (root->node_type == NodeType::SelectStmt || is_setop(root->node_type)) {
+    if (root->node_type == NodeType::SelectStmt || is_setop(root->node_type) ||
+        root->node_type == NodeType::ValuesStmt) {
         analyze_stmt(root, nullptr);
         return;
     }
@@ -914,6 +915,17 @@ std::vector<ResolvedColumn> Analyzer::analyze_stmt(ASTNode* node, Scope* parent)
     }
     if (node->node_type == NodeType::SelectStmt) {
         return analyze_query(node, parent);
+    }
+    if (node->node_type == NodeType::ValuesStmt) {
+        // A VALUES table-value-constructor is a query block in its own right (a
+        // top-level statement or a CTE body), not only a FROM-derived table.
+        // Its columns are the reconciled value positions; record the projection
+        // so projection_of() is populated and a CTE over VALUES gets its true
+        // arity (previously 0), matching the bound plan's schema.
+        Scope local(parent);
+        std::vector<ResolvedColumn> cols = columns_from_values(node, local);
+        projections_[node] = cols;
+        return cols;
     }
     return {};
 }
@@ -1648,7 +1660,8 @@ void Analyzer::register_ctes(ASTNode* cte_clause, Scope& scope) {
             // which dispatches both.
             ASTNode* body = nullptr;
             for (ASTNode* c = first_child(def); c != nullptr; c = c->next_sibling) {
-                if (c->node_type == NodeType::SelectStmt || is_setop(c->node_type)) {
+                if (c->node_type == NodeType::SelectStmt || is_setop(c->node_type) ||
+                    c->node_type == NodeType::ValuesStmt) {
                     body = c;
                     break;
                 }

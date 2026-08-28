@@ -52,6 +52,17 @@ struct ResolvedColumn {
     // ordinary outer-join nullability, matching the binder's hidden per-side
     // copies. Set by the analyzer's resolve_using / resolve_natural.
     bool merged = false;
+    // A merged column's authoritative `nullable` accounts for its OWN join's
+    // null-supply (the COALESCE of both sides), but NOT for any outer join that
+    // ENCLOSES the merge and null-supplies the merged relation as a whole. When
+    // such an enclosing join makes the merged relation the null side (a FULL
+    // JOIN, or a RIGHT JOIN with the merged relation on the left), every column
+    // including the merged key becomes nullable - matching the binder, which
+    // ORs the null flag into all child columns uniformly. mark_join_nullable
+    // records that here (only for already-`merged` columns, so it captures
+    // strictly enclosing joins, never the merge's own level); the bare-read
+    // paths OR it into the merged nullability. Meaningless unless `merged`.
+    bool nullable_from_enclosing_join = false;
 };
 
 // A relation visible in a scope: a base table, an aliased table, a derived
@@ -188,6 +199,18 @@ public:
     void mark_join_nullable(std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end && i < relations_.size(); ++i) {
             relations_[i].nullable_from_join = true;
+            // A column already flagged `merged` was produced by a USING / NATURAL
+            // join NESTED inside this one: merges are resolved at their own,
+            // inner level, whose mark_join_nullable ran BEFORE the column became
+            // merged. So this call is necessarily an ENCLOSING outer join, and
+            // its null-supply applies to the merged column as a whole - record it
+            // so the bare-read paths (resolve_bare / expand_star) can OR it into
+            // the merged column's own-level authoritative nullability.
+            for (auto& c : relations_[i].columns) {
+                if (c.merged) {
+                    c.nullable_from_enclosing_join = true;
+                }
+            }
         }
     }
 
@@ -320,12 +343,17 @@ public:
                 res.owner = s;
                 res.column = *hit;
                 // A merged USING / NATURAL column carries its own authoritative
-                // (COALESCE) nullability; do not re-apply the null-supplying-side
-                // adjustment to a bare reference. Non-merged columns get the
-                // ordinary outer-join nullability.
+                // (COALESCE) nullability; do not re-apply THIS join's
+                // null-supplying-side adjustment to a bare reference. But an
+                // outer join ENCLOSING the merge nulls the merged relation as a
+                // whole, so still OR in that (see nullable_from_enclosing_join).
+                // Non-merged columns get the ordinary outer-join nullability.
                 if (!res.column.merged) {
                     res.column.nullable =
                         res.column.nullable || hit_rel->nullable_from_join;
+                } else {
+                    res.column.nullable = res.column.nullable ||
+                                          res.column.nullable_from_enclosing_join;
                 }
                 return res;
             }

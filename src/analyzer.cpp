@@ -1926,10 +1926,14 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
                 }
                 ResolvedColumn out = col;
                 // A merged USING/NATURAL column carries authoritative nullability
-                // (COALESCE of both sides); a bare `*` reads it verbatim. Any other
+                // (COALESCE of both sides) for its OWN join; a bare `*` reads that
+                // verbatim but must still OR in an ENCLOSING outer join that nulls
+                // the merged relation (nullable_from_enclosing_join). Any other
                 // column takes the ordinary null-supplying-side adjustment.
                 if (!col.merged) {
                     out.nullable = out.nullable || rel.nullable_from_join;
+                } else {
+                    out.nullable = out.nullable || col.nullable_from_enclosing_join;
                 }
                 out.coalesced = false;
                 // Record the relation instance so a positional GROUP BY key that

@@ -929,6 +929,63 @@ void test_filter_requires_aggregate() {
     CHECK(count_filter_err("SELECT every(id > 0) FILTER (WHERE id > 1) FROM users") == 0);
 }
 
+// The ON CONFLICT DO UPDATE SET assignments and the RETURNING clause of a DML
+// statement were never analyzed, so a bad column reference, type mismatch, or
+// NOT-NULL violation in them passed silently -- unlike the identical standalone
+// UPDATE SET. Both are now checked.
+void test_dml_on_conflict_and_returning_analyzed() {
+    std::printf("test_dml_on_conflict_and_returning_analyzed\n");
+    auto cat = make_catalog();  // users(id INTEGER NOT NULL, name TEXT)
+    parser::Parser p;
+    auto codes = [&](const char* sql, DiagnosticCode code) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return count_code(a, code);
+    };
+    auto clean = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return false;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return !a.has_errors();
+    };
+    // ON CONFLICT DO UPDATE SET: unresolved column / NOT NULL / type checks, the
+    // same as a standalone UPDATE SET.
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (id) DO UPDATE SET nonexistent = 5",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (id) DO UPDATE SET id = NULL",
+                DiagnosticCode::NotNullViolation) == 1);
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (id) DO UPDATE SET name = 5",
+                DiagnosticCode::ImplicitCoercion) == 1);
+    // Guard: a well-formed DO UPDATE SET, including an `excluded.col` reference
+    // to the proposed row, analyzes clean.
+    CHECK(clean("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (id) DO UPDATE SET name = excluded.name"));
+    CHECK(clean("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (id) DO UPDATE SET name = 'b'"));
+
+    // RETURNING (INSERT / UPDATE / DELETE): a bad column reference is flagged.
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') RETURNING nonexistent",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    CHECK(codes("UPDATE users SET name = 'a' RETURNING nonexistent",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    CHECK(codes("DELETE FROM users RETURNING nonexistent",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    // Guard: well-formed RETURNING (explicit columns, an expression, and *)
+    // analyzes clean.
+    CHECK(clean("INSERT INTO users (id,name) VALUES (1,'a') RETURNING id, name"));
+    CHECK(clean("UPDATE users SET name = 'a' RETURNING id, name"));
+    CHECK(clean("DELETE FROM users RETURNING *"));
+    CHECK(clean("INSERT INTO users (id,name) VALUES (1,'a') RETURNING id + 1"));
+}
+
 void test_recursive_cte_nullability() {
     std::printf("test_recursive_cte_nullability\n");
     InMemoryCatalog cat;
@@ -6010,6 +6067,7 @@ int main() {
     test_exists_requires_subquery();
     test_every_is_bool_and_synonym();
     test_filter_requires_aggregate();
+    test_dml_on_conflict_and_returning_analyzed();
     test_recursive_cte_nullability();
     test_duplicate_derived_alias_ambiguous();
     test_unresolved_table();

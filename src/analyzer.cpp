@@ -1912,7 +1912,12 @@ void Analyzer::expand_star(ASTNode* star, Scope& scope,
                     continue;
                 }
                 ResolvedColumn out = col;
-                out.nullable = out.nullable || rel.nullable_from_join;
+                // A merged USING/NATURAL column carries authoritative nullability
+                // (COALESCE of both sides); a bare `*` reads it verbatim. Any other
+                // column takes the ordinary null-supplying-side adjustment.
+                if (!col.merged) {
+                    out.nullable = out.nullable || rel.nullable_from_join;
+                }
                 out.coalesced = false;
                 // Record the relation instance so a positional GROUP BY key that
                 // lands on this star column can be told apart from a same-named
@@ -2406,12 +2411,20 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
                 case JoinNullSide::None:
                     break;
             }
+            // Which side(s) an outer join makes NULL - drives the merged
+            // USING/NATURAL column's authoritative nullability.
+            const JoinNullSide null_side = join_null_side(item);
+            const bool left_null_supplied = null_side == JoinNullSide::Left ||
+                                            null_side == JoinNullSide::Both;
+            const bool right_null_supplied = null_side == JoinNullSide::Right ||
+                                             null_side == JoinNullSide::Both;
             // Pass 2: resolve the ON expression / USING columns against the now
             // fully-populated scope.
             for (ASTNode* child = first_child(item); child != nullptr;
                  child = child->next_sibling) {
                 if (child->node_type == NodeType::UsingClause) {
-                    resolve_using(child, scope, left_end, right_end);
+                    resolve_using(child, scope, left_end, right_end,
+                                  left_null_supplied, right_null_supplied);
                 } else if (!is_relation_node(child->node_type)) {
                     // The ON predicate: a normal expression whose column refs
                     // resolve (and emit diagnostics) through infer_expr. Like WHERE
@@ -2424,7 +2437,8 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
             // or USING clause; coalesce its common columns so bare references to
             // them resolve unambiguously.
             if (to_upper(item->primary_text).find("NATURAL") != std::string::npos) {
-                resolve_natural(scope, left_end, right_end);
+                resolve_natural(scope, left_end, right_end, left_null_supplied,
+                                right_null_supplied);
             }
             return;
         }
@@ -2435,7 +2449,8 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
 }
 
 void Analyzer::resolve_using(ASTNode* using_clause, Scope& scope,
-                             std::size_t left_end, std::size_t right_end) {
+                             std::size_t left_end, std::size_t right_end,
+                             bool left_null_supplied, bool right_null_supplied) {
     const auto& relations = scope.relations();
     for (ASTNode* col = first_child(using_clause); col != nullptr;
          col = col->next_sibling) {
@@ -2448,20 +2463,31 @@ void Analyzer::resolve_using(ASTNode* using_clause, Scope& scope,
                 left_hit = c;
             }
         }
-        bool right_found = false;
+        const ResolvedColumn* right_hit = nullptr;
         for (std::size_t i = left_end; i < right_end && i < relations.size(); ++i) {
-            if (relations[i].find_column(name) != nullptr) {
-                right_found = true;
+            if (const auto* c = relations[i].find_column(name)) {
+                right_hit = c;
             }
         }
 
-        if (left_hit == nullptr || !right_found) {
+        if (left_hit == nullptr || right_hit == nullptr) {
             add_diagnostic(DiagnosticCode::UsingColumnMissing,
                            "USING column '" + std::string{name} +
                                "' is not present in both joined relations",
                            col);
             continue;
         }
+        // The merged output column is COALESCE(left, right); its authoritative
+        // nullability is the value present in a null-extended row (see the
+        // binder's merged-key rule). RIGHT join -> right base; FULL -> either
+        // base nullable; LEFT / INNER -> left base. Record it on the surviving
+        // left copy so a bare / `SELECT *` reference reports NOT NULL when the
+        // preserved base key is NOT NULL, agreeing with the bound plan schema.
+        const bool merged_nullable =
+            (left_null_supplied && right_null_supplied)
+                ? (left_hit->nullable || right_hit->nullable)
+                : left_null_supplied ? right_hit->nullable : left_hit->nullable;
+        scope.set_merged_column_nullability(0, left_end, name, merged_nullable);
         // A USING column collapses to a single merged output column; record its
         // resolved type on the node so downstream consumers see it, and coalesce
         // the right-hand copy so a bare reference is not ambiguous. The bare
@@ -2485,18 +2511,26 @@ void Analyzer::resolve_using(ASTNode* using_clause, Scope& scope,
 // a common column that is itself ambiguous on the left stays ambiguous - the
 // left copy is not coalesced, so resolve_bare still sees more than one.)
 void Analyzer::resolve_natural(Scope& scope, std::size_t left_end,
-                               std::size_t right_end) {
+                               std::size_t right_end, bool left_null_supplied,
+                               bool right_null_supplied) {
     const auto& relations = scope.relations();
     for (std::size_t li = 0; li < left_end && li < relations.size(); ++li) {
         for (const auto& lc : relations[li].columns) {
-            bool in_right = false;
+            const ResolvedColumn* right_hit = nullptr;
             for (std::size_t ri = left_end; ri < right_end && ri < relations.size(); ++ri) {
-                if (relations[ri].find_column(lc.name) != nullptr) {
-                    in_right = true;
+                if (const auto* c = relations[ri].find_column(lc.name)) {
+                    right_hit = c;
                     break;
                 }
             }
-            if (in_right) {
+            if (right_hit != nullptr) {
+                // Merged-column authoritative nullability, as in resolve_using.
+                const bool merged_nullable =
+                    (left_null_supplied && right_null_supplied)
+                        ? (lc.nullable || right_hit->nullable)
+                        : left_null_supplied ? right_hit->nullable : lc.nullable;
+                scope.set_merged_column_nullability(0, left_end, lc.name,
+                                                    merged_nullable);
                 scope.mark_column_coalesced(left_end, right_end, lc.name);
             }
         }

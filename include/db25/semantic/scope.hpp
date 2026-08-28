@@ -43,6 +43,15 @@ struct ResolvedColumn {
     // reference resolves to the single left copy instead of being reported
     // ambiguous. A qualified reference (`b.id`) still resolves against it.
     bool coalesced = false;
+    // The surviving (left) copy of a USING / NATURAL merged column. Its `nullable`
+    // is the AUTHORITATIVE nullability of the merged COALESCE(left, right) value
+    // (computed from the join type and both base columns), so a bare / `SELECT *`
+    // reference must use it verbatim WITHOUT re-applying the null-supplying-side
+    // adjustment - the merged value is present whenever either side is. A
+    // QUALIFIED reference (`t.id`) still reads the per-side copy and keeps the
+    // ordinary outer-join nullability, matching the binder's hidden per-side
+    // copies. Set by the analyzer's resolve_using / resolve_natural.
+    bool merged = false;
 };
 
 // A relation visible in a scope: a base table, an aliased table, a derived
@@ -182,6 +191,23 @@ public:
         }
     }
 
+    // Record the authoritative nullability of a USING / NATURAL merged column on
+    // its surviving (left) copy in relations [begin, end), and flag it merged so
+    // a bare / `SELECT *` reference reads this value verbatim (see
+    // ResolvedColumn::merged). Applied to every left copy of `name` in range;
+    // the right copies are already marked coalesced.
+    void set_merged_column_nullability(std::size_t begin, std::size_t end,
+                                       std::string_view name, bool nullable) {
+        for (std::size_t i = begin; i < end && i < relations_.size(); ++i) {
+            for (auto& c : relations_[i].columns) {
+                if (!c.coalesced && iequals(c.name, name)) {
+                    c.nullable = nullable;
+                    c.merged = true;
+                }
+            }
+        }
+    }
+
     // The relations made visible directly by this scope's own FROM clause, in
     // FROM/JOIN order. Used to expand `SELECT *` / `table.*` (which expand over
     // the current query block only, not outer scopes).
@@ -293,7 +319,14 @@ public:
                 res.from_outer = (s != this);
                 res.owner = s;
                 res.column = *hit;
-                res.column.nullable = res.column.nullable || hit_rel->nullable_from_join;
+                // A merged USING / NATURAL column carries its own authoritative
+                // (COALESCE) nullability; do not re-apply the null-supplying-side
+                // adjustment to a bare reference. Non-merged columns get the
+                // ordinary outer-join nullability.
+                if (!res.column.merged) {
+                    res.column.nullable =
+                        res.column.nullable || hit_rel->nullable_from_join;
+                }
                 return res;
             }
             if (matches > 1) {

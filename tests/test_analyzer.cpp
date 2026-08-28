@@ -4015,6 +4015,57 @@ void test_grouping_function_typing() {
     }
 }
 
+// GROUPING(...) is only defined in a grouped query. Used with no GROUP BY (and
+// no aggregate that would make the block grouped), it must be REJECTED - it was
+// previously typed BigInt and accepted silently (Postgres: "GROUPING must be
+// used in a grouped query").
+void test_grouping_without_group_by_rejected() {
+    std::printf("test_grouping_without_group_by_rejected\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    // Illegal: no grouping present anywhere in the block.
+    const char* bad[] = {
+        "SELECT GROUPING(dept) FROM emp",
+        "SELECT GROUPING(dept), dept FROM emp",
+        "SELECT id FROM emp ORDER BY GROUPING(dept)",
+    };
+    for (const char* sql : bad) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::GroupingWithoutGroupBy) == 1);
+    }
+    // Legal: a grouped query (GROUP BY, grouping set, or an aggregate + HAVING)
+    // must NOT raise it.
+    const char* ok[] = {
+        "SELECT dept, GROUPING(dept) FROM emp GROUP BY dept",
+        "SELECT dept, GROUPING(dept) FROM emp GROUP BY ROLLUP(dept)",
+        "SELECT GROUPING(dept) FROM emp GROUP BY dept HAVING COUNT(*) > 1",
+    };
+    for (const char* sql : ok) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(count_code(a, DiagnosticCode::GroupingWithoutGroupBy) == 0);
+    }
+    // A GROUPING nested in a subquery belongs to THAT block: an outer non-grouped
+    // query with a grouped subquery using GROUPING is clean at the outer level.
+    {
+        auto res = p.parse("SELECT (SELECT GROUPING(dept) FROM emp GROUP BY dept "
+                           "LIMIT 1) FROM emp");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(count_code(a, DiagnosticCode::GroupingWithoutGroupBy) == 0);
+        }
+    }
+}
+
 // M2 (pass 13): an ORDER BY key that references a ROLLUP/CUBE/GROUPING SETS
 // output column must carry the SAME nullability the SELECT-list column and the
 // projection do - nullable - because the key is NULL in the super-aggregate
@@ -6590,6 +6641,7 @@ int main() {
     test_group_by_grouping_element_columns();
     test_group_by_grouping_set_key_nullable();
     test_grouping_function_typing();
+    test_grouping_without_group_by_rejected();
     test_order_by_grouping_set_key_nullable();
     test_group_by_grouping_set_expression_nullable();
     test_group_by_grouping_set_window_not_nulled();

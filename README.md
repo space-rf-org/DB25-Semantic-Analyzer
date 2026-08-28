@@ -1,13 +1,31 @@
 # DB25 Semantic Analyzer
 
-A small C++23 library that consumes the [DB25 SQL parser](https://github.com/space-rf-org/db25-sql-parser)
-AST and performs **name resolution** and **basic type inference**: it resolves
-`FROM` tables and aliases, derived tables and CTEs, and column references
-against an injectable catalog, then infers types for literals, column
-references, comparisons and arithmetic.
+A C++23 library that consumes the [DB25 SQL parser](https://github.com/space-rf-org/db25-sql-parser)
+AST and resolves it into a typed, checked query, in place on the AST nodes:
+
+- **Name resolution** — `FROM` tables and aliases, derived tables, CTEs
+  (including recursive), and correlated / LATERAL scopes; column references
+  resolved against an injectable catalog, with ambiguity and unresolved-column
+  diagnostics.
+- **Type + nullability inference** — a `DataType` and a 2-bit nullability for
+  every expression node: literals (typed by magnitude), comparisons, arithmetic
+  (with a constant integer-overflow diagnostic), CASE / COALESCE, casts,
+  set-operation and `USING`/`NATURAL` merged-column reconciliation, and the
+  output **projection** of each query block (`projection_of`, which a downstream
+  binder must agree with).
+- **Legality checks** — aggregate/window placement (WHERE / HAVING / JOIN ON),
+  grouped-column and `DISTINCT`-`ORDER BY` rules, grouping-set (ROLLUP / CUBE /
+  GROUPING SETS) key nullability and the `GROUPING()` indicator, `RETURNING`
+  legality, and more — reported as structured `Diagnostic`s.
+
+It also snapshots DDL into the catalog so later statements resolve against it.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the pass pipeline, how results map
 onto the parser's node fields, and the AST conventions this analyzer relies on.
+To *see* the analyzer's resolved AST (types + nullability + catalog ids) as a
+canonical s-expression end to end, use the umbrella
+[`db25`](https://github.com/space-rf-org/db25) harness — its staged fixtures
+carry a `-- resolved` section per statement.
 
 ## Building
 
@@ -61,8 +79,12 @@ for (const auto& d : analyzer.diagnostics()) {
 ## Layout
 
 ```
-include/db25/semantic/   public headers (catalog, scope, diagnostic, analyzer, ast_helpers)
-src/analyzer.cpp         analyzer implementation
-tests/test_analyzer.cpp  assertion-based test suite
+include/db25/semantic/   public headers (catalog, scope, diagnostic, analyzer, ast_helpers, ...)
+src/analyzer.cpp         analyzer core (name resolution, type/nullability, legality)
+src/ddl.cpp              DDL -> catalog snapshotting
+src/check_eval.cpp       CHECK-constraint / constant folding evaluator
+src/{catalog_snapshot,transaction}.cpp
+tests/                   assertion-based suites (semantic, catalog, ddl, transaction);
+                         run all via `ctest --test-dir build`
 docs/DESIGN.md           design and AST-convention notes
 ```

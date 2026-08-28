@@ -602,6 +602,47 @@ void test_values_derived_table() {
     }
 }
 
+// A VALUES table-value-constructor is a query block in its own right - a
+// top-level statement or a CTE body - not only a FROM-derived table. It must be
+// analyzed and produce a projection so projection_of() is populated (agreeing
+// with the bound plan) and a CTE over VALUES gets its true arity. Previously
+// analyze() / analyze_stmt() / register_ctes ignored a ValuesStmt body, so a
+// top-level VALUES had no projection and a WITH-over-VALUES CTE had 0 columns.
+void test_values_query_block_projection() {
+    std::printf("test_values_query_block_projection\n");
+    auto cat = make_catalog();
+    parser::Parser p;
+    // Top-level VALUES: projection has one column per value position.
+    {
+        auto res = p.parse("VALUES (1, 'a'), (3, 'b')");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(!a.has_errors());
+            const auto* proj = a.projection_of(res.value());
+            CHECK(proj != nullptr && proj->size() == 2);
+            if (proj != nullptr && proj->size() == 2) {
+                CHECK((*proj)[0].type == DataType::Integer);
+                CHECK((*proj)[1].type == DataType::Text);
+            }
+        }
+    }
+    // A CTE whose body is VALUES gets its true arity, so `SELECT * FROM x`
+    // projects that many columns (was 0 -> star expanded to nothing).
+    {
+        auto res = p.parse("WITH x AS (VALUES (1, 2)) SELECT * FROM x");
+        CHECK(res.has_value());
+        if (res) {
+            Analyzer a(cat);
+            a.analyze(res.value());
+            CHECK(!a.has_errors());
+            const auto* proj = a.projection_of(res.value());
+            CHECK(proj != nullptr && proj->size() == 2);
+        }
+    }
+}
+
 void test_where_type_inference() {
     std::printf("test_where_type_inference\n");
     auto cat = make_catalog();
@@ -6208,6 +6249,7 @@ int main() {
     test_case_insensitive_check_binding();
     test_check_temporal_value_not_compared_lexically();
     test_values_derived_table();
+    test_values_query_block_projection();
     test_where_type_inference();
     test_cte_resolution();
     test_cte_setop_body();

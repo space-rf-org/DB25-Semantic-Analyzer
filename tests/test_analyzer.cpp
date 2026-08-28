@@ -1525,6 +1525,41 @@ void test_natural_join_coalesces_bare_ref() {
     CHECK(!a.has_errors());
 }
 
+// The merged USING/NATURAL column is COALESCE(left, right); with a NOT NULL join
+// key it is NOT NULL under every join type (the preserved side is always
+// present), so projection_of must report it NOT NULL - matching the bound plan
+// schema. Previously the analyzer OR'd in the null-supplying side's flag and
+// wrongly reported the merged column nullable under RIGHT / FULL. A QUALIFIED
+// reference still reads the per-side (nullable) copy.
+void test_using_merged_column_nullability() {
+    std::printf("test_using_merged_column_nullability\n");
+    auto cat = make_catalog_joins();  // orders.user_id, sessions.user_id NOT NULL
+    parser::Parser p;
+    // Bare merged `user_id` -> NOT NULL for INNER / LEFT / RIGHT / FULL / NATURAL.
+    auto merged_nullable = [&](const char* sql) -> int {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return -1;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        CHECK(!a.has_errors());
+        const auto* proj = a.projection_of(res.value());
+        if (proj == nullptr || proj->empty()) return -1;
+        return (*proj)[0].nullable ? 1 : 0;
+    };
+    CHECK(merged_nullable("SELECT user_id FROM orders o JOIN sessions s USING (user_id)") == 0);
+    CHECK(merged_nullable("SELECT user_id FROM orders o LEFT JOIN sessions s USING (user_id)") == 0);
+    CHECK(merged_nullable("SELECT user_id FROM orders o RIGHT JOIN sessions s USING (user_id)") == 0);
+    CHECK(merged_nullable("SELECT user_id FROM orders o FULL JOIN sessions s USING (user_id)") == 0);
+    CHECK(merged_nullable("SELECT user_id FROM orders o NATURAL RIGHT JOIN sessions s") == 0);
+    // A QUALIFIED reference to the null-supplying side keeps per-side nullability:
+    // under RIGHT join the left (orders) side is null-supplied, so o.user_id is
+    // nullable even though its base column is NOT NULL.
+    CHECK(merged_nullable("SELECT o.user_id FROM orders o RIGHT JOIN sessions s USING (user_id)") == 1);
+    // ...and NOT NULL when the qualified side is the preserved one.
+    CHECK(merged_nullable("SELECT s.user_id FROM orders o RIGHT JOIN sessions s USING (user_id)") == 0);
+}
+
 // Coalescing is specific to USING / NATURAL: a plain ON join over a shared
 // column name leaves BOTH copies visible, so a bare reference stays ambiguous.
 void test_join_on_shared_name_still_ambiguous() {
@@ -6211,6 +6246,7 @@ int main() {
     test_parenthesized_join_group_resolves();
     test_join_using_coalesces_bare_ref();
     test_natural_join_coalesces_bare_ref();
+    test_using_merged_column_nullability();
     test_join_on_shared_name_still_ambiguous();
     test_star_over_using_coalesces();
     test_star_over_natural_coalesces();

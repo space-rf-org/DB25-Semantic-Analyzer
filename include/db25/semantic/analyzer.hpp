@@ -203,13 +203,17 @@ private:
 
     // Resolve a JOIN's USING (col, ...) columns against the left relations
     // (indices [0, left_end)) and right relations ([left_end, right_end)).
+    // left_null_supplied / right_null_supplied say which side an outer join makes
+    // NULL, so the merged column's authoritative nullability can be computed.
     void resolve_using(ASTNode* using_clause, Scope& scope, std::size_t left_end,
-                       std::size_t right_end);
+                       std::size_t right_end, bool left_null_supplied,
+                       bool right_null_supplied);
 
     // Coalesce the columns common to a NATURAL join's left ([0, left_end)) and
     // right ([left_end, right_end)) relations, so a bare reference to a shared
-    // column is not ambiguous.
-    void resolve_natural(Scope& scope, std::size_t left_end, std::size_t right_end);
+    // column is not ambiguous. left/right_null_supplied as in resolve_using.
+    void resolve_natural(Scope& scope, std::size_t left_end, std::size_t right_end,
+                         bool left_null_supplied, bool right_null_supplied);
 
     // Resolve a column reference against `scope`, recording type + context and
     // emitting a diagnostic on failure.

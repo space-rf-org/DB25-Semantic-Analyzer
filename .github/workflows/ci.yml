@@ -11,7 +11,7 @@ on:
 jobs:
   # ---------------------------------------------------------------------------
   # Build the parser dependency, then build + test the analyzer.
-  # Runs once per compiler (g++-13 and g++-14 both build the parser).
+  # Builds the parser then the analyzer with the supported toolchain (GCC 14).
   # ---------------------------------------------------------------------------
   build-and-test:
     name: build-and-test (${{ matrix.cxx }})
@@ -21,7 +21,6 @@ jobs:
       matrix:
         include:
           - cxx: g++-14
-          - cxx: g++-13
     steps:
       # 1. Check out the analyzer.
       - name: Checkout analyzer

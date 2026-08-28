@@ -57,15 +57,21 @@ enum class DiagnosticCode : std::uint16_t {
     // An aggregate function call appears in a WHERE clause. Aggregates are
     // evaluated after grouping, so they belong in HAVING, not WHERE.
     AggregateInWhere,
+    // An aggregate function call appears in a JOIN ON condition. A join
+    // predicate is a filter evaluated BEFORE aggregation - the same position as
+    // WHERE - so an aggregate is illegal there (Postgres: "aggregate functions
+    // are not allowed in JOIN conditions").
+    AggregateInJoinCondition,
     // A GROUP BY key is (or contains) a non-windowed aggregate, e.g.
     // `GROUP BY MAX(age)`. Grouping is what produces aggregates, so an aggregate
     // cannot itself be a grouping key (Postgres: "aggregate functions are not
     // allowed in GROUP BY").
     AggregateInGroupBy,
     // A window function appears where it is not allowed: a WHERE or HAVING
-    // predicate. Windows are computed AFTER the WHERE filter and AFTER grouping /
-    // HAVING, so a window call can never be a WHERE or HAVING term (Postgres:
-    // "window functions are not allowed in WHERE" / "... in HAVING").
+    // predicate, or a JOIN ON condition. Windows are computed AFTER the WHERE
+    // filter and AFTER grouping / HAVING, so a window call can never be a WHERE,
+    // HAVING, or join-condition term (Postgres: "window functions are not
+    // allowed in WHERE" / "... in HAVING" / "... in JOIN conditions").
     WindowNotAllowed,
     // The same correlation name (table alias, or table name when unaliased) is
     // specified more than once in a single FROM clause.

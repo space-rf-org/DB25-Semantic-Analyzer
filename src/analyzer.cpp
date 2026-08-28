@@ -2461,6 +2461,32 @@ void Analyzer::resolve_from_item(ASTNode* item, Scope& scope,
                     // it is a boolean context, so a non-boolean ON is flagged.
                     warn_boolean_context(infer_expr(child, scope), child,
                                          "JOIN ON predicate");
+                    // A JOIN ON predicate is a filter evaluated BEFORE aggregation,
+                    // the same position as WHERE, so an aggregate or window call is
+                    // illegal here exactly as it is in WHERE (Postgres: "aggregate
+                    // / window functions are not allowed in JOIN conditions").
+                    // Without this the binder would lower the set-function into a
+                    // join predicate with no operator to compute it - a
+                    // structurally invalid plan. This check lives here rather than
+                    // in analyze_grouping because ON predicates hang off the
+                    // FromClause / JoinClause subtree, which the WHERE / HAVING
+                    // legality checks never visit; doing it at the resolution site
+                    // also covers nested joins and joins inside derived tables.
+                    // contains_aggregate / contains_window stop at subquery
+                    // boundaries, so a set-function legitimately inside an ON
+                    // subquery (`ON x = (SELECT SUM(y) ...)`) is not flagged.
+                    if (contains_aggregate(child, 0)) {
+                        add_diagnostic(DiagnosticCode::AggregateInJoinCondition,
+                                       "aggregate functions are not allowed in "
+                                       "JOIN conditions",
+                                       child);
+                    }
+                    if (contains_window(child, 0)) {
+                        add_diagnostic(DiagnosticCode::WindowNotAllowed,
+                                       "window functions are not allowed in JOIN "
+                                       "conditions",
+                                       child);
+                    }
                 }
             }
             // A NATURAL join (recorded in the JoinClause primary_text) has no ON

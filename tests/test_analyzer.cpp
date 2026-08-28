@@ -3979,6 +3979,42 @@ void test_group_by_grouping_set_key_nullable() {
     }
 }
 
+// GROUPING(col, ...) is the grouping-set indicator function: a BigInt bitmask,
+// never NULL. It is neither a value aggregate nor a scalar function, so the
+// analyzer types it explicitly - without this it degraded to an UnknownFunction
+// warning with an Unknown result type.
+void test_grouping_function_typing() {
+    std::printf("test_grouping_function_typing\n");
+    auto cat = make_catalog_emp();
+    parser::Parser p;
+    const char* ok[] = {
+        "SELECT dept, GROUPING(dept), SUM(salary) FROM emp GROUP BY ROLLUP(dept)",
+        "SELECT GROUPING(dept) FROM emp GROUP BY GROUPING SETS ((dept))",
+        "SELECT GROUPING(dept, region) FROM emp GROUP BY CUBE(dept, region)",
+    };
+    for (const char* sql : ok) {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) continue;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        // No UnknownFunction warning for GROUPING.
+        CHECK(count_code(a, DiagnosticCode::UnknownFunction) == 0);
+        // The GROUPING() output column is BigInt and NOT NULL. It is the first
+        // projection column in the last two queries; find it in the first.
+        const auto* proj = a.projection_of(res.value());
+        CHECK(proj != nullptr && !proj->empty());
+        if (proj != nullptr) {
+            for (const auto& c : *proj) {
+                // The bitmask column, wherever it lands, is a not-null BigInt.
+                if (c.type == DataType::BigInt) {
+                    CHECK(c.nullable == false);
+                }
+            }
+        }
+    }
+}
+
 // M2 (pass 13): an ORDER BY key that references a ROLLUP/CUBE/GROUPING SETS
 // output column must carry the SAME nullability the SELECT-list column and the
 // projection do - nullable - because the key is NULL in the super-aggregate
@@ -6553,6 +6589,7 @@ int main() {
     test_numeric_real_promotes_double();
     test_group_by_grouping_element_columns();
     test_group_by_grouping_set_key_nullable();
+    test_grouping_function_typing();
     test_order_by_grouping_set_key_nullable();
     test_group_by_grouping_set_expression_nullable();
     test_group_by_grouping_set_window_not_nulled();

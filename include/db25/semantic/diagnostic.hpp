@@ -130,6 +130,27 @@ enum class DiagnosticCode : std::uint16_t {
     // aggregates used as window functions) (Postgres: "FILTER specified, but X
     // is not an aggregate function").
     FilterOnNonAggregate,
+    // A window function appears inside an aggregate function's argument, e.g.
+    // `sum(row_number() OVER ())`. Windowing runs AFTER aggregation, so a window
+    // result can never feed an aggregate (Postgres: "aggregate function calls
+    // cannot contain window function calls").
+    WindowInAggregate,
+    // An aggregate or window function appears in a RETURNING list, e.g.
+    // `INSERT ... RETURNING count(*)`. RETURNING projects the individual
+    // affected rows; it has no grouping or window framing, so set functions are
+    // not allowed there (Postgres: "aggregate/window functions are not allowed
+    // in RETURNING").
+    AggregateInReturning,
+    WindowInReturning,
+    // Under SELECT DISTINCT, an ORDER BY item references a column that is not in
+    // the select list, e.g. `SELECT DISTINCT dept FROM emp ORDER BY sal`.
+    // DISTINCT collapses the visible row to the select list, so a sort key must
+    // be composed only of selected items - a hidden sort column would change
+    // the distinct key (Postgres: "for SELECT DISTINCT, ORDER BY expressions
+    // must appear in select list"). The analyzer's plain-SELECT ORDER BY
+    // fallback resolves such a key against the FROM scope with no DISTINCT
+    // awareness, so the binder would reject what the analyzer accepted.
+    OrderByNotInSelectDistinct,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

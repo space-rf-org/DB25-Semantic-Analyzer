@@ -202,6 +202,43 @@ constexpr std::array<std::string_view, 16> kAggregateNames = {
     return false;
 }
 
+// Forward declarations: these recursive expression probes are defined later in
+// the file's anonymous namespace, but several analysis passes above their
+// definition need them (window-in-aggregate and RETURNING legality checks).
+[[nodiscard]] bool contains_aggregate(const ASTNode* node, int depth);
+[[nodiscard]] bool contains_window(const ASTNode* node, int depth);
+[[nodiscard]] bool group_expr_equal(const ASTNode* e, const ASTNode* k, int depth);
+
+// True if an ORDER BY key structurally matches a whole projected select-list
+// expression of `container` (used to enforce the SELECT DISTINCT rule that a
+// sort key must be composed of selected items). Star items have no single
+// source expression and are skipped; a `*` projection is handled by the
+// output-name match earlier in analyze_order_by.
+[[nodiscard]] bool order_key_matches_select_list(const ASTNode* container,
+                                                 const ASTNode* key) {
+    const ASTNode* select_list = nullptr;
+    for (const ASTNode* c = container->first_child; c != nullptr;
+         c = c->next_sibling) {
+        if (c->node_type == NodeType::SelectList) {
+            select_list = c;
+            break;
+        }
+    }
+    if (select_list == nullptr) {
+        return false;
+    }
+    for (const ASTNode* item = select_list->first_child; item != nullptr;
+         item = item->next_sibling) {
+        if (item->node_type == NodeType::Star) {
+            continue;
+        }
+        if (group_expr_equal(key, item, 0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // A FROM/JOIN child that contributes relations to the scope (as opposed to a
 // join predicate such as an ON expression or a USING clause).
 [[nodiscard]] bool is_relation_node(NodeType t) {
@@ -1407,6 +1444,20 @@ void Analyzer::analyze_returning(ASTNode* stmt, Scope& scope) {
         // Resolving the item emits UnresolvedColumn for a bad reference and
         // records the output column's type / nullability.
         infer_expr(item, scope);
+        // RETURNING projects the individual affected rows: there is no grouping
+        // or window framing, so an aggregate or window function is illegal
+        // there (Postgres: "aggregate/window functions are not allowed in
+        // RETURNING"). Both would otherwise analyze clean and reach the binder
+        // as an unlowerable set function.
+        if (contains_aggregate(item, 0)) {
+            add_diagnostic(DiagnosticCode::AggregateInReturning,
+                           "aggregate functions are not allowed in RETURNING",
+                           item);
+        } else if (contains_window(item, 0)) {
+            add_diagnostic(DiagnosticCode::WindowInReturning,
+                           "window functions are not allowed in RETURNING",
+                           item);
+        }
     }
 }
 
@@ -1946,6 +1997,32 @@ void Analyzer::analyze_order_by(ASTNode* container,
             // not projected (`SELECT a FROM t ORDER BY b`), so fall back to the
             // FROM scope.
             infer_expr(item, *from_scope);
+            // ...unless the query is SELECT DISTINCT: DISTINCT collapses the
+            // visible row to the select list, so an ORDER BY key must be
+            // composed only of selected items - it must structurally match a
+            // whole projected select-list expression (an output-name/ordinal
+            // match was handled above). A key over a NON-projected column
+            // (`SELECT DISTINCT dept FROM emp ORDER BY sal`) resolves against
+            // the FROM scope but the binder rejects it, since ordering it would
+            // require a hidden column that changes the distinct key. Reject it
+            // here so the stages agree (Postgres: "for SELECT DISTINCT, ORDER BY
+            // expressions must appear in select list").
+            // DISTINCT is recorded by the parser in the SelectStmt's
+            // semantic_flags (bit 0), which is also where the binder reads it -
+            // NOT in the NodeFlags `flags` byte that has_flag() checks.
+            const bool distinct =
+                (container->semantic_flags &
+                 static_cast<std::uint16_t>(ast::NodeFlags::Distinct)) != 0;
+            if (distinct && !order_key_matches_select_list(container, item)) {
+                const bool is_col = is_column_ref_node(item->node_type);
+                add_diagnostic(
+                    DiagnosticCode::OrderByNotInSelectDistinct,
+                    std::string{"for SELECT DISTINCT, ORDER BY "} +
+                        (is_col ? "column '" + std::string{item->primary_text} + "'"
+                                : "expression") +
+                        " must appear in the select list",
+                    item);
+            }
         } else {
             // Set operation: there is no single FROM scope, so an ORDER BY key may
             // reference ONLY an output column - by position (handled above) or by
@@ -2665,6 +2742,31 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                                "FILTER specified, but " + upper +
                                    " is not an aggregate function",
                                expr);
+            }
+            // A (non-windowed) aggregate's argument may not contain a window
+            // function: `sum(row_number() OVER ())`. Windowing runs after
+            // aggregation, so a window result can never feed an aggregate
+            // (Postgres: "aggregate function calls cannot contain window
+            // function calls"). A windowed call (window_spec != nullptr) is
+            // itself a window function and is handled below.
+            if (window_spec == nullptr && is_aggregate_name(upper)) {
+                for (ASTNode* arg = first_child(expr); arg != nullptr;
+                     arg = arg->next_sibling) {
+                    if (arg->node_type == NodeType::WindowSpec) {
+                        continue;  // this call's own OVER, not an argument
+                    }
+                    // A window inside a FILTER predicate is equally illegal.
+                    ASTNode* probe = arg->node_type == NodeType::WhereClause
+                                         ? first_child(arg)
+                                         : arg;
+                    if (contains_window(probe, 0)) {
+                        add_diagnostic(DiagnosticCode::WindowInAggregate,
+                                       "aggregate function calls cannot contain "
+                                       "window function calls",
+                                       expr);
+                        break;
+                    }
+                }
             }
             if (window_spec != nullptr) {
                 // Resolve the OVER clause's partition/order expressions (the

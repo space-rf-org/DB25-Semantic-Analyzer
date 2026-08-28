@@ -3631,6 +3631,31 @@ namespace {
     return false;
 }
 
+// Does the subtree rooted at `node` contain a GROUPING(...) call? Mirrors
+// contains_aggregate: depth-bounded and stops at a subquery boundary (a GROUPING
+// inside a nested query block belongs to THAT block's grouping, not this one).
+// Used to reject GROUPING() in a query with no grouping.
+[[nodiscard]] bool contains_grouping_call(const ASTNode* node, int depth = 0) {
+    if (node == nullptr || depth >= kMaxExprDepth) {
+        return false;
+    }
+    if (node->node_type == NodeType::Subquery ||
+        node->node_type == NodeType::SubqueryExpr) {
+        return false;
+    }
+    if ((node->node_type == NodeType::FunctionCall ||
+         node->node_type == NodeType::FunctionExpr) &&
+        to_upper(node->primary_text) == "GROUPING") {
+        return true;
+    }
+    for (const ASTNode* c = node->first_child; c != nullptr; c = c->next_sibling) {
+        if (contains_grouping_call(c, depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Does the subtree rooted at `node` contain a WINDOW function call (any call
 // carrying an OVER / WindowSpec)? Mirrors contains_aggregate: bounded by the
 // shared expression-depth limit and stopping at a nested subquery boundary (a
@@ -3900,6 +3925,31 @@ void Analyzer::analyze_grouping(ASTNode* select_stmt, ASTNode* group_by, Scope& 
                          clause_has_aggregate(select_list) ||
                          clause_has_aggregate(order_by_clause);
     if (!grouped) {
+        // GROUPING(...) is the grouping-set indicator and is only defined in a
+        // grouped query; `SELECT GROUPING(dept) FROM emp` has no GROUP BY (and
+        // GROUPING is not itself an aggregate, so it does not make the block
+        // grouped). It was previously typed BigInt and accepted silently - report
+        // it (Postgres: "GROUPING must be used in a grouped query"). Check the
+        // clauses where GROUPING may legally appear once grouped: the SELECT list,
+        // HAVING, and ORDER BY.
+        const auto clause_has_grouping = [](ASTNode* clause) {
+            if (clause == nullptr) return false;
+            for (ASTNode* item = first_child(clause); item != nullptr;
+                 item = item->next_sibling) {
+                if (contains_grouping_call(item)) return true;
+            }
+            return false;
+        };
+        for (ASTNode* clause : {select_list, static_cast<ASTNode*>(having_clause),
+                                static_cast<ASTNode*>(order_by_clause)}) {
+            if (clause_has_grouping(clause)) {
+                add_diagnostic(DiagnosticCode::GroupingWithoutGroupBy,
+                               "GROUPING() must be used in a grouped query (a query "
+                               "with GROUP BY or an aggregate)",
+                               clause);
+                break;
+            }
+        }
         return;
     }
 

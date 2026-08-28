@@ -166,6 +166,13 @@ enum class DiagnosticCode : std::uint16_t {
     // fallback resolves such a key against the FROM scope with no DISTINCT
     // awareness, so the binder would reject what the analyzer accepted.
     OrderByNotInSelectDistinct,
+    // GROUPING(...) appears in a query with no grouping (no GROUP BY, and no
+    // aggregate that would make the block grouped). GROUPING is the grouping-set
+    // indicator - it reports, per output row, which of its argument columns were
+    // NULLed by the grouping set rather than by the data - so it is only defined
+    // in a grouped query (Postgres: "GROUPING must be used in a grouped query",
+    // SQLSTATE 42803). Outside one it was silently typed BigInt and accepted.
+    GroupingWithoutGroupBy,
 };
 
 // A diagnostic carries the parser node's source range so callers can point at

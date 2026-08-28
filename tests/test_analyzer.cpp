@@ -1080,6 +1080,25 @@ void test_dml_on_conflict_and_returning_analyzed() {
     CHECK(clean("UPDATE users SET name = 'a' RETURNING id, name"));
     CHECK(clean("DELETE FROM users RETURNING *"));
     CHECK(clean("INSERT INTO users (id,name) VALUES (1,'a') RETURNING id + 1"));
+
+    // ON CONFLICT conflict-target (arbiter) columns must exist in the target
+    // table -- the parenthesized index-inference list was never resolved, so a
+    // non-existent arbiter column was accepted clean even though the DO UPDATE
+    // SET / RETURNING columns of the same statement are checked.
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (missing) DO NOTHING",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (id, bogus) DO NOTHING",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    CHECK(codes("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (missing) DO UPDATE SET name = 'b'",
+                DiagnosticCode::UnresolvedColumn) == 1);
+    // Guard: valid arbiter columns (single and multi-column) analyze clean, and
+    // the DO UPDATE SET payload columns are not mistaken for arbiter columns.
+    CHECK(clean("INSERT INTO users (id,name) VALUES (1,'a') ON CONFLICT (id) DO NOTHING"));
+    CHECK(clean("INSERT INTO users (id,name) VALUES (1,'a') "
+                "ON CONFLICT (id) DO UPDATE SET name = excluded.name"));
 }
 
 void test_recursive_cte_nullability() {

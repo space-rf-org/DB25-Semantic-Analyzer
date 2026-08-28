@@ -1338,6 +1338,28 @@ void Analyzer::analyze_insert(ASTNode* insert_stmt) {
     // row plus an `excluded` alias for the proposed row (both the target
     // columns), matching Postgres's DO UPDATE visibility.
     if (ASTNode* on_conflict = find_child(insert_stmt, NodeType::OnConflictClause)) {
+        // The conflict target - the parenthesized arbiter column list
+        // `ON CONFLICT (a, b) ...` - names columns of the target table that an
+        // index must cover. It was never resolved, so a non-existent arbiter
+        // column (`ON CONFLICT (missing) DO NOTHING`) was accepted clean even
+        // though the DO UPDATE SET and RETURNING columns of the same statement
+        // are checked; Postgres rejects it ("column ... named in conflict target
+        // does not exist") and the binder has no index/column to build the
+        // arbiter on. The arbiter columns are the Identifier children of the
+        // clause (the SetClause / DO-UPDATE payload is a separate child).
+        for (ASTNode* c = first_child(on_conflict); c != nullptr; c = c->next_sibling) {
+            if (c->node_type != NodeType::Identifier) {
+                continue;
+            }
+            const std::string_view col = split_column_ref(c->primary_text).column;
+            if (table->find_column(col) == nullptr) {
+                add_diagnostic(DiagnosticCode::UnresolvedColumn,
+                               "column '" + std::string{col} +
+                                   "' named in ON CONFLICT target does not exist in '" +
+                                   std::string{table_name} + "'",
+                               c);
+            }
+        }
         if (ASTNode* set_clause = find_child(on_conflict, NodeType::SetClause)) {
             Scope conflict_scope(nullptr);
             bind_base_table(table_ref, conflict_scope);

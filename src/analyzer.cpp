@@ -2942,6 +2942,19 @@ DataType Analyzer::infer_expr(ASTNode* expr, Scope& scope) {
                 record_nullability(expr, window_function_nullability(upper, arg_nulls));
                 return wf.type;
             }
+            // GROUPING(col, ...) is the grouping-set indicator: it returns a
+            // BigInt bitmask (never NULL) telling which of its argument columns
+            // are NULL because of the grouping set rather than the data. It is
+            // neither a value aggregate nor a scalar function, so type it
+            // explicitly here (otherwise it degrades to an UnknownFunction
+            // warning). Legality - it must appear in a grouped query and each
+            // argument must be a grouping key - is checked in analyze_grouping,
+            // where the grouping keys are known.
+            if (upper == "GROUPING") {
+                record_type(expr, DataType::BigInt);
+                record_nullability(expr, 1);  // the bitmask is never NULL
+                return DataType::BigInt;
+            }
             const FunctionType ft = function_result_type(upper, arg_types);
             if (!ft.known) {
                 add_diagnostic(DiagnosticCode::UnknownFunction,
@@ -4386,6 +4399,14 @@ bool Analyzer::expr_reads_grouping_key(
         // rows, so it must not null the result. Stop here - do not descend into a
         // windowed call.
         if (has_window_spec(expr)) {
+            return false;
+        }
+        // GROUPING(col, ...) is the grouping-set INDICATOR: its BigInt bitmask is
+        // always defined and never NULL, even though its arguments name grouping
+        // keys that ARE null in some super-aggregate rows. Reading a key inside
+        // GROUPING() must therefore not null the result (it is, in fact, the one
+        // function whose whole purpose is to report that NULL-ness as a value).
+        if (to_upper(expr->primary_text) == "GROUPING") {
             return false;
         }
         // A plain aggregate reads the raw input rows, where the grouping key is

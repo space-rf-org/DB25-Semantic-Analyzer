@@ -5,6 +5,7 @@
 // integrity in the manager), then assert the resulting catalog state.
 
 #include "db25/parser/parser.hpp"
+#include "db25/semantic/analyzer.hpp"
 #include "db25/semantic/catalog.hpp"
 #include "db25/semantic/catalog_manager.hpp"
 #include "db25/semantic/ddl.hpp"
@@ -909,8 +910,65 @@ void test_named_and_drop_constraint() {
 
 }  // namespace
 
+// CTAS (`CREATE TABLE ... AS <query>`) registers a new table whose columns are
+// the defining query's projection, so a later statement can resolve against it.
+void test_ctas_registration() {
+    const std::string path = scratch_path("ddl_ctas.db25cat");
+    std::remove(path.c_str());
+    std::string load_err;
+    CatalogManager mgr(path, load_err);
+    parser::Parser p;
+
+    CHECK(run(p, mgr, "CREATE TABLE emp (id INTEGER NOT NULL, name TEXT, "
+                      "dept_id INTEGER, salary DOUBLE)").ok);
+    CHECK(run(p, mgr, "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").ok);
+
+    // CTAS over a base table with a projection + WHERE: the new table gets the
+    // query's columns (id: Integer NOT NULL passthrough, salary: Double).
+    const DdlResult r = run(p, mgr,
+        "CREATE TABLE high_earners AS SELECT id, salary FROM emp WHERE salary > 100");
+    CHECK(r.ok);
+    const TableInfo* t = mgr.catalog().find_table("high_earners");
+    CHECK(t != nullptr);
+    if (t != nullptr) {
+        CHECK(t->columns.size() == 2);
+        if (t->columns.size() == 2) {
+            CHECK(t->columns[0].name == "id" && t->columns[0].type == DataType::Integer);
+            CHECK(t->columns[1].name == "salary" &&
+                  t->columns[1].type == DataType::Double);
+        }
+    }
+
+    // The CTAS table is now queryable: a SELECT against it analyzes clean.
+    {
+        ast::ASTNode* q = parse(p, "SELECT id, salary FROM high_earners");
+        CHECK(q != nullptr);
+        if (q != nullptr) {
+            Analyzer a(mgr.catalog());
+            a.analyze(q);
+            CHECK(!a.has_errors());
+        }
+    }
+
+    // CTAS over a join registers columns from both sides' projection.
+    const DdlResult rj = run(p, mgr,
+        "CREATE TABLE emp_dept AS SELECT e.id, d.name FROM emp e "
+        "JOIN dept d ON e.dept_id = d.id");
+    CHECK(rj.ok);
+    const TableInfo* ed = mgr.catalog().find_table("emp_dept");
+    CHECK(ed != nullptr && ed->columns.size() == 2);
+
+    // A CTAS whose query is invalid (an unresolved column) is honestly rejected,
+    // and the table is NOT registered.
+    const DdlResult bad = run(p, mgr,
+        "CREATE TABLE oops AS SELECT nonesuch FROM emp");
+    CHECK(!bad.ok);
+    CHECK(mgr.catalog().find_table("oops") == nullptr);
+}
+
 int main() {
     test_create_table_end_to_end();
+    test_ctas_registration();
     test_check_default_validation();
     test_check_default_persistence();
     test_check_default_typecheck();

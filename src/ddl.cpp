@@ -53,6 +53,25 @@ ASTNode* find_ddl(ASTNode* n) {
     return nullptr;
 }
 
+// The defining query of a CTAS (`CREATE TABLE ... AS <query>`): the SELECT /
+// set-op / VALUES child of a CreateTableStmt, or null for a plain CREATE TABLE.
+// A CTAS's columns come from this query, not from column definitions.
+const ASTNode* ctas_query(const ASTNode* create) {
+    for (const ASTNode* c = create->first_child; c != nullptr; c = c->next_sibling) {
+        switch (c->node_type) {
+            case NodeType::SelectStmt:
+            case NodeType::UnionStmt:
+            case NodeType::IntersectStmt:
+            case NodeType::ExceptStmt:
+            case NodeType::ValuesStmt:
+                return c;
+            default:
+                break;
+        }
+    }
+    return nullptr;
+}
+
 const ASTNode* first_child_of_type(const ASTNode* n, NodeType t) {
     for (const ASTNode* c = n->first_child; c != nullptr; c = c->next_sibling) {
         if (c->node_type == t) return c;
@@ -488,6 +507,14 @@ bool validate_ddl(ASTNode* stmt, std::vector<std::string>& errors) {
         errors.emplace_back("CREATE TABLE: missing table name");
     }
 
+    // CTAS (`CREATE TABLE ... AS <query>`): the shape is the query's, not a
+    // column-definition list, so the column-def / no-columns checks below do not
+    // apply. The defining query's own well-formedness is checked when it is
+    // analyzed (in execute_ddl, against the live catalog).
+    if (ctas_query(d) != nullptr) {
+        return errors.empty();
+    }
+
     int columns = 0;
     int primary_keys = 0;
     std::vector<std::string> seen;
@@ -739,6 +766,37 @@ DdlResult execute_ddl(ASTNode* stmt, CatalogManager& mgr) {
     const bool if_not_exists = (d->semantic_flags & kFlagIfExistsOrNotExists) != 0;
     if (if_not_exists && mgr.catalog().find_table(name) != nullptr) {
         return DdlResult{true, {}, mgr.schema_version()};  // no-op success
+    }
+
+    // CTAS (`CREATE TABLE <name> AS <query>`): the new table's columns are the
+    // defining query's projection, so a later statement can query it. Analyze the
+    // query against the LIVE catalog (tables created by earlier statements in the
+    // session are visible), then build the column list from its resolved columns.
+    if (const ASTNode* q = ctas_query(d)) {
+        Analyzer analyzer(mgr.catalog());
+        analyzer.analyze(d);  // routes to CTAS-body analysis; populates projection_of(q)
+        const std::vector<ResolvedColumn>* proj = analyzer.projection_of(q);
+        if (analyzer.has_errors() || proj == nullptr) {
+            return DdlResult{false,
+                             "CTAS defining query for '" + name +
+                                 "' did not analyze cleanly",
+                             mgr.schema_version()};
+        }
+        if (proj->empty()) {
+            return DdlResult{false, "CTAS query for '" + name + "' produces no columns",
+                             mgr.schema_version()};
+        }
+        std::vector<ColumnInfo> columns;
+        columns.reserve(proj->size());
+        std::size_t anon = 0;
+        for (const ResolvedColumn& rc : *proj) {
+            // A computed column (an expression with no output name) is named
+            // positionally, mirroring Postgres's `?column?` fallback.
+            std::string cname =
+                rc.name.empty() ? "column" + std::to_string(++anon) : rc.name;
+            columns.push_back(ColumnInfo{std::move(cname), rc.type, rc.nullable});
+        }
+        return mgr.create_table(name, std::move(columns));
     }
 
     std::vector<ColumnInfo> columns;

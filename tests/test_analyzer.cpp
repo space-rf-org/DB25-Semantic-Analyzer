@@ -1543,6 +1543,13 @@ void test_lateral_derived_table_sees_siblings() {
     CHECK(!has_err("SELECT * FROM users u, LATERAL (SELECT u.id) s"));
     CHECK(!has_err("SELECT * FROM users u CROSS JOIN LATERAL (SELECT u.id) s"));
     CHECK(!has_err("SELECT * FROM users u JOIN LATERAL (SELECT u.id) s ON true"));
+    // LEFT [OUTER] JOIN LATERAL is correlated too; its RHS is additionally
+    // null-extended, but that is a binder concern - the analyzer just resolves
+    // the correlation. (RIGHT/FULL JOIN LATERAL are rejected at the parser.)
+    CHECK(!has_err(
+        "SELECT * FROM users u LEFT JOIN LATERAL (SELECT u.id) s ON true"));
+    CHECK(!has_err(
+        "SELECT * FROM users u LEFT OUTER JOIN LATERAL (SELECT u.id) s ON true"));
     // A LATERAL body may reference EARLIER comma siblings, not only the immediate
     // left one (`u` is visible past `o`).
     CHECK(!has_err("SELECT * FROM users u, orders o, "

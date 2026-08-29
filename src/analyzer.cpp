@@ -276,8 +276,13 @@ enum class JoinNullSide {
         case NodeType::RightJoin: return JoinNullSide::Left;
         case NodeType::FullJoin: return JoinNullSide::Both;
         case NodeType::InnerJoin:
-        case NodeType::CrossJoin:
-        case NodeType::LateralJoin: return JoinNullSide::None;
+        case NodeType::CrossJoin: return JoinNullSide::None;
+        // A LateralJoin carries its outer-join qualifier in primary_text (the
+        // parser keeps "LEFT JOIN" etc. so laterality and null-extension stay
+        // orthogonal): fall through to the text scan. Comma / CROSS / [INNER]
+        // JOIN LATERAL have no qualifier -> None; LEFT JOIN LATERAL -> Right (its
+        // RHS is null-extended). RIGHT/FULL LATERAL are rejected at the parser.
+        case NodeType::LateralJoin: break;
         default: break;
     }
     // JoinClause carries the kind in primary_text, e.g. "LEFT JOIN".

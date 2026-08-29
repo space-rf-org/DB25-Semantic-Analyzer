@@ -1560,6 +1560,36 @@ void test_lateral_derived_table_sees_siblings() {
     CHECK(!has_err("SELECT * FROM users u, LATERAL (SELECT total FROM orders) s"));
 }
 
+// CREATE TABLE ... AS <query> (CTAS): the analyzer now resolves the defining
+// query (previously CreateTableStmt fell through unanalyzed), so a valid CTAS is
+// clean and an invalid one surfaces the query's error - which is what lets the
+// binder lower CTAS to a CreateTableAs over the bound query.
+void test_ctas_query_analyzed() {
+    std::printf("test_ctas_query_analyzed\n");
+    auto cat = make_catalog_joins();  // users, orders, sessions
+    parser::Parser p;
+    auto has_err = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return false;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return a.has_errors();
+    };
+    // A valid CTAS body resolves clean.
+    CHECK(!has_err("CREATE TABLE t AS SELECT id, name FROM users"));
+    CHECK(!has_err("CREATE TABLE t AS SELECT u.id FROM users u JOIN orders o "
+                   "ON u.id = o.user_id"));
+    CHECK(!has_err("CREATE TABLE t AS VALUES (1, 'a'), (2, 'b')"));
+    // An invalid CTAS body is no longer silently unanalyzed - the query's error
+    // (an unresolved column / table) is reported.
+    CHECK(has_err("CREATE TABLE t AS SELECT nonesuch FROM users"));
+    CHECK(has_err("CREATE TABLE t AS SELECT id FROM no_such_table"));
+    // Plain CREATE TABLE (no query body) carries nothing to analyze here and
+    // stays clean (it is applied to the catalog via execute_ddl, not analyze()).
+    CHECK(!has_err("CREATE TABLE t (a INTEGER, b TEXT)"));
+}
+
 void test_join_using_resolves() {
     std::printf("test_join_using_resolves\n");
     auto cat = make_catalog_joins();
@@ -6593,6 +6623,7 @@ int main() {
     test_join_on_unresolved_column();
     test_non_lateral_derived_table_cannot_see_siblings();
     test_lateral_derived_table_sees_siblings();
+    test_ctas_query_analyzed();
     test_join_using_resolves();
     test_join_using_missing();
     test_parenthesized_join_group_resolves();

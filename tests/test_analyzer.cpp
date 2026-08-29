@@ -1505,8 +1505,9 @@ void test_non_lateral_derived_table_cannot_see_siblings() {
         a.analyze(res.value());
         return a.has_errors();
     };
-    // A derived table referencing a comma / JOIN sibling is rejected (LATERAL
-    // would be required, and the parser does not yet support it).
+    // A derived table referencing a comma / JOIN sibling is rejected: LATERAL
+    // is required (and its presence is what test_lateral_join_correlation checks
+    // makes the same reference legal).
     CHECK(has_err("SELECT * FROM users u, (SELECT u.id) s"));
     CHECK(has_err("SELECT * FROM users u JOIN (SELECT u.id) s ON true"));
     // An independent (uncorrelated) derived table stays clean.
@@ -1517,6 +1518,39 @@ void test_non_lateral_derived_table_cannot_see_siblings() {
     // binder, which resolves it through the enclosing chain).
     CHECK(!has_err("SELECT * FROM users u WHERE u.id IN "
                    "(SELECT v FROM (SELECT u.id AS v) s)"));
+}
+
+// The LATERAL counterpart: a LATERAL derived table IS evaluated per left row, so
+// its body MAY reference the preceding FROM items. The analyzer grants that
+// sibling visibility only under LATERAL (the parser marks it with a LateralJoin
+// node). This is the accept side of the reject cases above - same references,
+// now legal - across the comma form, CROSS JOIN LATERAL and INNER JOIN LATERAL.
+// Outer / NATURAL JOIN LATERAL are rejected at the parser and so never reach the
+// analyzer.
+void test_lateral_derived_table_sees_siblings() {
+    std::printf("test_lateral_derived_table_sees_siblings\n");
+    auto cat = make_catalog_joins();  // users, orders, sessions
+    parser::Parser p;
+    auto has_err = [&](const char* sql) -> bool {
+        auto res = p.parse(sql);
+        CHECK(res.has_value());
+        if (!res) return false;
+        Analyzer a(cat);
+        a.analyze(res.value());
+        return a.has_errors();
+    };
+    // The very references rejected without LATERAL now resolve with it.
+    CHECK(!has_err("SELECT * FROM users u, LATERAL (SELECT u.id) s"));
+    CHECK(!has_err("SELECT * FROM users u CROSS JOIN LATERAL (SELECT u.id) s"));
+    CHECK(!has_err("SELECT * FROM users u JOIN LATERAL (SELECT u.id) s ON true"));
+    // A LATERAL body may reference EARLIER comma siblings, not only the immediate
+    // left one (`u` is visible past `o`).
+    CHECK(!has_err("SELECT * FROM users u, orders o, "
+                   "LATERAL (SELECT u.id + o.total AS x) s"));
+    // LATERAL does not invent columns: an unknown reference is still an error.
+    CHECK(has_err("SELECT * FROM users u, LATERAL (SELECT u.nonesuch) s"));
+    // And an independent LATERAL body (no correlation) is fine too.
+    CHECK(!has_err("SELECT * FROM users u, LATERAL (SELECT total FROM orders) s"));
 }
 
 void test_join_using_resolves() {
@@ -3158,14 +3192,14 @@ void test_empty_grouping_set_grand_total() {
 // The parser now REJECTS statements it used to silently truncate, so the
 // analyzer is never handed a mangled AST (a `SELECT *` whose FROM lost a
 // relation, or a set operation reduced to its bare left arm). Confirm these
-// no longer parse - the pin bump carries the parser fix (parser #105). A
-// comma-form `LATERAL (subq)` in particular used to drop the lateral relation
-// and make `SELECT *` silently expand to only the first relation's columns.
+// no longer parse - the pin bump carries the parser fix (parser #105).
+// (Comma-form `LATERAL (subq)`, once dropped here, is now a supported
+// derived-table join - see test_lateral_join_correlation - so it is no longer
+// a truncation case.)
 void test_silently_truncated_inputs_now_rejected() {
     std::printf("test_silently_truncated_inputs_now_rejected\n");
     parser::Parser p;
     auto rejected = [&](const char* sql) -> bool { return !p.parse(sql).has_value(); };
-    CHECK(rejected("SELECT * FROM emp e, LATERAL (SELECT 1) l"));
     CHECK(rejected("SELECT id FROM emp UNION"));
     CHECK(rejected("SELECT id FROM emp INTERSECT"));
     CHECK(rejected("UPDATE emp SET dept = WHERE id = 1"));
@@ -6551,6 +6585,7 @@ int main() {
     test_self_join_distinct_aliases_not_flagged();
     test_join_on_unresolved_column();
     test_non_lateral_derived_table_cannot_see_siblings();
+    test_lateral_derived_table_sees_siblings();
     test_join_using_resolves();
     test_join_using_missing();
     test_parenthesized_join_group_resolves();

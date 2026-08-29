@@ -905,6 +905,22 @@ void Analyzer::analyze(ASTNode* root) {
         case NodeType::DeleteStmt:
             analyze_delete(root);
             return;
+        case NodeType::CreateTableStmt: {
+            // CREATE TABLE ... AS <query> (CTAS): the table's columns come from a
+            // defining query. Analyze that query so its columns are typed and
+            // projection_of(body) is populated - the binder lowers CTAS to a
+            // CreateTableAs over the bound query. Plain CREATE TABLE (a column
+            // list, no query body) carries no query to analyze here; it is a
+            // catalog operation applied via execute_ddl, so it is left alone.
+            for (ASTNode* c = first_child(root); c != nullptr; c = c->next_sibling) {
+                if (c->node_type == NodeType::SelectStmt || is_setop(c->node_type) ||
+                    c->node_type == NodeType::ValuesStmt) {
+                    analyze_stmt(c, nullptr);
+                    break;
+                }
+            }
+            return;
+        }
         default:
             // Other statement kinds are not yet analyzed; see docs/DESIGN.md.
             return;

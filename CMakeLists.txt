@@ -19,9 +19,25 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# Consume the DB25 SQL parser via its installed CMake package export.
+# The DB25 SQL parser, reached one of two ways.
+#
+# STANDALONE (this repo's own CI, and anyone building it alone): nothing has
+# defined the target, so find it through its installed CMake package export.
 # Point CMake at the install prefix with -DCMAKE_PREFIX_PATH=/path/to/parser-install
-find_package(DB25Parser REQUIRED)
+#
+# IN-TREE (a superproject that add_subdirectory's both this repo and the parser):
+# the target already exists, and finding a SECOND copy through an install would
+# be both wasteful and a chance for the two to be different builds of different
+# commits. Reuse what the parent added. This is the same guard db25-physical-plan
+# uses for db25logicalplan, and it is what lets a parent add_subdirectory THIS
+# repo instead of reaching in and compiling its .cpp files by hand.
+#
+# Either way the target is named DB25::db25parser - the parser aliases its in-tree
+# target to the name its export publishes, so this file does not care which path
+# it came from.
+if(NOT TARGET DB25::db25parser)
+    find_package(DB25Parser REQUIRED)
+endif()
 
 add_library(db25semantic
     src/analyzer.cpp

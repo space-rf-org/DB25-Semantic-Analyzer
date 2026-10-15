@@ -8,6 +8,21 @@ on:
   push:
   pull_request:
 
+# The parser commit every job in this file builds against, in ONE place.
+#
+# It used to be three copies of `PARSER_SHA=<sha>`, one per job, with a comment
+# in the third asking the reader to keep them in step by hand. Three copies of a
+# constant is three chances to bump two of them: a gate built against a
+# different parser than the suite it gates would be measuring the wrong thing.
+#
+# This must match the parser pin the rest of the chain uses - the gitlink at
+# db25-logical-plan/external/parser. The umbrella's check_pin_agreement.sh
+# compares the two and fails if they drift, because unlike a gitlink this value
+# is a string in a YAML file that nothing else would ever notice going stale.
+# To bump: set it to the chain's parser pin, not merely to the parser's main.
+env:
+  PARSER_SHA: 852821ac91202361d1d7ab90f242231d459115c7
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build the parser dependency, then build + test the analyzer.
@@ -40,17 +55,14 @@ jobs:
 
       # 3. Build + install the parser dependency (portable / non-native build:
       #    ENABLE_NATIVE is intentionally NOT passed so the binaries run on any
-      #    runner). Pinned to an exact parser commit (see PARSER_SHA below) for
+      #    runner). Pinned to an exact parser commit (PARSER_SHA, at the top) for
       #    a reproducible contract. The tokenizer is a git submodule and must be
       #    pulled recursively.
       - name: Build and install DB25 SQL parser
         run: |
-          # Pin the parser to an exact commit for a reproducible build
-          # contract (do not float on the parser's moving main branch).
-          # To bump: set PARSER_SHA to the desired db25-sql-parser commit,
-          # e.g. its current main tip from:
-          #   git ls-remote https://github.com/space-rf-org/db25-sql-parser main
-          PARSER_SHA=f107102
+          # PARSER_SHA comes from the workflow-level env above - one value
+          # for every job here. Pinned, so this never floats on the parser's
+          # moving main branch.
           git clone https://github.com/space-rf-org/db25-sql-parser
           cd db25-sql-parser
           git checkout "$PARSER_SHA"
@@ -104,12 +116,9 @@ jobs:
       # Parser install stays a plain Release build (no sanitizers needed).
       - name: Build and install DB25 SQL parser
         run: |
-          # Pin the parser to an exact commit for a reproducible build
-          # contract (do not float on the parser's moving main branch).
-          # To bump: set PARSER_SHA to the desired db25-sql-parser commit,
-          # e.g. its current main tip from:
-          #   git ls-remote https://github.com/space-rf-org/db25-sql-parser main
-          PARSER_SHA=f107102
+          # PARSER_SHA comes from the workflow-level env above - one value
+          # for every job here. Pinned, so this never floats on the parser's
+          # moving main branch.
           git clone https://github.com/space-rf-org/db25-sql-parser
           cd db25-sql-parser
           git checkout "$PARSER_SHA"
@@ -159,12 +168,10 @@ jobs:
 
       # The analyzer builds against an installed parser, same as every other job
       # in this file.
-      # Same pinned-parser recipe the other jobs in this file use. Keep
-      # PARSER_SHA in step with them; a gate built against a different parser
-      # than the suite it gates would be measuring the wrong thing.
+      # Same pinned-parser recipe the other jobs in this file use, and now
+      # literally the same value: PARSER_SHA is defined once at the top.
       - name: Build and install the parser
         run: |
-          PARSER_SHA=f107102
           git clone https://github.com/space-rf-org/db25-sql-parser
           cd db25-sql-parser
           git checkout "$PARSER_SHA"

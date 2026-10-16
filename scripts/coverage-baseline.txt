@@ -1,0 +1,20 @@
+92.4
+# Total line coverage of the semantic analyzer, as measured by
+# scripts/coverage.sh over THIS repository's own ctest targets.
+#
+# THE NUMBER IS TOOLCHAIN-DEPENDENT, which is why this says 92.4 and not the
+# 92.5 first recorded here. gcov attributes lines slightly differently between
+# compiler versions: under CI's g++-14 the analyzer is 3204 lines and the total
+# is 92.4%; under g++-13 it is 3183 lines and 92.5%. Same code, same tests, two
+# readings a tenth of a point apart.
+#
+# CI IS THE AUTHORITY. The baseline records what the job that enforces it
+# measures, not what a laptop measured. Reading this file without that caveat
+# invites someone to "fix" a 0.1pp difference that is an artifact of the
+# compiler they happen to have.
+#
+# SCOPE. This repo's own suite only. The same files read differently against
+# the umbrella's query-path harness - check_eval.cpp is 54.2% there and 80.0%
+# here - because that suite has no reason to exercise them.
+#
+# A RECORD, not a target. Move it in the same commit that changes coverage.

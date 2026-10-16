@@ -199,3 +199,71 @@ jobs:
       # a suite that only ever exercises the happy path.
       - name: Falsifiability gate
         run: python3 tools/falsifiability.py --build-dir build
+
+  # ---------------------------------------------------------------------------
+  # Line coverage for THIS repository, recomputed every run against a recorded
+  # baseline. Each repo measures itself: the same files read very differently
+  # from the umbrella's suite, which exercises the query path and builds this
+  # repo for its own purposes. A ratchet on one total, not per-file targets.
+  #
+  # Coverage is what was REACHED, never what was CHECKED - the falsifiability
+  # gate above is what decides whether reaching a line means anything.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: line coverage (ratchet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install compiler
+        run: |
+          if command -v g++-14 >/dev/null 2>&1; then
+            echo "g++-14 already present: $(g++-14 --version | head -1)"
+          else
+            sudo apt-get update
+            sudo apt-get install -y g++-14
+          fi
+
+      # Same pinned-parser recipe every other job in this file uses: this repo
+      # consumes the parser through find_package, so coverage needs it installed.
+      - name: Build and install the parser
+        run: |
+          git clone https://github.com/space-rf-org/db25-sql-parser
+          cd db25-sql-parser
+          git checkout "$PARSER_SHA"
+          git submodule update --init --recursive
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_TOOLS=OFF \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_INSTALL_PREFIX=$HOME/parser-install
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      - name: Coverage (with the installed parser on the prefix path)
+        env:
+          # The parser above is built with g++-14; this repo must be built by the
+          # SAME toolchain or it links a library from another ABI. Every other job
+          # here passes -DCMAKE_CXX_COMPILER explicitly; coverage.sh reads CXX, and
+          # derives the matching gcov from it (gcov is version-locked to the
+          # compiler that wrote the .gcda).
+          CXX: g++-14
+        # CMAKE_PREFIX_PATH is set HERE, from $HOME, rather than as a literal in
+        # env: - the install step above writes to $HOME/parser-install, and a
+        # hardcoded /home/runner/... is an assumption about the runner that is
+        # silently wrong the moment it does not hold.
+        run: |
+          export CMAKE_PREFIX_PATH="$HOME/parser-install"
+          test -d "$CMAKE_PREFIX_PATH" || {
+            echo "::error::parser install missing at $CMAKE_PREFIX_PATH"; exit 1; }
+          # Re-emit the failure as a ::error:: annotation. A failed job whose
+          # reason lives only in the log is a job you debug by guessing: the
+          # reason belongs where the API and the PR page both show it.
+          set -o pipefail
+          if ! ./scripts/coverage.sh build-coverage 2>&1 | tee /tmp/coverage.log; then
+            echo "::error::coverage failed: $(tail -n 12 /tmp/coverage.log | tr '\n' ' ' | tail -c 700)"
+            exit 1
+          fi

@@ -199,3 +199,51 @@ jobs:
       # a suite that only ever exercises the happy path.
       - name: Falsifiability gate
         run: python3 tools/falsifiability.py --build-dir build
+
+  # ---------------------------------------------------------------------------
+  # Line coverage for THIS repository, recomputed every run against a recorded
+  # baseline. Each repo measures itself: the same files read very differently
+  # from the umbrella's suite, which exercises the query path and builds this
+  # repo for its own purposes. A ratchet on one total, not per-file targets.
+  #
+  # Coverage is what was REACHED, never what was CHECKED - the falsifiability
+  # gate above is what decides whether reaching a line means anything.
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: line coverage (ratchet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install compiler
+        run: |
+          if command -v g++-14 >/dev/null 2>&1; then
+            echo "g++-14 already present: $(g++-14 --version | head -1)"
+          else
+            sudo apt-get update
+            sudo apt-get install -y g++-14
+          fi
+
+      # Same pinned-parser recipe every other job in this file uses: this repo
+      # consumes the parser through find_package, so coverage needs it installed.
+      - name: Build and install the parser
+        run: |
+          git clone https://github.com/space-rf-org/db25-sql-parser
+          cd db25-sql-parser
+          git checkout "$PARSER_SHA"
+          git submodule update --init --recursive
+          cmake -S . -B build \\
+            -DCMAKE_BUILD_TYPE=Release \\
+            -DBUILD_TESTS=OFF \\
+            -DBUILD_TOOLS=OFF \\
+            -DCMAKE_CXX_COMPILER=g++-14 \\
+            -DCMAKE_INSTALL_PREFIX=$HOME/parser-install
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+
+      - name: Coverage (with the installed parser on the prefix path)
+        env:
+          CMAKE_PREFIX_PATH: /home/runner/parser-install
+        run: ./scripts/coverage.sh build-coverage

@@ -245,10 +245,18 @@ jobs:
 
       - name: Coverage (with the installed parser on the prefix path)
         env:
-          CMAKE_PREFIX_PATH: /home/runner/parser-install
-          # The parser above is built with g++-14; the analyzer must be built by
-          # the SAME toolchain or it links a library from another ABI. Every
-          # other job here passes -DCMAKE_CXX_COMPILER explicitly; coverage.sh
-          # reads CXX so the one setting covers both.
+          # The parser above is built with g++-14; this repo must be built by the
+          # SAME toolchain or it links a library from another ABI. Every other job
+          # here passes -DCMAKE_CXX_COMPILER explicitly; coverage.sh reads CXX, and
+          # derives the matching gcov from it (gcov is version-locked to the
+          # compiler that wrote the .gcda).
           CXX: g++-14
-        run: ./scripts/coverage.sh build-coverage
+        # CMAKE_PREFIX_PATH is set HERE, from $HOME, rather than as a literal in
+        # env: - the install step above writes to $HOME/parser-install, and a
+        # hardcoded /home/runner/... is an assumption about the runner that is
+        # silently wrong the moment it does not hold.
+        run: |
+          export CMAKE_PREFIX_PATH="$HOME/parser-install"
+          test -d "$CMAKE_PREFIX_PATH" || {
+            echo "coverage: the parser install is not at $CMAKE_PREFIX_PATH"; exit 1; }
+          ./scripts/coverage.sh build-coverage

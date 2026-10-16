@@ -234,11 +234,11 @@ jobs:
           cd db25-sql-parser
           git checkout "$PARSER_SHA"
           git submodule update --init --recursive
-          cmake -S . -B build \\
-            -DCMAKE_BUILD_TYPE=Release \\
-            -DBUILD_TESTS=OFF \\
-            -DBUILD_TOOLS=OFF \\
-            -DCMAKE_CXX_COMPILER=g++-14 \\
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_TOOLS=OFF \
+            -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_INSTALL_PREFIX=$HOME/parser-install
           cmake --build build -j"$(nproc)"
           cmake --install build
@@ -246,4 +246,9 @@ jobs:
       - name: Coverage (with the installed parser on the prefix path)
         env:
           CMAKE_PREFIX_PATH: /home/runner/parser-install
+          # The parser above is built with g++-14; the analyzer must be built by
+          # the SAME toolchain or it links a library from another ABI. Every
+          # other job here passes -DCMAKE_CXX_COMPILER explicitly; coverage.sh
+          # reads CXX so the one setting covers both.
+          CXX: g++-14
         run: ./scripts/coverage.sh build-coverage

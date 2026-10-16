@@ -34,6 +34,12 @@ PREFIX_ARG=()
 if [ -n "${CMAKE_PREFIX_PATH:-}" ]; then
     PREFIX_ARG=(-DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH")
 fi
+# The installed parser was compiled by some toolchain; this repo must be
+# compiled by the SAME one or it links a library built against another ABI.
+# CI sets CXX=g++-14 to match the compiler it installed the parser with.
+if [ -n "${CXX:-}" ]; then
+    PREFIX_ARG+=(-DCMAKE_CXX_COMPILER="$CXX")
+fi
 
 echo "== configuring instrumented build =="
 if ! cmake -S "$ROOT" -B "$BUILD" -DCMAKE_BUILD_TYPE=Debug \

@@ -258,5 +258,12 @@ jobs:
         run: |
           export CMAKE_PREFIX_PATH="$HOME/parser-install"
           test -d "$CMAKE_PREFIX_PATH" || {
-            echo "coverage: the parser install is not at $CMAKE_PREFIX_PATH"; exit 1; }
-          ./scripts/coverage.sh build-coverage
+            echo "::error::parser install missing at $CMAKE_PREFIX_PATH"; exit 1; }
+          # Re-emit the failure as a ::error:: annotation. A failed job whose
+          # reason lives only in the log is a job you debug by guessing: the
+          # reason belongs where the API and the PR page both show it.
+          set -o pipefail
+          if ! ./scripts/coverage.sh build-coverage 2>&1 | tee /tmp/coverage.log; then
+            echo "::error::coverage failed: $(tail -n 12 /tmp/coverage.log | tr '\n' ' ' | tail -c 700)"
+            exit 1
+          fi

@@ -21,7 +21,7 @@ on:
 # is a string in a YAML file that nothing else would ever notice going stale.
 # To bump: set it to the chain's parser pin, not merely to the parser's main.
 env:
-  PARSER_SHA: 852821ac91202361d1d7ab90f242231d459115c7
+  PARSER_SHA: 7913a4d9147d4278906d487081215a2fe025b1ff
 
 jobs:
   # ---------------------------------------------------------------------------
